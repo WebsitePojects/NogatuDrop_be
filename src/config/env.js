@@ -1,4 +1,4 @@
-// Validated environment variables with defaults
+// Validated environment variables
 // Loaded via --env-file flag in package.json scripts
 
 const env = {
@@ -26,23 +26,40 @@ const env = {
   // CORS
   ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173',
 
-  // Rate limiting
-  RATE_LIMIT_ENABLED:
-    (process.env.RATE_LIMIT_ENABLED || (process.env.NODE_ENV === 'production' ? 'true' : 'false')).toLowerCase() === 'true',
+  // Brevo (transactional email — replaces SMS)
+  BREVO_API_KEY: process.env.BREVO_API_KEY || '',
+  EMAIL_FROM: 'noreply@nogatu.store',
+  EMAIL_FROM_NAME: 'Nogatu',
 
-  // SMS
-  SEMAPHORE_API_KEY: process.env.SEMAPHORE_API_KEY || '',
+  // Cloudinary (file storage — replaces local uploads)
+  CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',
+  CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY || '',
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || '',
 
   // Google Maps
   GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
 
-  // File Upload
-  UPLOAD_DIR: process.env.UPLOAD_DIR || './uploads',
+  // Alliance API bridge
+  ALLIANCE_API_KEY: process.env.ALLIANCE_API_KEY || '',
+
+  // Public base URL (for magic links)
+  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || 'http://localhost:5173',
+
+  // Business rules
+  PAYMENT_DEADLINE_HOURS: parseInt(process.env.PAYMENT_DEADLINE_HOURS, 10) || 24,
+
+  // Rate limiting
+  RATE_LIMIT_ENABLED:
+    (process.env.RATE_LIMIT_ENABLED || (process.env.NODE_ENV === 'production' ? 'true' : 'false')).toLowerCase() === 'true',
+
+  // File size limit (MB)
   MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 5,
 
-  // Cron
+  // Cron schedules
   REPLENISH_CRON: process.env.REPLENISH_CRON || '*/15 * * * *',
-  GPS_PING_INTERVAL_SECONDS: parseInt(process.env.GPS_PING_INTERVAL_SECONDS, 10) || 30,
+  PAYMENT_DEADLINE_CRON: process.env.PAYMENT_DEADLINE_CRON || '*/5 * * * *',
+  EXPIRY_ALERT_CRON: process.env.EXPIRY_ALERT_CRON || '0 8 * * *',
+  TOKEN_CLEANUP_CRON: process.env.TOKEN_CLEANUP_CRON || '0 3 * * *',
 };
 
 module.exports = env;

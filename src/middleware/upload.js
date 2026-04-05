@@ -1,38 +1,51 @@
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const cloudinary = require('../config/cloudinary');
 const env = require('../config/env');
-const ApiError = require('../utils/ApiError');
 
-const MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp'];
+const MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const IMAGE_ONLY = ['image/jpeg', 'image/png', 'image/webp'];
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = path.resolve(env.UPLOAD_DIR);
-    fs.mkdirSync(uploadPath, { recursive: true });
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, `${file.fieldname}-${uniqueSuffix}${ext}`);
-  },
-});
+function createUpload(folder, imageOnly = false, transformation = null) {
+  const storage = new CloudinaryStorage({
+    cloudinary,
+    params: {
+      folder: `nogatu/${folder}`,
+      allowed_formats: imageOnly ? ['jpg', 'jpeg', 'png', 'webp'] : ['jpg', 'jpeg', 'png', 'webp', 'pdf'],
+      ...(transformation && { transformation }),
+    },
+  });
 
-const fileFilter = (req, file, cb) => {
-  if (MIME_WHITELIST.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new ApiError(400, 'Only JPEG, PNG, and WebP images are allowed'), false);
-  }
-};
+  return multer({
+    storage,
+    limits: { fileSize: env.MAX_FILE_SIZE_MB * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+      const allowed = imageOnly ? IMAGE_ONLY : MIME_WHITELIST;
+      if (allowed.includes(file.mimetype)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Invalid file type. Allowed: ${allowed.join(', ')}`), false);
+      }
+    },
+  });
+}
 
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: {
-    fileSize: env.MAX_FILE_SIZE_MB * 1024 * 1024,
-  },
-});
+// Product images — compressed square
+const productUpload = createUpload('products', true, [
+  { width: 800, height: 800, crop: 'limit', quality: 'auto:good' },
+]);
 
-module.exports = upload;
+// Payment proof — original quality, PDF allowed
+const paymentProofUpload = createUpload('payment-proofs', false, [
+  { width: 1200, height: 1200, crop: 'limit', quality: 'auto' },
+]);
+
+// Proof of delivery photos
+const podUpload = createUpload('pod', true, [
+  { width: 1200, height: 1200, crop: 'limit', quality: 'auto' },
+]);
+
+// DTA application attachments
+const dtaUpload = createUpload('dta', false);
+
+module.exports = { productUpload, paymentProofUpload, podUpload, dtaUpload };

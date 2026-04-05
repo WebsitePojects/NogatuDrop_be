@@ -46,7 +46,7 @@ const createProduct = asyncHandler(async (req, res) => {
   );
   if (existing.length > 0) throw ApiError.conflict('SKU already exists');
 
-  const image_url = req.file ? `/uploads/${req.file.filename}` : null;
+  const image_url = req.file ? req.file.path : null;
 
   const [result] = await pool.execute(
     `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url)
@@ -90,7 +90,7 @@ const updateProduct = asyncHandler(async (req, res) => {
 
   if (req.file) {
     fields.push('image_url = ?');
-    values.push(`/uploads/${req.file.filename}`);
+    values.push(req.file.path);
   }
 
   if (fields.length === 0) throw ApiError.badRequest('No fields to update');

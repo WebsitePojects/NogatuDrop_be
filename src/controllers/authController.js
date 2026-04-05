@@ -5,6 +5,7 @@ const redis = require('../config/redis');
 const env = require('../config/env');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
+const { sendEmail, EMAIL } = require('../services/emailService');
 
 function parseExpiry(str) {
   const match = str.match(/^(\d+)([smhd])$/);
@@ -220,4 +221,60 @@ const me = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { login, logout, refresh, me };
+// POST /api/v1/auth/forgot-password
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email) throw ApiError.badRequest('Email is required');
+
+  const [users] = await pool.execute(
+    'SELECT id, name, email FROM users WHERE email = ? AND is_deleted = 0 AND status = \'active\' LIMIT 1',
+    [email]
+  );
+
+  // Always return 200 to prevent user enumeration
+  if (users.length === 0) {
+    return res.json({ success: true, message: 'If that email exists, a reset code has been sent.' });
+  }
+
+  const user = users[0];
+  const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit OTP
+  const ttlSeconds = 15 * 60; // 15 minutes
+
+  await redis.setex(`otp:reset:${user.id}`, ttlSeconds, otp);
+
+  const tmpl = EMAIL.passwordReset(otp);
+  await sendEmail({ to: user.email, toName: user.name, ...tmpl });
+
+  res.json({ success: true, message: 'If that email exists, a reset code has been sent.' });
+});
+
+// POST /api/v1/auth/reset-password
+const resetPassword = asyncHandler(async (req, res) => {
+  const { email, otp, new_password } = req.body;
+  if (!email || !otp || !new_password) throw ApiError.badRequest('email, otp, and new_password are required');
+  if (new_password.length < 8) throw ApiError.badRequest('Password must be at least 8 characters');
+
+  const [users] = await pool.execute(
+    'SELECT id FROM users WHERE email = ? AND is_deleted = 0 AND status = \'active\' LIMIT 1',
+    [email]
+  );
+  if (users.length === 0) throw ApiError.badRequest('Invalid reset request');
+
+  const userId = users[0].id;
+  const storedOtp = await redis.get(`otp:reset:${userId}`);
+
+  if (!storedOtp || storedOtp !== otp) {
+    throw ApiError.badRequest('Invalid or expired reset code');
+  }
+
+  const hashed = await bcrypt.hash(new_password, 12);
+  await pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashed, userId]);
+  await redis.del(`otp:reset:${userId}`);
+
+  // Revoke all refresh tokens for this user
+  await redis.del(`refresh:${userId}`);
+
+  res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
+});
+
+module.exports = { login, logout, refresh, me, forgotPassword, resetPassword };

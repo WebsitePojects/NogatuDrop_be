@@ -3,6 +3,9 @@ const app = require('./app');
 const env = require('./config/env');
 const pool = require('./config/db');
 const { startReplenishmentCron } = require('./services/replenishmentCron');
+const { startPaymentDeadlineCron } = require('./services/paymentDeadlineCron');
+const { startExpiryAlertCron } = require('./services/expiryAlertCron');
+const { startTokenCleanupCron } = require('./services/tokenCleanupCron');
 
 const server = http.createServer(app);
 
@@ -15,6 +18,9 @@ async function start() {
 
     // Start cron jobs
     startReplenishmentCron();
+    startPaymentDeadlineCron();
+    startExpiryAlertCron();
+    startTokenCleanupCron();
 
     // Start server
     server.listen(env.PORT, () => {
@@ -33,21 +39,14 @@ async function start() {
   }
 }
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Server] SIGTERM received, shutting down...');
-  server.close(() => {
-    pool.end();
-    process.exit(0);
-  });
+  server.close(() => { pool.end(); process.exit(0); });
 });
 
 process.on('SIGINT', () => {
   console.log('[Server] SIGINT received, shutting down...');
-  server.close(() => {
-    pool.end();
-    process.exit(0);
-  });
+  server.close(() => { pool.end(); process.exit(0); });
 });
 
 start();

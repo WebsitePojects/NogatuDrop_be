@@ -3,8 +3,38 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const generateOrderNum = require('../utils/generateOrderNum');
-const { sendSMS, SMS_TEMPLATES } = require('../services/smsService');
+const { sendEmail, EMAIL } = require('../services/emailService');
 const cache = require('../services/cacheService');
+const env = require('../config/env');
+
+// ─── Helper: notify users of a partner ───────────────────────────────────────
+async function notifyPartnerUsers(conn, partnerId, type, title, message, entityId) {
+  const [users] = await conn.execute(
+    `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,
+    [partnerId]
+  );
+  for (const u of users) {
+    await conn.execute(
+      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, ?, ?, ?, 'order', ?)`,
+      [u.id, type, title, message, entityId]
+    );
+  }
+  return users;
+}
+
+async function notifySuperAdmins(conn, type, title, message, entityId) {
+  const [admins] = await conn.execute(
+    `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
+  );
+  for (const a of admins) {
+    await conn.execute(
+      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, ?, ?, ?, 'order', ?)`,
+      [a.id, type, title, message, entityId]
+    );
+  }
+  return admins;
+}
 
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
@@ -12,7 +42,6 @@ const getOrders = asyncHandler(async (req, res) => {
   const params = [];
   let where = 'WHERE o.is_deleted = 0';
 
-  // Scope by role
   if (req.user.role_slug !== 'super_admin') {
     where += ' AND o.partner_id = ?';
     params.push(req.user.partner_id);
@@ -28,10 +57,12 @@ const getOrders = asyncHandler(async (req, res) => {
   const baseQuery = `
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
            o.placed_by, u.name AS placed_by_name, o.status, o.payment_status,
-           o.total_amount, o.notes, o.created_at, o.approved_at, o.delivered_at
+           o.total_amount, o.payment_deadline, o.payment_proof_url,
+           o.placed_by_type, o.customer_name,
+           o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
     JOIN partners pt ON pt.id = o.partner_id
-    JOIN users u ON u.id = o.placed_by
+    LEFT JOIN users u ON u.id = o.placed_by
     ${where}
     ORDER BY o.created_at DESC`;
 
@@ -39,16 +70,15 @@ const getOrders = asyncHandler(async (req, res) => {
     SELECT COUNT(*) AS total
     FROM orders o
     JOIN partners pt ON pt.id = o.partner_id
-    JOIN users u ON u.id = o.placed_by
+    LEFT JOIN users u ON u.id = o.placed_by
     ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
 
-  // Attach order items to each order
   for (const order of result.data) {
     const [items] = await pool.execute(
       `SELECT oi.id, oi.product_id, p.name AS product_name, p.sku, p.image_url,
-              oi.supplier, oi.quantity, oi.unit_price, oi.subtotal
+              oi.quantity, oi.unit_price, oi.subtotal
        FROM order_items oi
        JOIN products p ON p.id = oi.product_id
        WHERE oi.order_id = ?`,
@@ -72,21 +102,22 @@ const getOrder = asyncHandler(async (req, res) => {
 
   const [rows] = await pool.execute(
     `SELECT o.*, pt.business_name AS partner_name, u.name AS placed_by_name,
-            a.name AS approved_by_name
+            a.name AS approved_by_name, verifier.name AS payment_verified_by_name
      FROM orders o
      JOIN partners pt ON pt.id = o.partner_id
-     JOIN users u ON u.id = o.placed_by
+     LEFT JOIN users u ON u.id = o.placed_by
      LEFT JOIN users a ON a.id = o.approved_by
+     LEFT JOIN users verifier ON verifier.id = o.payment_proof_verified_by
      ${where} LIMIT 1`,
     params
   );
 
   if (rows.length === 0) throw ApiError.notFound('Order not found');
-
   const order = rows[0];
+
   const [items] = await pool.execute(
     `SELECT oi.id, oi.product_id, p.name AS product_name, p.sku, p.image_url,
-            oi.supplier, oi.quantity, oi.unit_price, oi.subtotal
+            oi.quantity, oi.unit_price, oi.subtotal
      FROM order_items oi
      JOIN products p ON p.id = oi.product_id
      WHERE oi.order_id = ?`,
@@ -97,19 +128,42 @@ const getOrder = asyncHandler(async (req, res) => {
   res.json({ success: true, data: order });
 });
 
-// POST /api/v1/orders (checkout cart)
+// POST /api/v1/orders — checkout cart (authenticated stockist)
 const createOrder = asyncHandler(async (req, res) => {
   const userId = req.user.id;
   const partnerId = req.user.partner_id;
   const { notes } = req.body;
 
-  if (!partnerId) throw ApiError.badRequest('Only partner users can place orders');
+  if (!partnerId) throw ApiError.badRequest('Only Stockist users can place orders');
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // Get cart items
+    const [partner] = await conn.execute(
+      'SELECT id, business_name, parent_partner_id, stockist_level, discount_pct FROM partners WHERE id = ? AND is_deleted = 0',
+      [partnerId]
+    );
+    if (partner.length === 0) throw ApiError.badRequest('Partner account not found');
+
+    const partnerData = partner[0];
+
+    // Determine source warehouse
+    let sourceWarehouseId = null;
+    if (partnerData.stockist_level === 'city_stockist' && partnerData.parent_partner_id) {
+      const [parentWh] = await conn.execute(
+        'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
+        [partnerData.parent_partner_id]
+      );
+      if (parentWh.length > 0) sourceWarehouseId = parentWh[0].id;
+    } else {
+      const [ownWh] = await conn.execute(
+        'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
+        [partnerId]
+      );
+      if (ownWh.length > 0) sourceWarehouseId = ownWh[0].id;
+    }
+
     const [cartItems] = await conn.execute(
       `SELECT ci.id, ci.product_id, ci.quantity, p.name AS product_name,
               p.partner_price, p.sku
@@ -121,69 +175,160 @@ const createOrder = asyncHandler(async (req, res) => {
 
     if (cartItems.length === 0) throw ApiError.badRequest('Cart is empty');
 
-    // Calculate total
+    // Compute prices with discount locked at order time
     let totalAmount = 0;
+    const discountPct = partnerData.discount_pct || 0;
+
     for (const item of cartItems) {
-      totalAmount += item.quantity * item.partner_price;
+      const unitPrice = parseFloat(item.partner_price) * (1 - discountPct / 100);
+      item.lockedUnitPrice = Math.round(unitPrice * 100) / 100;
+      totalAmount += item.quantity * item.lockedUnitPrice;
     }
 
-    // Generate order number
+    // Check available stock if source warehouse known
+    if (sourceWarehouseId) {
+      for (const item of cartItems) {
+        const [inv] = await conn.execute(
+          `SELECT current_stock, reserved_stock FROM inventories
+           WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
+          [item.product_id, sourceWarehouseId]
+        );
+        const available = inv.length > 0 ? inv[0].current_stock - inv[0].reserved_stock : 0;
+        if (available < item.quantity) {
+          throw ApiError.badRequest(`Insufficient stock for ${item.product_name} (available: ${available})`);
+        }
+      }
+    }
+
     const orderNumber = await generateOrderNum('ORD', 'orders', 'order_number');
 
-    // Create order
     const [orderResult] = await conn.execute(
-      `INSERT INTO orders (order_number, partner_id, placed_by, total_amount, notes)
-       VALUES (?, ?, ?, ?, ?)`,
-      [orderNumber, partnerId, userId, totalAmount, notes || null]
+      `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, total_amount, notes)
+       VALUES (?, ?, ?, 'user', ?, ?, ?)`,
+      [orderNumber, partnerId, userId, sourceWarehouseId, totalAmount, notes || null]
     );
-
     const orderId = orderResult.insertId;
 
-    // Create order items
     for (const item of cartItems) {
       await conn.execute(
-        `INSERT INTO order_items (order_id, product_id, supplier, quantity, unit_price)
-         VALUES (?, ?, 'Nogatu Manufacturing', ?, ?)`,
-        [orderId, item.product_id, item.quantity, item.partner_price]
+        `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
+         VALUES (?, ?, ?, ?, ?)`,
+        [orderId, item.product_id, sourceWarehouseId, item.quantity, item.lockedUnitPrice]
       );
+    }
+
+    // Reserve stock
+    if (sourceWarehouseId) {
+      for (const item of cartItems) {
+        await conn.execute(
+          `UPDATE inventories SET reserved_stock = reserved_stock + ?
+           WHERE product_id = ? AND warehouse_id = ?`,
+          [item.quantity, item.product_id, sourceWarehouseId]
+        );
+        await conn.execute(
+          `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
+           VALUES (?, ?, 'reserve', ?, 'order', ?, 'Stock reserved on order placement')`,
+          [item.product_id, sourceWarehouseId, item.quantity, orderId]
+        );
+      }
     }
 
     // Clear cart
     await conn.execute('DELETE FROM cart_items WHERE user_id = ?', [userId]);
 
-    // Create notification for super_admin
-    const [admins] = await conn.execute(
-      `SELECT u.id, u.phone FROM users u JOIN roles r ON r.id = u.role_id
-       WHERE r.slug = 'super_admin' AND u.is_deleted = 0`
+    const admins = await notifySuperAdmins(
+      conn, 'order_placed',
+      `New Order: #${orderNumber}`,
+      `New order #${orderNumber} from ${partnerData.business_name} worth ₱${totalAmount.toFixed(2)}`,
+      orderId
     );
 
-    const [partner] = await conn.execute('SELECT business_name, phone FROM partners WHERE id = ?', [partnerId]);
-    const partnerName = partner[0]?.business_name || 'Unknown';
+    await conn.commit();
+    await cache.delPattern('dashboard:*');
 
+    // Email all super admins
     for (const admin of admins) {
-      await conn.execute(
-        `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-         VALUES (?, 'order_placed', ?, ?, 'order', ?)`,
-        [admin.id, `New Order: ${orderNumber}`, `New order ${orderNumber} from ${partnerName} worth PHP ${totalAmount.toFixed(2)}`, orderId]
-      );
+      const tmpl = EMAIL.orderPlaced(orderNumber, partnerData.business_name);
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
 
-      if (admin.phone) {
-        sendSMS(admin.phone, SMS_TEMPLATES.NEW_ORDER(orderNumber, partnerName));
-      }
+    res.status(201).json({ success: true, message: 'Order placed successfully', data: { id: orderId, order_number: orderNumber, total_amount: totalAmount } });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
+const createPublicOrder = asyncHandler(async (req, res) => {
+  const { customer_name, customer_phone, customer_email, customer_address, items, notes } = req.body;
+
+  if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
+  if (!items || items.length === 0) throw ApiError.badRequest('items are required');
+
+  // Auto-assign nearest stockist (city or provincial) based on customer address
+  // For now, assign the first available city/provincial stockist
+  // In production this uses ST_Distance_Sphere on warehouse coordinates
+  const [nearestPartner] = await pool.execute(
+    `SELECT p.id AS partner_id, w.id AS warehouse_id
+     FROM partners p
+     JOIN warehouses w ON w.partner_id = p.id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       AND p.is_deleted = 0 AND w.is_deleted = 0
+     LIMIT 1`
+  );
+
+  if (nearestPartner.length === 0) throw ApiError.serviceUnavailable('No available Stockist to handle this order');
+
+  const { partner_id: partnerId, warehouse_id: sourceWarehouseId } = nearestPartner[0];
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    let totalAmount = 0;
+    const resolvedItems = [];
+
+    for (const item of items) {
+      const [products] = await conn.execute(
+        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
+        [item.product_id]
+      );
+      if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
+      const price = parseFloat(products[0].partner_price);
+      resolvedItems.push({ ...item, name: products[0].name, unit_price: price });
+      totalAmount += item.quantity * price;
+    }
+
+    const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
+
+    const [orderResult] = await conn.execute(
+      `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+                           customer_name, customer_phone, customer_email, customer_address,
+                           total_amount, notes)
+       VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+      [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+       customer_email || null, customer_address, totalAmount, notes || null]
+    );
+    const orderId = orderResult.insertId;
+
+    for (const item of resolvedItems) {
+      await conn.execute(
+        `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
+         VALUES (?, ?, ?, ?, ?)`,
+        [orderId, item.product_id, sourceWarehouseId, item.quantity, item.unit_price]
+      );
     }
 
     await conn.commit();
 
-    await cache.delPattern('dashboard:*');
-    await cache.delPattern('orders:*');
-
-    const [createdOrder] = await pool.execute(
-      `SELECT o.*, pt.business_name AS partner_name
-       FROM orders o JOIN partners pt ON pt.id = o.partner_id WHERE o.id = ?`,
-      [orderId]
-    );
-
-    res.status(201).json({ success: true, message: 'Order placed successfully', data: createdOrder[0] });
+    res.status(201).json({
+      success: true,
+      message: 'Order placed successfully. You will be contacted shortly.',
+      data: { order_number: orderNumber, total_amount: totalAmount },
+    });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -197,151 +342,275 @@ const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status FROM orders WHERE id = ? AND is_deleted = 0', [orderId]
+    'SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0',
+    [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
-  if (orders[0].status !== 'pending') throw ApiError.badRequest('Order can only be approved from pending status');
+  if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be approved');
 
-  await pool.execute(
-    'UPDATE orders SET status = ?, approved_by = ?, approved_at = NOW() WHERE id = ?',
-    ['approved', req.user.id, orderId]
-  );
+  const deadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
 
-  // Notify partner
-  const [partnerUsers] = await pool.execute(
-    `SELECT u.id, u.phone FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0`,
-    [orders[0].partner_id]
-  );
-
-  for (const pu of partnerUsers) {
-    await pool.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-       VALUES (?, 'order_approved', ?, ?, 'order', ?)`,
-      [pu.id, `Order Approved: ${orders[0].order_number}`, `Your order ${orders[0].order_number} has been approved. Please proceed with payment.`, orderId]
+  // Find bank account for the source warehouse
+  let bankDetails = null;
+  if (orders[0].source_warehouse_id) {
+    const [banks] = await pool.execute(
+      `SELECT bank_name, account_name, account_number FROM bank_accounts
+       WHERE warehouse_id = ? AND is_active = 1 AND is_deleted = 0 LIMIT 1`,
+      [orders[0].source_warehouse_id]
     );
-    if (pu.phone) sendSMS(pu.phone, SMS_TEMPLATES.ORDER_APPROVED(orders[0].order_number));
+    if (banks.length > 0) {
+      const b = banks[0];
+      bankDetails = `${b.bank_name} — ${b.account_name} — ${b.account_number}`;
+    }
   }
 
-  await cache.delPattern('dashboard:*');
-  res.json({ success: true, message: 'Order approved' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(), payment_deadline = ? WHERE id = ?`,
+      [req.user.id, deadline, orderId]
+    );
+
+    const partnerUsers = await notifyPartnerUsers(
+      conn, orders[0].partner_id, 'order_approved',
+      `Order Approved: #${orders[0].order_number}`,
+      `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
+      orderId
+    );
+    await conn.commit();
+
+    for (const pu of partnerUsers) {
+      const tmpl = EMAIL.orderApproved(orders[0].order_number, env.PAYMENT_DEADLINE_HOURS, bankDetails);
+      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+    }
+
+    await cache.delPattern('dashboard:*');
+    res.json({ success: true, message: 'Order approved', data: { payment_deadline: deadline } });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 });
 
 // PATCH /api/v1/orders/:id/reject
 const rejectOrder = asyncHandler(async (req, res) => {
-  const orderId = req.params.id;
   const { reason } = req.body;
-
-  const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status FROM orders WHERE id = ? AND is_deleted = 0', [orderId]
-  );
-  if (orders.length === 0) throw ApiError.notFound('Order not found');
-  if (orders[0].status !== 'pending') throw ApiError.badRequest('Order can only be rejected from pending status');
-
-  await pool.execute(
-    'UPDATE orders SET status = ?, approved_by = ?, notes = CONCAT(COALESCE(notes, ""), ?) WHERE id = ?',
-    ['rejected', req.user.id, reason ? `\nRejection reason: ${reason}` : '', orderId]
-  );
-
-  const [partnerUsers] = await pool.execute(
-    'SELECT u.id, u.phone FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0',
-    [orders[0].partner_id]
-  );
-
-  for (const pu of partnerUsers) {
-    await pool.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-       VALUES (?, 'order_rejected', ?, ?, 'order', ?)`,
-      [pu.id, `Order Rejected: ${orders[0].order_number}`, `Your order ${orders[0].order_number} has been rejected. Reason: ${reason || 'N/A'}`, orderId]
-    );
-    if (pu.phone) sendSMS(pu.phone, SMS_TEMPLATES.ORDER_REJECTED(orders[0].order_number, reason));
-  }
-
-  await cache.delPattern('dashboard:*');
-  res.json({ success: true, message: 'Order rejected' });
-});
-
-// PATCH /api/v1/orders/:id/pay
-const payOrder = asyncHandler(async (req, res) => {
-  const orderId = req.params.id;
-  const { method, amount, reference, notes } = req.body;
-
-  const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status, payment_status, total_amount FROM orders WHERE id = ? AND is_deleted = 0',
-    [orderId]
-  );
-  if (orders.length === 0) throw ApiError.notFound('Order not found');
-  if (orders[0].status !== 'approved') throw ApiError.badRequest('Order must be approved before payment');
-  if (orders[0].payment_status === 'paid') throw ApiError.badRequest('Order is already paid');
-
-  const payAmount = amount || orders[0].total_amount;
-
-  await pool.execute('UPDATE orders SET payment_status = ? WHERE id = ?', ['paid', orderId]);
-
-  // Create payment record
-  await pool.execute(
-    `INSERT INTO payments (order_id, marked_by, method, amount, reference, notes)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [orderId, req.user.id, method || 'bank_transfer', payAmount, reference || null, notes || null]
-  );
-
-  const [partnerUsers] = await pool.execute(
-    'SELECT u.id, u.phone FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0',
-    [orders[0].partner_id]
-  );
-
-  for (const pu of partnerUsers) {
-    await pool.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-       VALUES (?, 'order_paid', ?, ?, 'order', ?)`,
-      [pu.id, `Payment Confirmed: ${orders[0].order_number}`, `Payment for order ${orders[0].order_number} has been confirmed.`, orderId]
-    );
-    if (pu.phone) sendSMS(pu.phone, SMS_TEMPLATES.ORDER_PAID(orders[0].order_number));
-  }
-
-  await cache.delPattern('dashboard:*');
-  res.json({ success: true, message: 'Payment recorded' });
-});
-
-// PATCH /api/v1/orders/:id/deliver
-const deliverOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status, payment_status FROM orders WHERE id = ? AND is_deleted = 0',
+    'SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0',
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
-  if (!['approved', 'delivering'].includes(orders[0].status)) {
-    throw ApiError.badRequest('Order must be approved or delivering to mark as delivered');
-  }
+  if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be rejected');
 
-  await pool.execute(
-    'UPDATE orders SET status = ?, delivered_at = NOW() WHERE id = ?',
-    ['delivered', orderId]
-  );
-
-  // Update delivery tracking if exists
-  await pool.execute(
-    `UPDATE delivery_tracking SET status = 'delivered', delivered_at = NOW() WHERE order_id = ?`,
-    [orderId]
-  );
-
-  const [partnerUsers] = await pool.execute(
-    'SELECT u.id, u.phone FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0',
-    [orders[0].partner_id]
-  );
-
-  for (const pu of partnerUsers) {
-    await pool.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-       VALUES (?, 'order_delivered', ?, ?, 'order', ?)`,
-      [pu.id, `Order Delivered: ${orders[0].order_number}`, `Order ${orders[0].order_number} has been delivered successfully.`, orderId]
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET status = 'rejected', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW() WHERE id = ?`,
+      [reason || null, req.user.id, orderId]
     );
-    if (pu.phone) sendSMS(pu.phone, SMS_TEMPLATES.ORDER_DELIVERED(orders[0].order_number));
-  }
 
-  await cache.delPattern('dashboard:*');
-  res.json({ success: true, message: 'Order marked as delivered' });
+    // Release reserved stock
+    const [items] = await conn.execute(
+      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
+      [orderId]
+    );
+    for (const item of items) {
+      const wid = item.source_warehouse_id || orders[0].source_warehouse_id;
+      if (wid) {
+        await conn.execute(
+          `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
+          [item.quantity, item.product_id, wid]
+        );
+        await conn.execute(
+          `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
+           VALUES (?, ?, 'release', ?, 'order', ?, 'Reserved stock released — order rejected')`,
+          [item.product_id, wid, item.quantity, orderId]
+        );
+      }
+    }
+
+    const partnerUsers = await notifyPartnerUsers(
+      conn, orders[0].partner_id, 'order_rejected',
+      `Order Rejected: #${orders[0].order_number}`,
+      `Order #${orders[0].order_number} was rejected. Reason: ${reason || 'N/A'}`,
+      orderId
+    );
+    await conn.commit();
+
+    for (const pu of partnerUsers) {
+      const tmpl = EMAIL.orderRejected(orders[0].order_number, reason);
+      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+    }
+
+    await cache.delPattern('dashboard:*');
+    res.json({ success: true, message: 'Order rejected' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 });
 
-module.exports = { getOrders, getOrder, createOrder, approveOrder, rejectOrder, payOrder, deliverOrder };
+// PATCH /api/v1/orders/:id/cancel — stockist self-cancel (pending only)
+const cancelOrder = asyncHandler(async (req, res) => {
+  const { reason } = req.body;
+  const orderId = req.params.id;
+
+  const whereExtra = req.user.role_slug !== 'super_admin' ? ' AND partner_id = ?' : '';
+  const params = req.user.role_slug !== 'super_admin'
+    ? [orderId, req.user.partner_id]
+    : [orderId];
+
+  const [orders] = await pool.execute(
+    `SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0${whereExtra}`,
+    params
+  );
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
+  if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be self-cancelled');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET status = 'cancelled', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW() WHERE id = ?`,
+      [reason || 'Cancelled by Stockist', req.user.id, orderId]
+    );
+
+    // Release reserved stock
+    const [items] = await conn.execute(
+      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
+      [orderId]
+    );
+    for (const item of items) {
+      const wid = item.source_warehouse_id || orders[0].source_warehouse_id;
+      if (wid) {
+        await conn.execute(
+          `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
+          [item.quantity, item.product_id, wid]
+        );
+      }
+    }
+
+    await conn.commit();
+    await cache.delPattern('dashboard:*');
+    res.json({ success: true, message: 'Order cancelled' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// POST /api/v1/orders/:id/payment-proof — upload payment proof (Cloudinary)
+const uploadPaymentProof = asyncHandler(async (req, res) => {
+  const orderId = req.params.id;
+
+  if (!req.file) throw ApiError.badRequest('Payment proof file is required');
+
+  const whereExtra = req.user.role_slug !== 'super_admin' ? ' AND partner_id = ?' : '';
+  const params = req.user.role_slug !== 'super_admin' ? [orderId, req.user.partner_id] : [orderId];
+
+  const [orders] = await pool.execute(
+    `SELECT id, order_number, partner_id, status FROM orders WHERE id = ? AND is_deleted = 0${whereExtra}`,
+    params
+  );
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
+  if (orders[0].status !== 'approved') throw ApiError.badRequest('Payment proof can only be uploaded for approved orders');
+
+  const proofUrl = req.file.path; // Cloudinary URL
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ?`,
+      [proofUrl, orderId]
+    );
+
+    const admins = await notifySuperAdmins(
+      conn, 'payment_proof_uploaded',
+      `Payment Proof: #${orders[0].order_number}`,
+      `Payment proof uploaded for order #${orders[0].order_number}. Please verify.`,
+      orderId
+    );
+    await conn.commit();
+
+    // Get stockist name
+    const [partnerRow] = await pool.execute('SELECT business_name FROM partners WHERE id = ?', [orders[0].partner_id]);
+    const stockistName = partnerRow[0]?.business_name || 'Stockist';
+
+    for (const admin of admins) {
+      const tmpl = EMAIL.paymentProofUploaded(orders[0].order_number, stockistName);
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
+
+    res.json({ success: true, message: 'Payment proof uploaded', data: { payment_proof_url: proofUrl } });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// PATCH /api/v1/orders/:id/verify-payment — super_admin verifies payment proof
+const verifyPayment = asyncHandler(async (req, res) => {
+  const orderId = req.params.id;
+
+  const [orders] = await pool.execute(
+    'SELECT id, order_number, partner_id, status, payment_proof_url FROM orders WHERE id = ? AND is_deleted = 0',
+    [orderId]
+  );
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
+  if (orders[0].status !== 'approved') throw ApiError.badRequest('Order must be in approved status');
+  if (!orders[0].payment_proof_url) throw ApiError.badRequest('No payment proof has been uploaded');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW() WHERE id = ?`,
+      [req.user.id, orderId]
+    );
+
+    const partnerUsers = await notifyPartnerUsers(
+      conn, orders[0].partner_id, 'payment_verified',
+      `Payment Confirmed: #${orders[0].order_number}`,
+      `Payment for order #${orders[0].order_number} has been verified. Delivery is being arranged.`,
+      orderId
+    );
+    await conn.commit();
+
+    for (const pu of partnerUsers) {
+      const tmpl = EMAIL.paymentVerified(orders[0].order_number);
+      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+    }
+
+    res.json({ success: true, message: 'Payment verified' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+module.exports = {
+  getOrders,
+  getOrder,
+  createOrder,
+  createPublicOrder,
+  approveOrder,
+  rejectOrder,
+  cancelOrder,
+  uploadPaymentProof,
+  verifyPayment,
+};

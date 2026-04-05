@@ -14,6 +14,15 @@ const notificationRoutes = require('./notifications');
 const trackingRoutes = require('./tracking');
 const reportRoutes = require('./reports');
 const dashboardRoutes = require('./dashboard');
+const bankAccountRoutes = require('./bankAccounts');
+const courierRoutes = require('./couriers');
+const deliveryTokenRoutes = require('./deliveryTokens');
+const grnRoutes = require('./grn');
+const mobileStockistRoutes = require('./mobileStockists');
+const applicationRoutes = require('./applications');
+const stockMovementRoutes = require('./stockMovements');
+const stockAdjustmentRoutes = require('./stockAdjustments');
+const allianceRoutes = require('./alliance');
 
 const router = Router();
 
@@ -31,5 +40,14 @@ router.use('/notifications', notificationRoutes);
 router.use('/tracking', trackingRoutes);
 router.use('/reports', reportRoutes);
 router.use('/dashboard', dashboardRoutes);
+router.use('/bank-accounts', bankAccountRoutes);
+router.use('/couriers', courierRoutes);
+router.use('/delivery-tokens', deliveryTokenRoutes);
+router.use('/grn', grnRoutes);
+router.use('/mobile-stockists', mobileStockistRoutes);
+router.use('/applications', applicationRoutes);
+router.use('/stock-movements', stockMovementRoutes);
+router.use('/stock-adjustments', stockAdjustmentRoutes);
+router.use('/alliance', allianceRoutes);
 
 module.exports = router;

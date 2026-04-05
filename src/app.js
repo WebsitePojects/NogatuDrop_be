@@ -4,7 +4,6 @@ const cors = require('cors');
 const morgan = require('morgan');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 const env = require('./config/env');
 const routes = require('./routes/index');
 const ApiError = require('./utils/ApiError');
@@ -19,7 +18,7 @@ app.use(cors({
   origin: env.ALLOWED_ORIGIN,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Alliance-API-Key'],
 }));
 
 // Request logging
@@ -35,17 +34,23 @@ app.use(cookieParser());
 // Rate limiting
 if (env.RATE_LIMIT_ENABLED) {
   const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
+    windowMs: 15 * 60 * 1000,
     max: 100,
     message: { success: false, message: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
   });
   app.use('/api/', limiter);
-}
 
-// Static uploads
-app.use('/uploads', express.static(path.resolve(env.UPLOAD_DIR)));
+  // Stricter limit on auth endpoints
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    message: { success: false, message: 'Too many auth attempts, please try again later.' },
+  });
+  app.use('/api/v1/auth/login', authLimiter);
+  app.use('/api/v1/auth/forgot-password', authLimiter);
+}
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -62,13 +67,12 @@ app.use((req, res, next) => {
 
 // Global error handler
 app.use((err, req, res, next) => {
-  // Multer file size error
   if (err.code === 'LIMIT_FILE_SIZE') {
     err = ApiError.badRequest(`File too large. Maximum size is ${env.MAX_FILE_SIZE_MB}MB`);
   }
 
   const statusCode = err.statusCode || 500;
-  const error = err.message || 'Internal server error';
+  const message = err.message || 'Internal server error';
 
   if (env.NODE_ENV !== 'production') {
     console.error('[Error]', err);
@@ -76,8 +80,7 @@ app.use((err, req, res, next) => {
 
   res.status(statusCode).json({
     success: false,
-    error,
-    message: error,
+    message,
     details: Array.isArray(err.details) ? err.details : [],
     ...(env.NODE_ENV !== 'production' && { stack: err.stack }),
   });

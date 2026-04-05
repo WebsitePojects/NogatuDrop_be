@@ -3,7 +3,7 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
-const upload = require('../middleware/upload');
+const { productUpload: upload } = require('../middleware/upload');
 const { getProducts, getProduct, createProduct, updateProduct, deleteProduct } = require('../controllers/productController');
 
 const router = Router();

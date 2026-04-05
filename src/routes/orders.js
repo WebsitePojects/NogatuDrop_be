@@ -2,11 +2,20 @@ const { Router } = require('express');
 const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
-const roleGuard = require('../middleware/roleGuard');
-const { getOrders, getOrder, createOrder, approveOrder, rejectOrder, payOrder, deliverOrder } = require('../controllers/orderController');
+const role = require('../middleware/roleGuard');
+const { paymentProofUpload } = require('../middleware/upload');
+const {
+  getOrders, getOrder, createOrder, createPublicOrder,
+  approveOrder, rejectOrder, cancelOrder,
+  uploadPaymentProof, verifyPayment,
+} = require('../controllers/orderController');
 
 const router = Router();
 
+// Public — no auth
+router.post('/public', createPublicOrder);
+
+// Authenticated
 router.use(auth);
 
 router.get('/', getOrders);
@@ -14,37 +23,20 @@ router.get('/:id', param('id').isInt(), validate, getOrder);
 
 router.post(
   '/',
-  roleGuard('admin'),
+  role('provincial_stockist', 'city_stockist', 'mobile_stockist'),
   [body('notes').optional().trim()],
   validate,
   createOrder
 );
 
-router.patch('/:id/approve', roleGuard('super_admin'), param('id').isInt(), validate, approveOrder);
+router.patch('/:id/approve', role('super_admin'), approveOrder);
+router.patch('/:id/reject', role('super_admin'), [body('reason').optional().trim()], validate, rejectOrder);
+router.patch('/:id/cancel', cancelOrder);
 
-router.patch(
-  '/:id/reject',
-  roleGuard('super_admin'),
-  param('id').isInt(),
-  [body('reason').optional().trim()],
-  validate,
-  rejectOrder
-);
+// Stockist uploads payment proof (Cloudinary)
+router.post('/:id/payment-proof', paymentProofUpload.single('proof'), uploadPaymentProof);
 
-router.patch(
-  '/:id/pay',
-  roleGuard('super_admin'),
-  param('id').isInt(),
-  [
-    body('method').optional().isIn(['bank_transfer', 'gcash', 'cash', 'credit']),
-    body('amount').optional().isFloat({ min: 0 }),
-    body('reference').optional().trim(),
-    body('notes').optional().trim(),
-  ],
-  validate,
-  payOrder
-);
-
-router.patch('/:id/deliver', roleGuard('super_admin'), param('id').isInt(), validate, deliverOrder);
+// Super admin verifies payment proof
+router.patch('/:id/verify-payment', role('super_admin'), verifyPayment);
 
 module.exports = router;
