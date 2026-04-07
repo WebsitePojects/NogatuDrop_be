@@ -149,6 +149,8 @@ const createOrder = asyncHandler(async (req, res) => {
     const partnerData = partner[0];
 
     // Determine source warehouse
+    // City stockist → order from parent provincial warehouse
+    // Provincial stockist → order from Goldenstar (type = 'manufacturer')
     let sourceWarehouseId = null;
     if (partnerData.stockist_level === 'city_stockist' && partnerData.parent_partner_id) {
       const [parentWh] = await conn.execute(
@@ -156,7 +158,14 @@ const createOrder = asyncHandler(async (req, res) => {
         [partnerData.parent_partner_id]
       );
       if (parentWh.length > 0) sourceWarehouseId = parentWh[0].id;
+    } else if (partnerData.stockist_level === 'provincial_stockist') {
+      // Provincial stockist sources stock from the Goldenstar manufacturer warehouse
+      const [mfrWh] = await conn.execute(
+        `SELECT id FROM warehouses WHERE type = 'manufacturer' AND is_deleted = 0 LIMIT 1`
+      );
+      if (mfrWh.length > 0) sourceWarehouseId = mfrWh[0].id;
     } else {
+      // Fallback: city stockist with no parent — use own warehouse
       const [ownWh] = await conn.execute(
         'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
         [partnerId]

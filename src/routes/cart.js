@@ -8,7 +8,7 @@ const { getCart, addToCart, updateCartItem, removeCartItem, clearCart } = requir
 const router = Router();
 
 router.use(auth);
-router.use(roleGuard('admin'));
+router.use(roleGuard('admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff'));
 
 router.get('/', getCart);
 

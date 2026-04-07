@@ -8,13 +8,15 @@ const { getTransfers, getTransfer, createTransfer, completeTransfer } = require(
 const router = Router();
 
 router.use(auth);
-router.use(roleGuard('super_admin'));
 
-router.get('/', getTransfers);
-router.get('/:id', param('id').isInt(), validate, getTransfer);
+const ALL_STOCKIST_ROLES = ['super_admin', 'provincial_stockist', 'city_stockist', 'staff'];
+
+router.get('/', roleGuard(...ALL_STOCKIST_ROLES), getTransfers);
+router.get('/:id', roleGuard(...ALL_STOCKIST_ROLES), param('id').isInt(), validate, getTransfer);
 
 router.post(
   '/',
+  roleGuard('super_admin', 'provincial_stockist', 'city_stockist'),
   [
     body('from_warehouse_id').isInt().withMessage('Source warehouse ID is required'),
     body('to_warehouse_id').isInt().withMessage('Destination warehouse ID is required'),
@@ -27,6 +29,6 @@ router.post(
   createTransfer
 );
 
-router.patch('/:id/complete', param('id').isInt(), validate, completeTransfer);
+router.patch('/:id/complete', roleGuard('super_admin'), param('id').isInt(), validate, completeTransfer);
 
 module.exports = router;

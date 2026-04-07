@@ -9,8 +9,8 @@ const router = Router();
 
 router.use(auth);
 
-router.get('/', roleGuard('super_admin', 'admin'), getUsers);
-router.get('/:id', roleGuard('super_admin', 'admin'), param('id').isInt(), validate, getUser);
+router.get('/', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), getUsers);
+router.get('/:id', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), param('id').isInt(), validate, getUser);
 
 router.post(
   '/',

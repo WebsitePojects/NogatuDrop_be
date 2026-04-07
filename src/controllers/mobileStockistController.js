@@ -2,7 +2,6 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
-const bcrypt = require('bcryptjs');
 
 // GET /api/v1/mobile-stockists
 const getMobileStockists = asyncHandler(async (req, res) => {
@@ -12,7 +11,7 @@ const getMobileStockists = asyncHandler(async (req, res) => {
 
   // City/Provincial Stockist: only see their own mobile stockists
   if (!['super_admin'].includes(req.user.role_slug)) {
-    where += ' AND ms.parent_partner_id = ?';
+    where += ' AND ms.partner_id = ?';
     params.push(req.user.partner_id);
   }
   if (search) {
@@ -22,12 +21,12 @@ const getMobileStockists = asyncHandler(async (req, res) => {
 
   const baseQuery = `
     SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.status,
-           ms.parent_partner_id, p.business_name AS parent_name,
+           ms.partner_id, p.business_name AS parent_name,
            ms.created_at, ms.last_login
     FROM mobile_stockists ms
-    LEFT JOIN partners p ON p.id = ms.parent_partner_id
+    LEFT JOIN partners p ON p.id = ms.partner_id
     ${where} ORDER BY ms.created_at DESC`;
-  const countQuery = `SELECT COUNT(*) AS total FROM mobile_stockists ms LEFT JOIN partners p ON p.id = ms.parent_partner_id ${where}`;
+  const countQuery = `SELECT COUNT(*) AS total FROM mobile_stockists ms LEFT JOIN partners p ON p.id = ms.partner_id ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
   res.json({ success: true, ...result });
@@ -35,8 +34,8 @@ const getMobileStockists = asyncHandler(async (req, res) => {
 
 // POST /api/v1/mobile-stockists
 const createMobileStockist = asyncHandler(async (req, res) => {
-  const { name, email, phone, address, password, parent_partner_id } = req.body;
-  if (!name || !email || !password) throw ApiError.badRequest('name, email, and password are required');
+  const { name, email, phone, address, parent_partner_id } = req.body;
+  if (!name || !email) throw ApiError.badRequest('name and email are required');
 
   const [existing] = await pool.execute(
     'SELECT id FROM mobile_stockists WHERE email = ? AND is_deleted = 0 LIMIT 1',
@@ -45,12 +44,11 @@ const createMobileStockist = asyncHandler(async (req, res) => {
   if (existing.length > 0) throw ApiError.conflict('Email already registered as a Mobile Stockist');
 
   const parentId = parent_partner_id || req.user.partner_id;
-  const hashed = await bcrypt.hash(password, 12);
 
   const [result] = await pool.execute(
-    `INSERT INTO mobile_stockists (name, email, phone, address, password, parent_partner_id, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-    [name, email, phone || null, address || null, hashed, parentId]
+    `INSERT INTO mobile_stockists (name, email, phone, address, partner_id, status)
+     VALUES (?, ?, ?, ?, ?, 'active')`,
+    [name, email, phone || null, address || null, parentId]
   );
   res.status(201).json({ success: true, message: 'Mobile Stockist created', data: { id: result.insertId } });
 });

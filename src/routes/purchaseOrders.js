@@ -8,13 +8,15 @@ const { getPurchaseOrders, getPurchaseOrder, createPurchaseOrder, approvePurchas
 const router = Router();
 
 router.use(auth);
-router.use(roleGuard('super_admin'));
 
-router.get('/', getPurchaseOrders);
-router.get('/:id', param('id').isInt(), validate, getPurchaseOrder);
+const ALL_STOCKIST_ROLES = ['super_admin', 'provincial_stockist', 'city_stockist', 'staff'];
+
+router.get('/', roleGuard(...ALL_STOCKIST_ROLES), getPurchaseOrders);
+router.get('/:id', roleGuard(...ALL_STOCKIST_ROLES), param('id').isInt(), validate, getPurchaseOrder);
 
 router.post(
   '/',
+  roleGuard('super_admin', 'provincial_stockist', 'city_stockist'),
   [
     body('supplier').optional().trim(),
     body('items').isArray({ min: 1 }).withMessage('At least one item is required'),
@@ -27,6 +29,6 @@ router.post(
   createPurchaseOrder
 );
 
-router.patch('/:id/approve', param('id').isInt(), validate, approvePurchaseOrder);
+router.patch('/:id/approve', roleGuard('super_admin'), param('id').isInt(), validate, approvePurchaseOrder);
 
 module.exports = router;

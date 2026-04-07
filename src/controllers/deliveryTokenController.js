@@ -29,8 +29,8 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48h
 
     await conn.execute(
-      `INSERT INTO delivery_tokens (order_id, token, expires_at) VALUES (?, ?, ?)`,
-      [order_id, token, expiresAt]
+      `INSERT INTO delivery_tokens (order_id, token, expires_at, created_by) VALUES (?, ?, ?, ?)`,
+      [order_id, token, expiresAt, req.user.id]
     );
 
     // Update delivery_tracking with courier info
