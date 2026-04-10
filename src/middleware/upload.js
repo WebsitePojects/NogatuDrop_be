@@ -5,6 +5,9 @@ const env = require('../config/env');
 
 const MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
 const IMAGE_ONLY = ['image/jpeg', 'image/png', 'image/webp'];
+const hasCloudinaryConfig = Boolean(
+  env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET
+);
 
 function createUpload(folder, imageOnly = false, transformation = null) {
   const storage = new CloudinaryStorage({
@@ -20,6 +23,15 @@ function createUpload(folder, imageOnly = false, transformation = null) {
     storage,
     limits: { fileSize: env.MAX_FILE_SIZE_MB * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
+      if (!hasCloudinaryConfig) {
+        const err = new Error(
+          'Cloudinary upload is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in backend env.'
+        );
+        err.statusCode = 503;
+        cb(err, false);
+        return;
+      }
+
       const allowed = imageOnly ? IMAGE_ONLY : MIME_WHITELIST;
       if (allowed.includes(file.mimetype)) {
         cb(null, true);

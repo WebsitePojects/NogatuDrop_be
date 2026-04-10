@@ -4,6 +4,7 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const generateOrderNum = require('../utils/generateOrderNum');
 const { sendEmail, EMAIL } = require('../services/emailService');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
 
 // GET /api/v1/grn
 const getGRNs = asyncHandler(async (req, res) => {
@@ -158,11 +159,16 @@ const completeGRN = asyncHandler(async (req, res) => {
       }
 
       // Log stock movement
-      await conn.execute(
-        `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-         VALUES (?, ?, 'in', ?, 'grn', ?, 'Stock received via GRN')`,
-        [item.product_id, grn.warehouse_id, item.received_qty, grnId]
-      );
+      await insertStockMovement(conn, {
+        productId: item.product_id,
+        warehouseId: grn.warehouse_id,
+        movementType: 'in',
+        quantity: item.received_qty,
+        referenceType: 'grn',
+        referenceId: grnId,
+        notes: 'Stock received via GRN',
+        createdBy: req.user.id,
+      });
     }
 
     await conn.commit();

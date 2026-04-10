@@ -7,4 +7,5 @@ const r = Router();
 r.get('/', auth, c.getCouriers);
 r.post('/', auth, role('super_admin'), c.createCourier);
 r.put('/:id', auth, role('super_admin'), c.updateCourier);
+r.delete('/:id', auth, role('super_admin'), c.deleteCourier);
 module.exports = r;

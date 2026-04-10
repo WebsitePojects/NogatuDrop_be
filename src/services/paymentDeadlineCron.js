@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const pool = require('../config/db');
 const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
 
 async function runPaymentDeadlineCheck() {
   const conn = await pool.getConnection();
@@ -48,11 +49,15 @@ async function runPaymentDeadlineCheck() {
             );
 
             // Log stock movement
-            await conn.execute(
-              `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-               VALUES (?, ?, 'release', ?, 'order', ?, 'Reserved stock released — payment deadline expired')`,
-              [item.product_id, warehouseId, item.quantity, order.id]
-            );
+            await insertStockMovement(conn, {
+              productId: item.product_id,
+              warehouseId,
+              movementType: 'release',
+              quantity: item.quantity,
+              referenceType: 'order',
+              referenceId: order.id,
+              notes: 'Reserved stock released — payment deadline expired',
+            });
           }
         }
 

@@ -8,6 +8,7 @@ const r = Router();
 
 // Staff / super_admin generates delivery link
 r.post('/', auth, role('super_admin', 'staff', 'provincial_stockist', 'city_stockist'), c.generateDeliveryLink);
+r.get('/by-order/:orderId', auth, role('super_admin', 'staff', 'provincial_stockist', 'city_stockist'), c.getLatestDeliveryLinkForOrder);
 
 // Public — no auth — delivery page + completion
 r.get('/deliver/:token', c.getDeliveryInfo);

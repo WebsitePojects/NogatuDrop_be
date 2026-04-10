@@ -4,6 +4,57 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
+
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
+async function resolveSourceWarehouseIdForPartner(db, partnerId) {
+  if (!partnerId) return null;
+
+  const [partners] = await db.execute(
+    'SELECT id, parent_partner_id, stockist_level FROM partners WHERE id = ? LIMIT 1',
+    [partnerId]
+  );
+  if (partners.length === 0) return null;
+
+  const partner = partners[0];
+
+  if (partner.stockist_level === 'city_stockist' && partner.parent_partner_id) {
+    const [parentWh] = await db.execute(
+      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1',
+      [partner.parent_partner_id]
+    );
+    return parentWh[0]?.id || null;
+  }
+
+  if (partner.stockist_level === 'provincial_stockist') {
+    const [mfrWh] = await db.execute(
+      `SELECT id FROM warehouses WHERE type = 'manufacturer' LIMIT 1`
+    );
+    return mfrWh[0]?.id || null;
+  }
+
+  const [ownWh] = await db.execute(
+    'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1',
+    [partner.id]
+  );
+  return ownWh[0]?.id || null;
+}
+
+async function getLatestActiveToken(orderId) {
+  const [rows] = await pool.execute(
+    `SELECT id, token, expires_at, is_used, created_at
+     FROM delivery_tokens
+     WHERE order_id = ? AND is_used = 0 AND expires_at > NOW()
+     ORDER BY id DESC LIMIT 1`,
+    [orderId]
+  );
+  return rows[0] || null;
+}
 
 // POST /api/v1/delivery-tokens — generate magic link for an order
 const generateDeliveryLink = asyncHandler(async (req, res) => {
@@ -19,6 +70,20 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   if (orders[0].payment_status !== 'paid') throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
     throw ApiError.badRequest('Cannot generate delivery link for this order status');
+  }
+
+  const existingToken = await getLatestActiveToken(order_id);
+  if (existingToken) {
+    const existingMagicLink = `${env.PUBLIC_BASE_URL}/deliver/${existingToken.token}`;
+    return res.status(200).json({
+      success: true,
+      message: 'Active delivery link already exists',
+      data: {
+        token: existingToken.token,
+        magic_link: existingMagicLink,
+        expires_at: existingToken.expires_at,
+      },
+    });
   }
 
   const conn = await pool.getConnection();
@@ -52,7 +117,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     // Notify Stockist users that order is on its way
     const [partnerUsers] = await pool.execute(
-      `SELECT u.email, u.name FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0 AND u.status = 'active'`,
+      `SELECT u.id, u.email, u.name FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0 AND u.status = 'active'`,
       [orders[0].partner_id]
     );
 
@@ -66,10 +131,16 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
       const tmpl = EMAIL.riderDispatched(orders[0].order_number, courierName, courier_tracking_number);
       await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
 
-      await pool.execute(
-        `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, 'rider_dispatched', ?, ?, 'order', ?)`,
-        [pu.id, `Order Dispatched: #${orders[0].order_number}`, `Order #${orders[0].order_number} is on its way via ${courierName}.`, order_id]
-      );
+      if (pu.id) {
+        try {
+          await pool.execute(
+            `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, 'rider_dispatched', ?, ?, 'order', ?)`,
+            [pu.id, `Order Dispatched: #${orders[0].order_number}`, `Order #${orders[0].order_number} is on its way via ${courierName}.`, order_id]
+          );
+        } catch (notifyErr) {
+          console.error('[DeliveryToken] Failed to create rider_dispatched notification:', notifyErr?.message || notifyErr);
+        }
+      }
     }
 
     res.status(201).json({
@@ -83,6 +154,35 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   } finally {
     conn.release();
   }
+});
+
+// GET /api/v1/delivery-tokens/by-order/:orderId — latest active magic link for an order
+const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
+  const orderId = req.params.orderId;
+
+  const [orders] = await pool.execute(
+    'SELECT id, partner_id FROM orders WHERE id = ? AND is_deleted = 0 LIMIT 1',
+    [orderId]
+  );
+
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
+
+  const token = await getLatestActiveToken(orderId);
+  if (!token) {
+    return res.json({ success: true, data: null });
+  }
+
+  const magicLink = `${env.PUBLIC_BASE_URL}/deliver/${token.token}`;
+  return res.json({
+    success: true,
+    data: {
+      token: token.token,
+      magic_link: magicLink,
+      expires_at: token.expires_at,
+      is_used: token.is_used,
+      created_at: token.created_at,
+    },
+  });
 });
 
 // GET /deliver/:token — public, no auth — delivery page info for rider
@@ -138,10 +238,24 @@ const completeDelivery = asyncHandler(async (req, res) => {
   const { id: tokenId, order_id: orderId } = tokens[0];
   const podUrl = req.file.path; // Cloudinary URL
 
-  const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
-    [orderId]
-  );
+  let orders;
+  try {
+    [orders] = await pool.execute(
+      'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
+      [orderId]
+    );
+  } catch (err) {
+    if (isMissingColumn(err, 'source_warehouse_id')) {
+      [orders] = await pool.execute(
+        'SELECT id, order_number, partner_id FROM orders WHERE id = ? LIMIT 1',
+        [orderId]
+      );
+      orders = orders.map((row) => ({ ...row, source_warehouse_id: null }));
+    } else {
+      throw err;
+    }
+  }
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
   const order = orders[0];
 
   const conn = await pool.getConnection();
@@ -170,12 +284,31 @@ const completeDelivery = asyncHandler(async (req, res) => {
     );
 
     // Decrement current_stock and reserved_stock
-    const [items] = await conn.execute(
-      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
-      [orderId]
-    );
+    let items;
+    try {
+      [items] = await conn.execute(
+        'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
+        [orderId]
+      );
+    } catch (err) {
+      if (isMissingColumn(err, 'source_warehouse_id')) {
+        const [rows] = await conn.execute(
+          'SELECT product_id, quantity FROM order_items WHERE order_id = ?',
+          [orderId]
+        );
+        items = rows.map((row) => ({ ...row, source_warehouse_id: null }));
+      } else {
+        throw err;
+      }
+    }
+
+    let fallbackWarehouseId = order.source_warehouse_id || null;
+    if (!fallbackWarehouseId) {
+      fallbackWarehouseId = await resolveSourceWarehouseIdForPartner(conn, order.partner_id);
+    }
+
     for (const item of items) {
-      const wid = item.source_warehouse_id || order.source_warehouse_id;
+      const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
         await conn.execute(
           `UPDATE inventories
@@ -185,11 +318,15 @@ const completeDelivery = asyncHandler(async (req, res) => {
            WHERE product_id = ? AND warehouse_id = ?`,
           [item.quantity, item.quantity, item.product_id, wid]
         );
-        await conn.execute(
-          `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-           VALUES (?, ?, 'out', ?, 'order', ?, 'Stock out on delivery confirmation')`,
-          [item.product_id, wid, item.quantity, orderId]
-        );
+        await insertStockMovement(conn, {
+          productId: item.product_id,
+          warehouseId: wid,
+          movementType: 'out',
+          quantity: item.quantity,
+          referenceType: 'order',
+          referenceId: orderId,
+          notes: 'Stock out on delivery confirmation',
+        });
       }
     }
 
@@ -222,4 +359,4 @@ const completeDelivery = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { generateDeliveryLink, getDeliveryInfo, completeDelivery };
+module.exports = { generateDeliveryLink, getLatestDeliveryLinkForOrder, getDeliveryInfo, completeDelivery };

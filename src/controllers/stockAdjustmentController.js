@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
 
 // GET /api/v1/stock-adjustments
 const getAdjustments = asyncHandler(async (req, res) => {
@@ -76,11 +77,16 @@ const approveAdjustment = asyncHandler(async (req, res) => {
 
     // Log movement
     const movType = delta > 0 ? 'in' : 'out';
-    await conn.execute(
-      `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-       VALUES (?, ?, ?, ?, 'adjustment', ?, ?)`,
-      [adj.product_id, adj.warehouse_id, movType, Math.abs(delta), adj.id, adj.reason || 'Manual adjustment']
-    );
+    await insertStockMovement(conn, {
+      productId: adj.product_id,
+      warehouseId: adj.warehouse_id,
+      movementType: movType,
+      quantity: Math.abs(delta),
+      referenceType: 'adjustment',
+      referenceId: adj.id,
+      notes: adj.reason || 'Manual adjustment',
+      createdBy: req.user.id,
+    });
 
     await conn.execute(
       `UPDATE stock_adjustments SET status = 'approved', approved_by = ?, approved_at = NOW() WHERE id = ?`,

@@ -71,6 +71,19 @@ app.use((err, req, res, next) => {
     err = ApiError.badRequest(`File too large. Maximum size is ${env.MAX_FILE_SIZE_MB}MB`);
   }
 
+  if (!err.statusCode && typeof err.message === 'string') {
+    const msg = err.message.toLowerCase();
+    const cloudinaryConfigIssue =
+      msg.includes('cloudinary') &&
+      (msg.includes('api key') || msg.includes('api_key') || msg.includes('api secret') || msg.includes('api_secret') || msg.includes('cloud name') || msg.includes('cloud_name'));
+
+    if (cloudinaryConfigIssue) {
+      err = ApiError.serviceUnavailable(
+        'Cloudinary upload is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in backend env.'
+      );
+    }
+  }
+
   const statusCode = err.statusCode || 500;
   const message = err.message || 'Internal server error';
 

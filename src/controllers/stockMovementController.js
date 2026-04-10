@@ -2,6 +2,12 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const paginate = require('../utils/paginate');
 
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
 // GET /api/v1/stock-movements — read-only event log
 const getStockMovements = asyncHandler(async (req, res) => {
   const { page, limit, product_id, warehouse_id, movement_type, date_from, date_to } = req.query;
@@ -32,7 +38,23 @@ const getStockMovements = asyncHandler(async (req, res) => {
     JOIN warehouses w ON w.id = sm.warehouse_id
     ${where}`;
 
-  const result = await paginate(baseQuery, countQuery, params, page, limit);
+  let result;
+  try {
+    result = await paginate(baseQuery, countQuery, params, page, limit);
+  } catch (err) {
+    if (!isMissingColumn(err, 'quantity_change')) throw err;
+
+    const compatBaseQuery = `
+      SELECT sm.id, sm.product_id, p.name AS product_name, sm.warehouse_id, w.name AS warehouse_name,
+             sm.movement_type, sm.quantity AS quantity_change, sm.reference_type, sm.reference_id, sm.notes, sm.created_at
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      JOIN warehouses w ON w.id = sm.warehouse_id
+      ${where} ORDER BY sm.created_at DESC`;
+
+    result = await paginate(compatBaseQuery, countQuery, params, page, limit);
+  }
+
   res.json({ success: true, ...result });
 });
 

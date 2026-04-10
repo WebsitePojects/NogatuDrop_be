@@ -6,12 +6,118 @@ const generateOrderNum = require('../utils/generateOrderNum');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const cache = require('../services/cacheService');
 const env = require('../config/env');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
+
+const isMissingSoftDeleteColumn = (err) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes("'is_deleted'")
+);
+
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
+async function executeSoftDeleteAware(db, primarySql, params = [], fallbackSql = null) {
+  try {
+    return await db.execute(primarySql, params);
+  } catch (err) {
+    if (isMissingSoftDeleteColumn(err) && fallbackSql) {
+      return db.execute(fallbackSql, params);
+    }
+    throw err;
+  }
+}
+
+async function getOrderRowsWithOptionalSourceColumn(db, whereClause, params = []) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders ${whereClause}`,
+      params
+    );
+    return rows;
+  } catch (err) {
+    if (isMissingColumn(err, 'source_warehouse_id')) {
+      const [rows] = await db.execute(
+        `SELECT id, order_number, partner_id, status FROM orders ${whereClause}`,
+        params
+      );
+      return rows.map((row) => ({ ...row, source_warehouse_id: null }));
+    }
+    throw err;
+  }
+}
+
+async function getOrderItemsWithOptionalSourceColumn(db, orderId) {
+  try {
+    const [rows] = await db.execute(
+      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
+      [orderId]
+    );
+    return rows;
+  } catch (err) {
+    if (isMissingColumn(err, 'source_warehouse_id')) {
+      const [rows] = await db.execute(
+        'SELECT product_id, quantity FROM order_items WHERE order_id = ?',
+        [orderId]
+      );
+      return rows.map((row) => ({ ...row, source_warehouse_id: null }));
+    }
+    throw err;
+  }
+}
+
+async function resolveSourceWarehouseIdForPartner(db, partnerId) {
+  if (!partnerId) return null;
+
+  const [partners] = await executeSoftDeleteAware(
+    db,
+    'SELECT id, parent_partner_id, stockist_level FROM partners WHERE id = ? AND is_deleted = 0 LIMIT 1',
+    [partnerId],
+    'SELECT id, parent_partner_id, stockist_level FROM partners WHERE id = ? LIMIT 1'
+  );
+  if (partners.length === 0) return null;
+
+  const partner = partners[0];
+
+  if (partner.stockist_level === 'city_stockist' && partner.parent_partner_id) {
+    const [parentWh] = await executeSoftDeleteAware(
+      db,
+      'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
+      [partner.parent_partner_id],
+      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
+    );
+    return parentWh[0]?.id || null;
+  }
+
+  if (partner.stockist_level === 'provincial_stockist') {
+    const [mfrWh] = await executeSoftDeleteAware(
+      db,
+      `SELECT id FROM warehouses WHERE type = 'manufacturer' AND is_deleted = 0 LIMIT 1`,
+      [],
+      `SELECT id FROM warehouses WHERE type = 'manufacturer' LIMIT 1`
+    );
+    return mfrWh[0]?.id || null;
+  }
+
+  const [ownWh] = await executeSoftDeleteAware(
+    db,
+    'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
+    [partner.id],
+    'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
+  );
+  return ownWh[0]?.id || null;
+}
 
 // ─── Helper: notify users of a partner ───────────────────────────────────────
 async function notifyPartnerUsers(conn, partnerId, type, title, message, entityId) {
-  const [users] = await conn.execute(
+  const [users] = await executeSoftDeleteAware(
+    conn,
     `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,
-    [partnerId]
+    [partnerId],
+    `SELECT id, email, name FROM users WHERE partner_id = ? AND status = 'active'`
   );
   for (const u of users) {
     await conn.execute(
@@ -23,9 +129,13 @@ async function notifyPartnerUsers(conn, partnerId, type, title, message, entityI
 }
 
 async function notifySuperAdmins(conn, type, title, message, entityId) {
-  const [admins] = await conn.execute(
+  const [admins] = await executeSoftDeleteAware(
+    conn,
     `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
-     WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
+     WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`,
+    [],
+    `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin' AND u.status = 'active'`
   );
   for (const a of admins) {
     await conn.execute(
@@ -140,9 +250,11 @@ const createOrder = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    const [partner] = await conn.execute(
+    const [partner] = await executeSoftDeleteAware(
+      conn,
       'SELECT id, business_name, parent_partner_id, stockist_level, discount_pct FROM partners WHERE id = ? AND is_deleted = 0',
-      [partnerId]
+      [partnerId],
+      'SELECT id, business_name, parent_partner_id, stockist_level, discount_pct FROM partners WHERE id = ?'
     );
     if (partner.length === 0) throw ApiError.badRequest('Partner account not found');
 
@@ -153,33 +265,46 @@ const createOrder = asyncHandler(async (req, res) => {
     // Provincial stockist → order from Goldenstar (type = 'manufacturer')
     let sourceWarehouseId = null;
     if (partnerData.stockist_level === 'city_stockist' && partnerData.parent_partner_id) {
-      const [parentWh] = await conn.execute(
+      const [parentWh] = await executeSoftDeleteAware(
+        conn,
         'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-        [partnerData.parent_partner_id]
+        [partnerData.parent_partner_id],
+        'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
       );
       if (parentWh.length > 0) sourceWarehouseId = parentWh[0].id;
     } else if (partnerData.stockist_level === 'provincial_stockist') {
       // Provincial stockist sources stock from the Goldenstar manufacturer warehouse
-      const [mfrWh] = await conn.execute(
-        `SELECT id FROM warehouses WHERE type = 'manufacturer' AND is_deleted = 0 LIMIT 1`
+      const [mfrWh] = await executeSoftDeleteAware(
+        conn,
+        `SELECT id FROM warehouses WHERE type = 'manufacturer' AND is_deleted = 0 LIMIT 1`,
+        [],
+        `SELECT id FROM warehouses WHERE type = 'manufacturer' LIMIT 1`
       );
       if (mfrWh.length > 0) sourceWarehouseId = mfrWh[0].id;
     } else {
       // Fallback: city stockist with no parent — use own warehouse
-      const [ownWh] = await conn.execute(
+      const [ownWh] = await executeSoftDeleteAware(
+        conn,
         'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-        [partnerId]
+        [partnerId],
+        'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
       );
       if (ownWh.length > 0) sourceWarehouseId = ownWh[0].id;
     }
 
-    const [cartItems] = await conn.execute(
+    const [cartItems] = await executeSoftDeleteAware(
+      conn,
       `SELECT ci.id, ci.product_id, ci.quantity, p.name AS product_name,
               p.partner_price, p.sku
        FROM cart_items ci
        JOIN products p ON p.id = ci.product_id
        WHERE ci.user_id = ? AND p.is_deleted = 0 AND p.is_active = 1`,
-      [userId]
+      [userId],
+      `SELECT ci.id, ci.product_id, ci.quantity, p.name AS product_name,
+              p.partner_price, p.sku
+       FROM cart_items ci
+       JOIN products p ON p.id = ci.product_id
+       WHERE ci.user_id = ? AND p.is_active = 1`
     );
 
     if (cartItems.length === 0) throw ApiError.badRequest('Cart is empty');
@@ -197,10 +322,13 @@ const createOrder = asyncHandler(async (req, res) => {
     // Check available stock if source warehouse known
     if (sourceWarehouseId) {
       for (const item of cartItems) {
-        const [inv] = await conn.execute(
+        const [inv] = await executeSoftDeleteAware(
+          conn,
           `SELECT current_stock, reserved_stock FROM inventories
            WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
-          [item.product_id, sourceWarehouseId]
+          [item.product_id, sourceWarehouseId],
+          `SELECT current_stock, reserved_stock FROM inventories
+           WHERE product_id = ? AND warehouse_id = ?`
         );
         const available = inv.length > 0 ? inv[0].current_stock - inv[0].reserved_stock : 0;
         if (available < item.quantity) {
@@ -211,19 +339,46 @@ const createOrder = asyncHandler(async (req, res) => {
 
     const orderNumber = await generateOrderNum('ORD', 'orders', 'order_number');
 
-    const [orderResult] = await conn.execute(
-      `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, total_amount, notes)
-       VALUES (?, ?, ?, 'user', ?, ?, ?)`,
-      [orderNumber, partnerId, userId, sourceWarehouseId, totalAmount, notes || null]
-    );
+    let orderResult;
+    try {
+      [orderResult] = await conn.execute(
+        `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, total_amount, notes)
+         VALUES (?, ?, ?, 'user', ?, ?, ?)`,
+        [orderNumber, partnerId, userId, sourceWarehouseId, totalAmount, notes || null]
+      );
+    } catch (err) {
+      // Backward compatibility for DBs missing v2 order columns.
+      if (isMissingColumn(err, 'source_warehouse_id') || isMissingColumn(err, 'placed_by_type')) {
+        [orderResult] = await conn.execute(
+          `INSERT INTO orders (order_number, partner_id, placed_by, total_amount, notes)
+           VALUES (?, ?, ?, ?, ?)`,
+          [orderNumber, partnerId, userId, totalAmount, notes || null]
+        );
+      } else {
+        throw err;
+      }
+    }
     const orderId = orderResult.insertId;
 
     for (const item of cartItems) {
-      await conn.execute(
-        `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
-         VALUES (?, ?, ?, ?, ?)`,
-        [orderId, item.product_id, sourceWarehouseId, item.quantity, item.lockedUnitPrice]
-      );
+      try {
+        await conn.execute(
+          `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
+           VALUES (?, ?, ?, ?, ?)`,
+          [orderId, item.product_id, sourceWarehouseId, item.quantity, item.lockedUnitPrice]
+        );
+      } catch (err) {
+        // Backward compatibility for DBs where order_items has no source_warehouse_id.
+        if (isMissingColumn(err, 'source_warehouse_id')) {
+          await conn.execute(
+            `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+             VALUES (?, ?, ?, ?)`,
+            [orderId, item.product_id, item.quantity, item.lockedUnitPrice]
+          );
+        } else {
+          throw err;
+        }
+      }
     }
 
     // Reserve stock
@@ -234,11 +389,16 @@ const createOrder = asyncHandler(async (req, res) => {
            WHERE product_id = ? AND warehouse_id = ?`,
           [item.quantity, item.product_id, sourceWarehouseId]
         );
-        await conn.execute(
-          `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-           VALUES (?, ?, 'reserve', ?, 'order', ?, 'Stock reserved on order placement')`,
-          [item.product_id, sourceWarehouseId, item.quantity, orderId]
-        );
+        await insertStockMovement(conn, {
+          productId: item.product_id,
+          warehouseId: sourceWarehouseId,
+          movementType: 'reserve',
+          quantity: item.quantity,
+          referenceType: 'order',
+          referenceId: orderId,
+          notes: 'Stock reserved on order placement',
+          createdBy: req.user.id,
+        });
       }
     }
 
@@ -280,12 +440,19 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   // Auto-assign nearest stockist (city or provincial) based on customer address
   // For now, assign the first available city/provincial stockist
   // In production this uses ST_Distance_Sphere on warehouse coordinates
-  const [nearestPartner] = await pool.execute(
+  const [nearestPartner] = await executeSoftDeleteAware(
+    pool,
     `SELECT p.id AS partner_id, w.id AS warehouse_id
      FROM partners p
      JOIN warehouses w ON w.partner_id = p.id
      WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
        AND p.is_deleted = 0 AND w.is_deleted = 0
+     LIMIT 1`,
+    [],
+    `SELECT p.id AS partner_id, w.id AS warehouse_id
+     FROM partners p
+     JOIN warehouses w ON w.partner_id = p.id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
      LIMIT 1`
   );
 
@@ -301,9 +468,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     const resolvedItems = [];
 
     for (const item of items) {
-      const [products] = await conn.execute(
+      const [products] = await executeSoftDeleteAware(
+        conn,
         'SELECT id, name, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
-        [item.product_id]
+        [item.product_id],
+        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
       );
       if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
       const price = parseFloat(products[0].partner_price);
@@ -313,22 +482,60 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
 
-    const [orderResult] = await conn.execute(
-      `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
-                           customer_name, customer_phone, customer_email, customer_address,
-                           total_amount, notes)
-       VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
-      [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
-       customer_email || null, customer_address, totalAmount, notes || null]
-    );
+    let orderResult;
+    try {
+      [orderResult] = await conn.execute(
+        `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+                             customer_name, customer_phone, customer_email, customer_address,
+                             total_amount, notes)
+         VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+        [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+         customer_email || null, customer_address, totalAmount, notes || null]
+      );
+    } catch (err) {
+      // Some DBs are partially migrated and only miss source_warehouse_id.
+      if (isMissingColumn(err, 'source_warehouse_id')) {
+        try {
+          [orderResult] = await conn.execute(
+            `INSERT INTO orders (order_number, partner_id, placed_by_type,
+                                 customer_name, customer_phone, customer_email, customer_address,
+                                 total_amount, notes)
+             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, customer_name, customer_phone || null,
+             customer_email || null, customer_address, totalAmount, notes || null]
+          );
+        } catch (innerErr) {
+          if (isMissingColumn(innerErr, 'placed_by_type') || isMissingColumn(innerErr, 'customer_name')) {
+            throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
+          }
+          throw innerErr;
+        }
+      } else if (isMissingColumn(err, 'placed_by_type') || isMissingColumn(err, 'customer_name')) {
+        throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
+      } else {
+        throw err;
+      }
+    }
     const orderId = orderResult.insertId;
 
     for (const item of resolvedItems) {
-      await conn.execute(
-        `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
-         VALUES (?, ?, ?, ?, ?)`,
-        [orderId, item.product_id, sourceWarehouseId, item.quantity, item.unit_price]
-      );
+      try {
+        await conn.execute(
+          `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
+           VALUES (?, ?, ?, ?, ?)`,
+          [orderId, item.product_id, sourceWarehouseId, item.quantity, item.unit_price]
+        );
+      } catch (err) {
+        if (isMissingColumn(err, 'source_warehouse_id')) {
+          await conn.execute(
+            `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+             VALUES (?, ?, ?, ?)`,
+            [orderId, item.product_id, item.quantity, item.unit_price]
+          );
+        } else {
+          throw err;
+        }
+      }
     }
 
     await conn.commit();
@@ -350,22 +557,31 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
-  const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0',
+  const orders = await getOrderRowsWithOptionalSourceColumn(
+    pool,
+    'WHERE id = ? AND is_deleted = 0',
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be approved');
 
+  let sourceWarehouseId = orders[0].source_warehouse_id || null;
+  if (!sourceWarehouseId) {
+    sourceWarehouseId = await resolveSourceWarehouseIdForPartner(pool, orders[0].partner_id);
+  }
+
   const deadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
 
   // Find bank account for the source warehouse
   let bankDetails = null;
-  if (orders[0].source_warehouse_id) {
-    const [banks] = await pool.execute(
+  if (sourceWarehouseId) {
+    const [banks] = await executeSoftDeleteAware(
+      pool,
       `SELECT bank_name, account_name, account_number FROM bank_accounts
        WHERE warehouse_id = ? AND is_active = 1 AND is_deleted = 0 LIMIT 1`,
-      [orders[0].source_warehouse_id]
+      [sourceWarehouseId],
+      `SELECT bank_name, account_name, account_number FROM bank_accounts
+       WHERE warehouse_id = ? AND is_active = 1 LIMIT 1`
     );
     if (banks.length > 0) {
       const b = banks[0];
@@ -409,8 +625,9 @@ const rejectOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0',
+  const orders = await getOrderRowsWithOptionalSourceColumn(
+    pool,
+    'WHERE id = ? AND is_deleted = 0',
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
@@ -425,22 +642,28 @@ const rejectOrder = asyncHandler(async (req, res) => {
     );
 
     // Release reserved stock
-    const [items] = await conn.execute(
-      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
-      [orderId]
-    );
+    const items = await getOrderItemsWithOptionalSourceColumn(conn, orderId);
+    let fallbackWarehouseId = orders[0].source_warehouse_id || null;
+    if (!fallbackWarehouseId) {
+      fallbackWarehouseId = await resolveSourceWarehouseIdForPartner(conn, orders[0].partner_id);
+    }
     for (const item of items) {
-      const wid = item.source_warehouse_id || orders[0].source_warehouse_id;
+      const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
         await conn.execute(
           `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
           [item.quantity, item.product_id, wid]
         );
-        await conn.execute(
-          `INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_change, reference_type, reference_id, notes)
-           VALUES (?, ?, 'release', ?, 'order', ?, 'Reserved stock released — order rejected')`,
-          [item.product_id, wid, item.quantity, orderId]
-        );
+        await insertStockMovement(conn, {
+          productId: item.product_id,
+          warehouseId: wid,
+          movementType: 'release',
+          quantity: item.quantity,
+          referenceType: 'order',
+          referenceId: orderId,
+          notes: 'Reserved stock released — order rejected',
+          createdBy: req.user.id,
+        });
       }
     }
 
@@ -477,8 +700,9 @@ const cancelOrder = asyncHandler(async (req, res) => {
     ? [orderId, req.user.partner_id]
     : [orderId];
 
-  const [orders] = await pool.execute(
-    `SELECT id, order_number, partner_id, source_warehouse_id, status FROM orders WHERE id = ? AND is_deleted = 0${whereExtra}`,
+  const orders = await getOrderRowsWithOptionalSourceColumn(
+    pool,
+    `WHERE id = ? AND is_deleted = 0${whereExtra}`,
     params
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
@@ -493,12 +717,13 @@ const cancelOrder = asyncHandler(async (req, res) => {
     );
 
     // Release reserved stock
-    const [items] = await conn.execute(
-      'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
-      [orderId]
-    );
+    const items = await getOrderItemsWithOptionalSourceColumn(conn, orderId);
+    let fallbackWarehouseId = orders[0].source_warehouse_id || null;
+    if (!fallbackWarehouseId) {
+      fallbackWarehouseId = await resolveSourceWarehouseIdForPartner(conn, orders[0].partner_id);
+    }
     for (const item of items) {
-      const wid = item.source_warehouse_id || orders[0].source_warehouse_id;
+      const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
         await conn.execute(
           `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
