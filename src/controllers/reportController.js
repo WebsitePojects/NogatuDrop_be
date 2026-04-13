@@ -2,6 +2,12 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const cache = require('../services/cacheService');
 
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
 // Helper: parse date param, return null if empty string
 const parseDateParam = (val) => (val && val.trim() !== '' ? val.trim() : null);
 
@@ -150,36 +156,84 @@ const getMovementsReport = asyncHandler(async (req, res) => {
   const cacheKey = `report:movements:${req.user.role_slug}:${req.user.partner_id || 'all'}:${fromDate}:${toDate}`;
 
   const data = await cache.getOrSet(cacheKey, 120, async () => {
-    const params = [];
-    let where = 'WHERE sm.is_deleted = 0';
+    const buildQuery = ({ includeSoftDelete = true, partnerScope = 'warehouse' } = {}) => {
+      const whereParts = [];
+      const params = [];
 
-    // Filter by partner: inventories don't have partner_id, filter via warehouses
-    if (req.user.role_slug !== 'super_admin' && req.user.partner_id) {
-      where += ' AND w.partner_id = ?';
-      params.push(req.user.partner_id);
-    }
-    if (fromDate) {
-      where += ' AND sm.created_at >= ?';
-      params.push(fromDate);
-    }
-    if (toDate) {
-      where += ' AND sm.created_at <= ?';
-      params.push(toDate + ' 23:59:59');
+      if (includeSoftDelete) {
+        whereParts.push('sm.is_deleted = 0');
+      }
+
+      // Filter by partner; fallback can scope via inventory ownership on older schemas.
+      if (req.user.role_slug !== 'super_admin' && req.user.partner_id) {
+        if (partnerScope === 'warehouse') {
+          whereParts.push('w.partner_id = ?');
+        } else {
+          whereParts.push('i.partner_id = ?');
+        }
+        params.push(req.user.partner_id);
+      }
+
+      if (fromDate) {
+        whereParts.push('sm.created_at >= ?');
+        params.push(fromDate);
+      }
+      if (toDate) {
+        whereParts.push('sm.created_at <= ?');
+        params.push(toDate + ' 23:59:59');
+      }
+
+      const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+      return {
+        sql: `
+          SELECT sm.id, sm.movement_type, sm.quantity, sm.reference_type, sm.reference_id,
+                 sm.notes, sm.created_at,
+                 p.name AS product_name, p.sku,
+                 w.name AS warehouse_name
+          FROM stock_movements sm
+          JOIN inventories i ON i.id = sm.inventory_id
+          JOIN products p ON p.id = i.product_id
+          JOIN warehouses w ON w.id = i.warehouse_id
+          ${whereClause}
+          ORDER BY sm.created_at DESC
+          LIMIT 200
+        `,
+        params,
+      };
+    };
+
+    const variants = [
+      { includeSoftDelete: true, partnerScope: 'warehouse' },
+      { includeSoftDelete: false, partnerScope: 'warehouse' },
+      { includeSoftDelete: false, partnerScope: 'inventory' },
+      { includeSoftDelete: true, partnerScope: 'inventory' },
+    ];
+
+    let movements = [];
+    let finalError = null;
+
+    for (const variant of variants) {
+      const query = buildQuery(variant);
+      try {
+        [movements] = await pool.execute(query.sql, query.params);
+        finalError = null;
+        break;
+      } catch (err) {
+        if (
+          isMissingColumn(err, 'sm.is_deleted') ||
+          isMissingColumn(err, 'w.partner_id') ||
+          isMissingColumn(err, 'i.partner_id')
+        ) {
+          finalError = err;
+          continue;
+        }
+        throw err;
+      }
     }
 
-    const [movements] = await pool.execute(`
-      SELECT sm.id, sm.movement_type, sm.quantity, sm.reference_type, sm.reference_id,
-             sm.notes, sm.created_at,
-             p.name AS product_name, p.sku,
-             w.name AS warehouse_name
-      FROM stock_movements sm
-      JOIN inventories i ON i.id = sm.inventory_id
-      JOIN products p ON p.id = i.product_id
-      JOIN warehouses w ON w.id = i.warehouse_id
-      ${where}
-      ORDER BY sm.created_at DESC
-      LIMIT 200
-    `, params);
+    if (finalError) {
+      throw finalError;
+    }
 
     return { movements };
   });

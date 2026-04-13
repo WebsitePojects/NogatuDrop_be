@@ -6,7 +6,13 @@
   "scripts": {
     "dev": "nodemon --env-file=.env.dev src/server.js",
     "start": "node --env-file=.env.prod src/server.js",
-    "seed": "node --env-file=.env.dev src/seed.js"
+    "seed": "node --env-file=.env.dev src/seed.js",
+    "migrate:finalize": "node --env-file=.env.dev scripts/runSqlFile.js sql/finalize_schema_2026_04_14.sql",
+    "smoke:verify": "node --env-file=.env.dev scripts/smokeApiVerify.js",
+    "smoke:deep": "node --env-file=.env.dev scripts/smokeApiHealth.js",
+    "smoke:health": "npm run smoke:verify",
+    "post:migration": "node --env-file=.env.dev scripts/postMigration.js",
+    "post:migration:deep": "set RUN_DEEP_SMOKE=true&& node --env-file=.env.dev scripts/postMigration.js"
   },
   "dependencies": {
     "@getbrevo/brevo": "^5.0.3",

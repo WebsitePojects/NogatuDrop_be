@@ -3,11 +3,40 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
-const { getTracking, postPing, updateTrackingStatus, createTracking } = require('../controllers/trackingController');
+const {
+  getTracking,
+  getPublicTracking,
+  getOrderPings,
+  getActiveTracking,
+  postPingByToken,
+  postPing,
+  updateTrackingStatus,
+  createTracking,
+} = require('../controllers/trackingController');
 
 const router = Router();
 
+// Public tracking endpoints (no auth)
+router.get('/public/:orderNumber', param('orderNumber').isString().trim().notEmpty(), validate, getPublicTracking);
+
+router.post(
+  '/ping/:token',
+  [
+    param('token').isString().trim().notEmpty(),
+    body('lat').isFloat().withMessage('Latitude is required'),
+    body('lng').isFloat().withMessage('Longitude is required'),
+    body('speed_kmh').optional().isFloat(),
+    body('accuracy_meters').optional().isFloat(),
+  ],
+  validate,
+  postPingByToken
+);
+
 router.use(auth);
+
+router.get('/active', roleGuard('super_admin'), getActiveTracking);
+
+router.get('/:orderId/pings', param('orderId').isInt(), validate, getOrderPings);
 
 router.get('/:orderId', param('orderId').isInt(), validate, getTracking);
 
@@ -32,6 +61,8 @@ router.post(
     body('tracking_id').isInt().withMessage('Tracking ID is required'),
     body('lat').isFloat().withMessage('Latitude is required'),
     body('lng').isFloat().withMessage('Longitude is required'),
+    body('speed_kmh').optional().isFloat(),
+    body('accuracy_meters').optional().isFloat(),
   ],
   validate,
   postPing
@@ -45,6 +76,8 @@ router.post(
   [
     body('lat').isFloat().withMessage('Latitude is required'),
     body('lng').isFloat().withMessage('Longitude is required'),
+    body('speed_kmh').optional().isFloat(),
+    body('accuracy_meters').optional().isFloat(),
   ],
   validate,
   postPing

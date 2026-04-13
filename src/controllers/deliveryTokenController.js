@@ -12,6 +12,40 @@ const isMissingColumn = (err, columnName) => (
   String(err.message || '').includes(`'${columnName}'`)
 );
 
+async function getWarehouseIdByPartner(db, partnerId) {
+  if (!partnerId) return null;
+
+  try {
+    const [rows] = await db.execute(
+      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1',
+      [partnerId]
+    );
+    return rows[0]?.id || null;
+  } catch (err) {
+    if (!isMissingColumn(err, 'partner_id')) {
+      throw err;
+    }
+  }
+
+  try {
+    const [rows] = await db.execute(
+      'SELECT warehouse_id AS id FROM inventories WHERE partner_id = ? AND is_active = 1 ORDER BY warehouse_id ASC LIMIT 1',
+      [partnerId]
+    );
+    return rows[0]?.id || null;
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_active')) {
+      throw err;
+    }
+  }
+
+  const [rows] = await db.execute(
+    'SELECT warehouse_id AS id FROM inventories WHERE partner_id = ? ORDER BY warehouse_id ASC LIMIT 1',
+    [partnerId]
+  );
+  return rows[0]?.id || null;
+}
+
 async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   if (!partnerId) return null;
 
@@ -24,11 +58,7 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   const partner = partners[0];
 
   if (partner.stockist_level === 'city_stockist' && partner.parent_partner_id) {
-    const [parentWh] = await db.execute(
-      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1',
-      [partner.parent_partner_id]
-    );
-    return parentWh[0]?.id || null;
+    return getWarehouseIdByPartner(db, partner.parent_partner_id);
   }
 
   if (partner.stockist_level === 'provincial_stockist') {
@@ -38,11 +68,7 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
     return mfrWh[0]?.id || null;
   }
 
-  const [ownWh] = await db.execute(
-    'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1',
-    [partner.id]
-  );
-  return ownWh[0]?.id || null;
+  return getWarehouseIdByPartner(db, partner.id);
 }
 
 async function getLatestActiveToken(orderId) {
@@ -237,6 +263,9 @@ const completeDelivery = asyncHandler(async (req, res) => {
 
   const { id: tokenId, order_id: orderId } = tokens[0];
   const podUrl = req.file.path; // Cloudinary URL
+  const recipientName = req.body.recipient_name || null;
+  const gpsLat = req.body.latitude || req.body.gps_lat || null;
+  const gpsLng = req.body.longitude || req.body.gps_lng || null;
 
   let orders;
   try {
@@ -266,10 +295,25 @@ const completeDelivery = asyncHandler(async (req, res) => {
     await conn.execute(`UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE id = ?`, [tokenId]);
 
     // Create POD record
-    await conn.execute(
-      `INSERT INTO proof_of_delivery (order_id, token_id, photo_url, notes) VALUES (?, ?, ?, ?)`,
-      [orderId, tokenId, podUrl, req.body.notes || null]
-    );
+    try {
+      await conn.execute(
+        `INSERT INTO proof_of_delivery (order_id, token_id, photo_url, gps_lat, gps_lng, recipient_name, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [orderId, tokenId, podUrl, gpsLat, gpsLng, recipientName, req.body.notes || null]
+      );
+    } catch (err) {
+      if (
+        !isMissingColumn(err, 'gps_lat') &&
+        !isMissingColumn(err, 'recipient_name')
+      ) {
+        throw err;
+      }
+
+      await conn.execute(
+        `INSERT INTO proof_of_delivery (order_id, token_id, photo_url, notes) VALUES (?, ?, ?, ?)`,
+        [orderId, tokenId, podUrl, req.body.notes || null]
+      );
+    }
 
     // Update delivery_tracking
     await conn.execute(

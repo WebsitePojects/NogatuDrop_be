@@ -69,6 +69,42 @@ async function getOrderItemsWithOptionalSourceColumn(db, orderId) {
   }
 }
 
+async function getWarehouseIdByPartner(db, partnerId) {
+  if (!partnerId) return null;
+
+  try {
+    const [rows] = await executeSoftDeleteAware(
+      db,
+      'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
+      [partnerId],
+      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
+    );
+    return rows[0]?.id || null;
+  } catch (err) {
+    if (!isMissingColumn(err, 'partner_id') && !isMissingColumn(err, 'w.partner_id')) {
+      throw err;
+    }
+  }
+
+  try {
+    const [rows] = await db.execute(
+      'SELECT warehouse_id AS id FROM inventories WHERE partner_id = ? AND is_active = 1 ORDER BY warehouse_id ASC LIMIT 1',
+      [partnerId]
+    );
+    return rows[0]?.id || null;
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_active')) {
+      throw err;
+    }
+  }
+
+  const [rows] = await db.execute(
+    'SELECT warehouse_id AS id FROM inventories WHERE partner_id = ? ORDER BY warehouse_id ASC LIMIT 1',
+    [partnerId]
+  );
+  return rows[0]?.id || null;
+}
+
 async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   if (!partnerId) return null;
 
@@ -83,13 +119,7 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   const partner = partners[0];
 
   if (partner.stockist_level === 'city_stockist' && partner.parent_partner_id) {
-    const [parentWh] = await executeSoftDeleteAware(
-      db,
-      'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-      [partner.parent_partner_id],
-      'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
-    );
-    return parentWh[0]?.id || null;
+    return getWarehouseIdByPartner(db, partner.parent_partner_id);
   }
 
   if (partner.stockist_level === 'provincial_stockist') {
@@ -102,13 +132,7 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
     return mfrWh[0]?.id || null;
   }
 
-  const [ownWh] = await executeSoftDeleteAware(
-    db,
-    'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-    [partner.id],
-    'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
-  );
-  return ownWh[0]?.id || null;
+  return getWarehouseIdByPartner(db, partner.id);
 }
 
 // ─── Helper: notify users of a partner ───────────────────────────────────────
@@ -263,34 +287,7 @@ const createOrder = asyncHandler(async (req, res) => {
     // Determine source warehouse
     // City stockist → order from parent provincial warehouse
     // Provincial stockist → order from Goldenstar (type = 'manufacturer')
-    let sourceWarehouseId = null;
-    if (partnerData.stockist_level === 'city_stockist' && partnerData.parent_partner_id) {
-      const [parentWh] = await executeSoftDeleteAware(
-        conn,
-        'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-        [partnerData.parent_partner_id],
-        'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
-      );
-      if (parentWh.length > 0) sourceWarehouseId = parentWh[0].id;
-    } else if (partnerData.stockist_level === 'provincial_stockist') {
-      // Provincial stockist sources stock from the Goldenstar manufacturer warehouse
-      const [mfrWh] = await executeSoftDeleteAware(
-        conn,
-        `SELECT id FROM warehouses WHERE type = 'manufacturer' AND is_deleted = 0 LIMIT 1`,
-        [],
-        `SELECT id FROM warehouses WHERE type = 'manufacturer' LIMIT 1`
-      );
-      if (mfrWh.length > 0) sourceWarehouseId = mfrWh[0].id;
-    } else {
-      // Fallback: city stockist with no parent — use own warehouse
-      const [ownWh] = await executeSoftDeleteAware(
-        conn,
-        'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 LIMIT 1',
-        [partnerId],
-        'SELECT id FROM warehouses WHERE partner_id = ? LIMIT 1'
-      );
-      if (ownWh.length > 0) sourceWarehouseId = ownWh[0].id;
-    }
+    const sourceWarehouseId = await resolveSourceWarehouseIdForPartner(conn, partnerId);
 
     const [cartItems] = await executeSoftDeleteAware(
       conn,
@@ -440,21 +437,50 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   // Auto-assign nearest stockist (city or provincial) based on customer address
   // For now, assign the first available city/provincial stockist
   // In production this uses ST_Distance_Sphere on warehouse coordinates
-  const [nearestPartner] = await executeSoftDeleteAware(
-    pool,
-    `SELECT p.id AS partner_id, w.id AS warehouse_id
-     FROM partners p
-     JOIN warehouses w ON w.partner_id = p.id
-     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       AND p.is_deleted = 0 AND w.is_deleted = 0
-     LIMIT 1`,
-    [],
-    `SELECT p.id AS partner_id, w.id AS warehouse_id
-     FROM partners p
-     JOIN warehouses w ON w.partner_id = p.id
-     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-     LIMIT 1`
-  );
+  let nearestPartner;
+  try {
+    [nearestPartner] = await executeSoftDeleteAware(
+      pool,
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+         AND p.is_deleted = 0 AND w.is_deleted = 0
+       LIMIT 1`,
+      [],
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       LIMIT 1`
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
+      throw err;
+    }
+
+    [nearestPartner] = await executeSoftDeleteAware(
+      pool,
+      `SELECT p.id AS partner_id, i.warehouse_id
+       FROM partners p
+       JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
+       JOIN warehouses w ON w.id = i.warehouse_id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+         AND p.is_deleted = 0 AND w.is_deleted = 0
+       GROUP BY p.id, i.warehouse_id
+       ORDER BY MIN(i.id)
+       LIMIT 1`,
+      [],
+      `SELECT p.id AS partner_id, i.warehouse_id
+       FROM partners p
+       JOIN inventories i ON i.partner_id = p.id
+       JOIN warehouses w ON w.id = i.warehouse_id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       GROUP BY p.id, i.warehouse_id
+       ORDER BY MIN(i.id)
+       LIMIT 1`
+    );
+  }
 
   if (nearestPartner.length === 0) throw ApiError.serviceUnavailable('No available Stockist to handle this order');
 

@@ -5,42 +5,142 @@ const paginate = require('../utils/paginate');
 const bcrypt = require('bcryptjs');
 const { sendEmail, EMAIL } = require('../services/emailService');
 
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
+const isApplicationSchemaMismatch = (err) => (
+  isMissingColumn(err, 'full_name') ||
+  isMissingColumn(err, 'stockist_level') ||
+  isMissingColumn(err, 'id_front_url') ||
+  isMissingColumn(err, 'id_back_url') ||
+  isMissingColumn(err, 'notes') ||
+  isMissingColumn(err, 'is_deleted')
+);
+
+const normalizeApplication = (row = {}) => ({
+  ...row,
+  full_name: row.full_name || row.applicant_name || null,
+  stockist_level: row.stockist_level || row.requested_level || null,
+  id_front_url: row.id_front_url || row.id_document_url || null,
+  id_back_url: row.id_back_url || row.business_permit_url || null,
+  notes: row.notes || row.message || row.rejection_reason || null,
+});
+
+async function getActiveSuperAdmins() {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
+       WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
+    );
+    return rows;
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_deleted')) {
+      throw err;
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
+       WHERE r.slug = 'super_admin' AND u.status = 'active'`
+    );
+    return rows;
+  }
+}
+
 // GET /api/v1/applications
 const getApplications = asyncHandler(async (req, res) => {
   const { page, limit, status } = req.query;
-  const params = [];
-  let where = 'WHERE is_deleted = 0';
-  if (status) { where += ' AND status = ?'; params.push(status); }
+  const oldParams = [];
+  let oldWhere = 'WHERE is_deleted = 0';
+  if (status) {
+    oldWhere += ' AND status = ?';
+    oldParams.push(status);
+  }
 
-  const baseQuery = `SELECT id, full_name, business_name, email, phone, address, stockist_level,
-    id_front_url, id_back_url, status, notes, created_at, reviewed_at
-    FROM dta_applications ${where} ORDER BY created_at DESC`;
-  const countQuery = `SELECT COUNT(*) AS total FROM dta_applications ${where}`;
+  const oldBaseQuery = `
+    SELECT id, full_name, business_name, email, phone, address, stockist_level,
+           id_front_url, id_back_url, status, notes, created_at, reviewed_at
+    FROM dta_applications ${oldWhere}
+    ORDER BY created_at DESC`;
+  const oldCountQuery = `SELECT COUNT(*) AS total FROM dta_applications ${oldWhere}`;
 
-  const result = await paginate(baseQuery, countQuery, params, page, limit);
+  const newParams = [];
+  let newWhere = 'WHERE 1=1';
+  if (status) {
+    newWhere += ' AND status = ?';
+    newParams.push(status);
+  }
+
+  const newBaseQuery = `
+    SELECT id,
+           applicant_name AS full_name,
+           business_name,
+           email,
+           phone,
+           address,
+           requested_level AS stockist_level,
+           id_document_url AS id_front_url,
+           business_permit_url AS id_back_url,
+           status,
+           message AS notes,
+           reviewed_at,
+           created_at
+    FROM dta_applications ${newWhere}
+    ORDER BY created_at DESC`;
+  const newCountQuery = `SELECT COUNT(*) AS total FROM dta_applications ${newWhere}`;
+
+  let result;
+  try {
+    result = await paginate(oldBaseQuery, oldCountQuery, oldParams, page, limit);
+  } catch (err) {
+    if (!isApplicationSchemaMismatch(err)) {
+      throw err;
+    }
+    result = await paginate(newBaseQuery, newCountQuery, newParams, page, limit);
+  }
+
+  result.data = result.data.map(normalizeApplication);
   res.json({ success: true, ...result });
 });
 
 // GET /api/v1/applications/:id
 const getApplication = asyncHandler(async (req, res) => {
-  const [rows] = await pool.execute(
-    'SELECT * FROM dta_applications WHERE id = ? AND is_deleted = 0 LIMIT 1',
-    [req.params.id]
-  );
+  let rows;
+  try {
+    [rows] = await pool.execute(
+      'SELECT * FROM dta_applications WHERE id = ? AND is_deleted = 0 LIMIT 1',
+      [req.params.id]
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_deleted')) {
+      throw err;
+    }
+    [rows] = await pool.execute(
+      'SELECT * FROM dta_applications WHERE id = ? LIMIT 1',
+      [req.params.id]
+    );
+  }
+
   if (rows.length === 0) throw ApiError.notFound('Application not found');
-  res.json({ success: true, data: rows[0] });
+  res.json({ success: true, data: normalizeApplication(rows[0]) });
 });
 
 // POST /api/v1/applications/dta — public, no auth
 const submitDTA = asyncHandler(async (req, res) => {
-  const {
-    full_name, business_name, email, phone, address, stockist_level, notes
-  } = req.body;
+  const fullName = req.body.full_name || req.body.applicant_name;
+  const businessName = req.body.business_name || null;
+  const email = req.body.email;
+  const phone = req.body.phone;
+  const address = req.body.address;
+  const stockistLevel = req.body.stockist_level || req.body.requested_level;
+  const notes = req.body.notes || req.body.message || null;
 
-  if (!full_name || !email || !phone || !address || !stockist_level) {
+  if (!fullName || !email || !phone || !address || !stockistLevel) {
     throw ApiError.badRequest('full_name, email, phone, address, and stockist_level are required');
   }
-  if (!['provincial_stockist', 'city_stockist'].includes(stockist_level)) {
+  if (!['provincial_stockist', 'city_stockist'].includes(stockistLevel)) {
     throw ApiError.badRequest('stockist_level must be provincial_stockist or city_stockist');
   }
 
@@ -53,25 +153,36 @@ const submitDTA = asyncHandler(async (req, res) => {
   const idFrontUrl = req.files?.id_front?.[0]?.path || null;
   const idBackUrl = req.files?.id_back?.[0]?.path || null;
 
-  const [result] = await pool.execute(
-    `INSERT INTO dta_applications (full_name, business_name, email, phone, address, stockist_level, id_front_url, id_back_url, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [full_name, business_name || null, email, phone, address, stockist_level, idFrontUrl, idBackUrl, notes || null]
-  );
+  let result;
+  try {
+    [result] = await pool.execute(
+      `INSERT INTO dta_applications (full_name, business_name, email, phone, address, stockist_level, id_front_url, id_back_url, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [fullName, businessName, email, phone, address, stockistLevel, idFrontUrl, idBackUrl, notes]
+    );
+  } catch (err) {
+    if (!isApplicationSchemaMismatch(err)) {
+      throw err;
+    }
+
+    [result] = await pool.execute(
+      `INSERT INTO dta_applications (applicant_name, business_name, email, phone, address, requested_level, id_document_url, business_permit_url, message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [fullName, businessName, email, phone, address, stockistLevel, idFrontUrl, idBackUrl, notes]
+    );
+  }
 
   // Notify all super admins
-  const [admins] = await pool.execute(
-    `SELECT u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
-     WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
-  );
+  const admins = await getActiveSuperAdmins();
+
   for (const admin of admins) {
-    const tmpl = EMAIL.dtaReceived(full_name, business_name || email);
+    const tmpl = EMAIL.dtaReceived(fullName, businessName || email);
     await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
 
     await pool.execute(
       `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
        VALUES (?, 'dta_received', ?, ?, 'application', ?)`,
-      [admin.id, `New Stockist Application: ${full_name}`, `${full_name} applied for ${stockist_level.replace('_', ' ')}.`, result.insertId]
+      [admin.id, `New Stockist Application: ${fullName}`, `${fullName} applied for ${stockistLevel.replace('_', ' ')}.`, result.insertId]
     );
   }
 
@@ -81,13 +192,27 @@ const submitDTA = asyncHandler(async (req, res) => {
 // PATCH /api/v1/applications/:id/approve
 const approveApplication = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const [rows] = await pool.execute(
-    'SELECT * FROM dta_applications WHERE id = ? AND status = \'pending\' AND is_deleted = 0 LIMIT 1',
-    [id]
-  );
+  let rows;
+  try {
+    [rows] = await pool.execute(
+      'SELECT * FROM dta_applications WHERE id = ? AND status = \'pending\' AND is_deleted = 0 LIMIT 1',
+      [id]
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_deleted')) {
+      throw err;
+    }
+    [rows] = await pool.execute(
+      'SELECT * FROM dta_applications WHERE id = ? AND status = \'pending\' LIMIT 1',
+      [id]
+    );
+  }
+
   if (rows.length === 0) throw ApiError.notFound('Pending application not found');
 
-  const app = rows[0];
+  const app = normalizeApplication(rows[0]);
+  const fullName = app.full_name;
+  const stockistLevel = app.stockist_level;
 
   // Generate a temporary password
   const tempPassword = Math.random().toString(36).slice(-8) + 'N1!';
@@ -101,14 +226,14 @@ const approveApplication = asyncHandler(async (req, res) => {
     const [partnerResult] = await conn.execute(
       `INSERT INTO partners (business_name, email, phone, address, stockist_level, discount_pct)
        VALUES (?, ?, ?, ?, ?, 0)`,
-      [app.business_name || app.full_name, app.email, app.phone, app.address, app.stockist_level]
+      [app.business_name || fullName, app.email, app.phone, app.address, stockistLevel]
     );
     const partnerId = partnerResult.insertId;
 
     // Get role id for the stockist level
     const [roleRow] = await conn.execute(
       'SELECT id FROM roles WHERE slug = ? LIMIT 1',
-      [app.stockist_level]
+      [stockistLevel]
     );
     if (roleRow.length === 0) throw ApiError.serverError('Role not found for stockist level');
 
@@ -116,20 +241,30 @@ const approveApplication = asyncHandler(async (req, res) => {
     await conn.execute(
       `INSERT INTO users (name, email, phone, password, role_id, partner_id, status)
        VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-      [app.full_name, app.email, app.phone, hashed, roleRow[0].id, partnerId]
+      [fullName, app.email, app.phone, hashed, roleRow[0].id, partnerId]
     );
 
     // Mark application approved
-    await conn.execute(
-      'UPDATE dta_applications SET status = \'approved\', reviewed_by = ?, reviewed_at = NOW() WHERE id = ?',
-      [req.user.id, id]
-    );
+    try {
+      await conn.execute(
+        'UPDATE dta_applications SET status = \'approved\', reviewed_by = ?, reviewed_at = NOW(), created_partner_id = ? WHERE id = ?',
+        [req.user.id, partnerId, id]
+      );
+    } catch (err) {
+      if (!isMissingColumn(err, 'created_partner_id')) {
+        throw err;
+      }
+      await conn.execute(
+        'UPDATE dta_applications SET status = \'approved\', reviewed_by = ?, reviewed_at = NOW() WHERE id = ?',
+        [req.user.id, id]
+      );
+    }
 
     await conn.commit();
 
     // Send welcome email with credentials
-    const tmpl = EMAIL.dtaApproved(app.full_name, app.email, tempPassword);
-    await sendEmail({ to: app.email, toName: app.full_name, ...tmpl });
+    const tmpl = EMAIL.dtaApproved(fullName, app.email, tempPassword);
+    await sendEmail({ to: app.email, toName: fullName, ...tmpl });
 
     res.json({ success: true, message: 'Application approved. Account created and credentials sent via email.' });
   } catch (err) {
@@ -142,11 +277,24 @@ const approveApplication = asyncHandler(async (req, res) => {
 
 // PATCH /api/v1/applications/:id/reject
 const rejectApplication = asyncHandler(async (req, res) => {
-  const { notes } = req.body;
-  await pool.execute(
-    'UPDATE dta_applications SET status = \'rejected\', reviewed_by = ?, reviewed_at = NOW(), notes = COALESCE(?, notes) WHERE id = ?',
-    [req.user.id, notes || null, req.params.id]
-  );
+  const reason = req.body?.notes || req.body?.reason || null;
+
+  try {
+    await pool.execute(
+      'UPDATE dta_applications SET status = \'rejected\', reviewed_by = ?, reviewed_at = NOW(), notes = COALESCE(?, notes) WHERE id = ?',
+      [req.user.id, reason, req.params.id]
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'notes')) {
+      throw err;
+    }
+
+    await pool.execute(
+      'UPDATE dta_applications SET status = \'rejected\', reviewed_by = ?, reviewed_at = NOW(), rejection_reason = COALESCE(?, rejection_reason) WHERE id = ?',
+      [req.user.id, reason, req.params.id]
+    );
+  }
+
   res.json({ success: true, message: 'Application rejected' });
 });
 

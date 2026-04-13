@@ -6,7 +6,11 @@ const paginate = require('../utils/paginate');
 const isMissingSoftDeleteColumn = (err) => (
   err &&
   err.code === 'ER_BAD_FIELD_ERROR' &&
-  String(err.message || '').includes("'is_deleted'")
+  (
+    String(err.message || '').includes("'is_deleted'") ||
+    String(err.message || '').includes(".is_deleted'") ||
+    String(err.message || '').includes('is_deleted')
+  )
 );
 
 async function executeSoftDeleteAware(db, primarySql, params = [], fallbackSql = null) {
@@ -20,21 +24,47 @@ async function executeSoftDeleteAware(db, primarySql, params = [], fallbackSql =
   }
 }
 
+let bankAccountsHasIsDeletedCache = null;
+async function bankAccountsHasIsDeletedColumn() {
+  if (bankAccountsHasIsDeletedCache !== null) {
+    return bankAccountsHasIsDeletedCache;
+  }
+
+  const [rows] = await pool.execute("SHOW COLUMNS FROM bank_accounts LIKE 'is_deleted'");
+  bankAccountsHasIsDeletedCache = rows.length > 0;
+  return bankAccountsHasIsDeletedCache;
+}
+
 // GET /api/v1/bank-accounts
 const getBankAccounts = asyncHandler(async (req, res) => {
   const { page, limit, warehouse_id } = req.query;
-  const params = [];
-  let where = 'WHERE ba.is_deleted = 0';
-  if (warehouse_id) { where += ' AND ba.warehouse_id = ?'; params.push(warehouse_id); }
+  const includeSoftDelete = await bankAccountsHasIsDeletedColumn();
+  const buildQueries = () => {
+    const params = [];
+    let where = 'WHERE 1=1';
 
-  const baseQuery = `
-    SELECT ba.*, w.name AS warehouse_name
-    FROM bank_accounts ba
-    LEFT JOIN warehouses w ON w.id = ba.warehouse_id
-    ${where} ORDER BY ba.created_at DESC`;
-  const countQuery = `SELECT COUNT(*) AS total FROM bank_accounts ba LEFT JOIN warehouses w ON w.id = ba.warehouse_id ${where}`;
+    if (includeSoftDelete) {
+      where += ' AND ba.is_deleted = 0';
+    }
+    if (warehouse_id) {
+      where += ' AND ba.warehouse_id = ?';
+      params.push(warehouse_id);
+    }
 
-  const result = await paginate(baseQuery, countQuery, params, page, limit);
+    return {
+      baseQuery: `
+        SELECT ba.*, w.name AS warehouse_name
+        FROM bank_accounts ba
+        LEFT JOIN warehouses w ON w.id = ba.warehouse_id
+        ${where} ORDER BY ba.created_at DESC`,
+      countQuery: `SELECT COUNT(*) AS total FROM bank_accounts ba LEFT JOIN warehouses w ON w.id = ba.warehouse_id ${where}`,
+      params,
+    };
+  };
+
+  const q = buildQueries();
+  const result = await paginate(q.baseQuery, q.countQuery, q.params, page, limit);
+
   res.json({ success: true, ...result });
 });
 
@@ -58,8 +88,16 @@ const updateBankAccount = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { bank_name, account_name, account_number, is_active, is_default } = req.body;
 
-  const [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ? AND is_deleted = 0', [id]);
-  if (existing.length === 0) throw ApiError.notFound('Bank account not found');
+  const hasSoftDelete = await bankAccountsHasIsDeletedColumn();
+  let existing;
+  if (hasSoftDelete) {
+    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ? AND is_deleted = 0', [id]);
+  } else {
+    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ?', [id]);
+  }
+  if (existing.length === 0) {
+    throw ApiError.notFound('Bank account not found');
+  }
 
   await pool.execute(
     `UPDATE bank_accounts SET bank_name = COALESCE(?, bank_name), account_name = COALESCE(?, account_name),
@@ -72,9 +110,22 @@ const updateBankAccount = asyncHandler(async (req, res) => {
 
 // DELETE /api/v1/bank-accounts/:id
 const deleteBankAccount = asyncHandler(async (req, res) => {
-  const [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ? AND is_deleted = 0', [req.params.id]);
+  const hasSoftDelete = await bankAccountsHasIsDeletedColumn();
+  let existing;
+  if (hasSoftDelete) {
+    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ? AND is_deleted = 0', [req.params.id]);
+  } else {
+    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ?', [req.params.id]);
+  }
+
   if (existing.length === 0) throw ApiError.notFound('Bank account not found');
-  await pool.execute('UPDATE bank_accounts SET is_deleted = 1 WHERE id = ?', [req.params.id]);
+
+  if (hasSoftDelete) {
+    await pool.execute('UPDATE bank_accounts SET is_deleted = 1 WHERE id = ?', [req.params.id]);
+  } else {
+    await pool.execute('UPDATE bank_accounts SET is_active = 0 WHERE id = ?', [req.params.id]);
+  }
+
   res.json({ success: true, message: 'Bank account deleted' });
 });
 

@@ -3,6 +3,12 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.message || '').includes(`'${columnName}'`)
+);
+
 // GET /api/v1/mobile-stockists
 const getMobileStockists = asyncHandler(async (req, res) => {
   const { page, limit, search } = req.query;
@@ -28,7 +34,24 @@ const getMobileStockists = asyncHandler(async (req, res) => {
     ${where} ORDER BY ms.created_at DESC`;
   const countQuery = `SELECT COUNT(*) AS total FROM mobile_stockists ms LEFT JOIN partners p ON p.id = ms.partner_id ${where}`;
 
-  const result = await paginate(baseQuery, countQuery, params, page, limit);
+  let result;
+  try {
+    result = await paginate(baseQuery, countQuery, params, page, limit);
+  } catch (err) {
+    if (!isMissingColumn(err, 'ms.last_login')) {
+      throw err;
+    }
+
+    const fallbackQuery = `
+      SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.status,
+             ms.partner_id, p.business_name AS parent_name,
+             ms.created_at, NULL AS last_login
+      FROM mobile_stockists ms
+      LEFT JOIN partners p ON p.id = ms.partner_id
+      ${where} ORDER BY ms.created_at DESC`;
+    result = await paginate(fallbackQuery, countQuery, params, page, limit);
+  }
+
   res.json({ success: true, ...result });
 });
 
