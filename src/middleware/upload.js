@@ -1,5 +1,5 @@
 const multer = require('multer');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const cloudinaryStoragePkg = require('multer-storage-cloudinary');
 const cloudinary = require('../config/cloudinary');
 const env = require('../config/env');
 
@@ -9,8 +9,34 @@ const hasCloudinaryConfig = Boolean(
   env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET
 );
 
+function createCloudinaryStorage(options) {
+  if (typeof cloudinaryStoragePkg === 'function') {
+    try {
+      return new cloudinaryStoragePkg(options);
+    } catch (_) {
+      return cloudinaryStoragePkg(options);
+    }
+  }
+
+  if (typeof cloudinaryStoragePkg.CloudinaryStorage === 'function') {
+    return new cloudinaryStoragePkg.CloudinaryStorage(options);
+  }
+
+  if (typeof cloudinaryStoragePkg.default === 'function') {
+    return new cloudinaryStoragePkg.default(options);
+  }
+
+  if (typeof cloudinaryStoragePkg.createCloudinaryStorage === 'function') {
+    return cloudinaryStoragePkg.createCloudinaryStorage(options);
+  }
+
+  throw new TypeError(
+    'Unsupported multer-storage-cloudinary export shape. Expected CloudinaryStorage constructor.'
+  );
+}
+
 function createUpload(folder, imageOnly = false, transformation = null) {
-  const storage = new CloudinaryStorage({
+  const storage = createCloudinaryStorage({
     cloudinary,
     params: {
       folder: `nogatu/${folder}`,
