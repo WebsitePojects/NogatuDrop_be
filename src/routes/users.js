@@ -14,7 +14,7 @@ router.get('/:id', roleGuard('super_admin', 'admin', 'provincial_stockist', 'cit
 
 router.post(
   '/',
-  roleGuard('super_admin', 'admin'),
+  roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'),
   [
     body('name')
       .optional({ nullable: true })
@@ -43,7 +43,7 @@ router.post(
       .isLength({ min: 6 })
       .withMessage('Password must be at least 6 characters'),
     body('role_id').optional().isInt(),
-    body('role_slug').optional().isIn(['super_admin', 'admin', 'staff']),
+    body('role_slug').optional().isIn(['super_admin', 'admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff']),
     body('partner_id').optional().isInt(),
     body('level').optional().isIn(['main', 'regional', 'city']),
     body('location').optional().trim(),
@@ -54,7 +54,7 @@ router.post(
 
 router.put(
   '/:id',
-  roleGuard('super_admin', 'admin'),
+  roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'),
   param('id').isInt(),
   [
     body('name').optional().trim().notEmpty(),
@@ -66,6 +66,6 @@ router.put(
   updateUser
 );
 
-router.delete('/:id', roleGuard('super_admin', 'admin'), param('id').isInt(), validate, deleteUser);
+router.delete('/:id', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), param('id').isInt(), validate, deleteUser);
 
 module.exports = router;

@@ -26,6 +26,31 @@ const getProducts = asyncHandler(async (req, res) => {
   res.json({ success: true, ...result });
 });
 
+// GET /api/v1/products/public
+const getPublicProducts = asyncHandler(async (req, res) => {
+  const { page, limit, search, category } = req.query;
+  const params = [];
+  let where = 'WHERE is_deleted = 0 AND is_active = 1';
+
+  if (search) {
+    where += ' AND (name LIKE ? OR sku LIKE ?)';
+    params.push(`%${search}%`, `%${search}%`);
+  }
+  if (category) {
+    where += ' AND category = ?';
+    params.push(category);
+  }
+
+  const baseQuery = `
+    SELECT id, name, category, retail_price, unit, description, image_url
+    FROM products ${where}
+    ORDER BY name ASC`;
+  const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
+
+  const result = await paginate(baseQuery, countQuery, params, page, limit);
+  res.json({ success: true, ...result });
+});
+
 // GET /api/v1/products/:id
 const getProduct = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
@@ -117,4 +142,4 @@ const deleteProduct = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Product deleted' });
 });
 
-module.exports = { getProducts, getProduct, createProduct, updateProduct, deleteProduct };
+module.exports = { getProducts, getPublicProducts, getProduct, createProduct, updateProduct, deleteProduct };

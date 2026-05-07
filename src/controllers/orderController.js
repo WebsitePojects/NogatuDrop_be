@@ -494,6 +494,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     const resolvedItems = [];
 
     for (const item of items) {
+      const quantity = Number(item.quantity);
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        throw ApiError.badRequest(`Invalid quantity for product ${item.product_id}`);
+      }
+
       const [products] = await executeSoftDeleteAware(
         conn,
         'SELECT id, name, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
@@ -502,8 +507,25 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       );
       if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
       const price = parseFloat(products[0].partner_price);
-      resolvedItems.push({ ...item, name: products[0].name, unit_price: price });
-      totalAmount += item.quantity * price;
+      resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
+      totalAmount += quantity * price;
+    }
+
+    if (sourceWarehouseId) {
+      for (const item of resolvedItems) {
+        const [inv] = await executeSoftDeleteAware(
+          conn,
+          `SELECT current_stock, reserved_stock FROM inventories
+           WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
+          [item.product_id, sourceWarehouseId],
+          `SELECT current_stock, reserved_stock FROM inventories
+           WHERE product_id = ? AND warehouse_id = ?`
+        );
+        const available = inv.length > 0 ? Number(inv[0].current_stock || 0) - Number(inv[0].reserved_stock || 0) : 0;
+        if (available < item.quantity) {
+          throw ApiError.badRequest(`Insufficient stock for ${item.name} (available: ${available})`);
+        }
+      }
     }
 
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
@@ -561,6 +583,27 @@ const createPublicOrder = asyncHandler(async (req, res) => {
         } else {
           throw err;
         }
+      }
+    }
+
+    if (sourceWarehouseId) {
+      for (const item of resolvedItems) {
+        await conn.execute(
+          `UPDATE inventories
+           SET reserved_stock = reserved_stock + ?,
+               last_movement_at = NOW()
+           WHERE product_id = ? AND warehouse_id = ?`,
+          [item.quantity, item.product_id, sourceWarehouseId]
+        );
+        await insertStockMovement(conn, {
+          productId: item.product_id,
+          warehouseId: sourceWarehouseId,
+          movementType: 'reserve',
+          quantity: item.quantity,
+          referenceType: 'order',
+          referenceId: orderId,
+          notes: 'Stock reserved on public order placement',
+        });
       }
     }
 

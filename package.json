@@ -8,6 +8,8 @@
     "start": "node --env-file=.env.prod src/server.js",
     "seed": "node --env-file=.env.dev src/seed.js",
     "migrate:finalize": "node --env-file=.env.dev scripts/runSqlFile.js sql/finalize_schema_2026_04_14.sql",
+    "migrate:repair": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_core_operational_schema_2026_05_07.sql",
+    "migrate:repair:prod": "node --env-file=.env.prod scripts/runSqlFile.js sql/repair_core_operational_schema_2026_05_07.sql",
     "smoke:verify": "node --env-file=.env.dev scripts/smokeApiVerify.js",
     "smoke:deep": "node --env-file=.env.dev scripts/smokeApiHealth.js",
     "smoke:health": "npm run smoke:verify",

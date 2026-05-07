@@ -313,6 +313,10 @@ const updateTrackingStatus = asyncHandler(async (req, res) => {
   const { status, rider_name, rider_user_id, est_delivery_at } = req.body;
   const trackingId = req.params.trackingId;
 
+  if (status === 'delivered') {
+    throw ApiError.badRequest('Use the courier proof-of-delivery link to mark an order delivered');
+  }
+
   const [existing] = await pool.execute(
     'SELECT id, order_id FROM delivery_tracking WHERE id = ?', [trackingId]
   );
@@ -326,22 +330,12 @@ const updateTrackingStatus = asyncHandler(async (req, res) => {
   if (rider_user_id !== undefined) { fields.push('rider_user_id = ?'); values.push(rider_user_id || null); }
   if (est_delivery_at) { fields.push('est_delivery_at = ?'); values.push(est_delivery_at); }
 
-  if (status === 'delivered') {
-    fields.push('delivered_at = NOW()');
-  }
-
   if (fields.length === 0) throw ApiError.badRequest('No fields to update');
 
   values.push(trackingId);
   await pool.execute(`UPDATE delivery_tracking SET ${fields.join(', ')} WHERE id = ?`, values);
 
-  // If delivered, update order status too
-  if (status === 'delivered') {
-    await pool.execute(
-      'UPDATE orders SET status = ?, delivered_at = NOW() WHERE id = ?',
-      ['delivered', existing[0].order_id]
-    );
-  } else if (status === 'out_for_delivery') {
+  if (status === 'out_for_delivery') {
     await pool.execute(
       'UPDATE orders SET status = ? WHERE id = ?',
       ['delivering', existing[0].order_id]

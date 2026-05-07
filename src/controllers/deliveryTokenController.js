@@ -82,6 +82,12 @@ async function getLatestActiveToken(orderId) {
   return rows[0] || null;
 }
 
+function assertCanAccessOrder(user, order) {
+  if (user.role_slug === 'super_admin') return;
+  if (Number(user.partner_id) === Number(order.partner_id)) return;
+  throw ApiError.forbidden('You do not have permission to access this order');
+}
+
 // POST /api/v1/delivery-tokens — generate magic link for an order
 const generateDeliveryLink = asyncHandler(async (req, res) => {
   const { order_id, courier_id, courier_tracking_number } = req.body;
@@ -93,6 +99,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
     [order_id]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
+  assertCanAccessOrder(req.user, orders[0]);
   if (orders[0].payment_status !== 'paid') throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
     throw ApiError.badRequest('Cannot generate delivery link for this order status');
@@ -100,6 +107,18 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
   const existingToken = await getLatestActiveToken(order_id);
   if (existingToken) {
+    const [trackingRows] = await pool.execute(
+      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
+      [order_id]
+    );
+    if (trackingRows.length === 0) {
+      await pool.execute(
+        `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number)
+         VALUES (?, 'out_for_delivery', ?, ?)`,
+        [order_id, courier_id || null, courier_tracking_number || null]
+      );
+    }
+
     const existingMagicLink = `${env.PUBLIC_BASE_URL}/deliver/${existingToken.token}`;
     return res.status(200).json({
       success: true,
@@ -124,11 +143,24 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
       [order_id, token, expiresAt, req.user.id]
     );
 
-    // Update delivery_tracking with courier info
-    if (courier_id || courier_tracking_number) {
+    const [trackingRows] = await conn.execute(
+      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
+      [order_id]
+    );
+
+    if (trackingRows.length === 0) {
       await conn.execute(
-        `UPDATE delivery_tracking SET courier_id = COALESCE(?, courier_id),
-         courier_tracking_number = COALESCE(?, courier_tracking_number)
+        `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number)
+         VALUES (?, 'out_for_delivery', ?, ?)`,
+        [order_id, courier_id || null, courier_tracking_number || null]
+      );
+    } else {
+      await conn.execute(
+        `UPDATE delivery_tracking
+         SET status = 'out_for_delivery',
+             courier_id = COALESCE(?, courier_id),
+             courier_tracking_number = COALESCE(?, courier_tracking_number),
+             updated_at = NOW()
          WHERE order_id = ?`,
         [courier_id || null, courier_tracking_number || null, order_id]
       );
@@ -192,6 +224,7 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   );
 
   if (orders.length === 0) throw ApiError.notFound('Order not found');
+  assertCanAccessOrder(req.user, orders[0]);
 
   const token = await getLatestActiveToken(orderId);
   if (!token) {
@@ -315,11 +348,22 @@ const completeDelivery = asyncHandler(async (req, res) => {
       );
     }
 
-    // Update delivery_tracking
-    await conn.execute(
-      `UPDATE delivery_tracking SET status = 'delivered', delivered_at = NOW() WHERE order_id = ?`,
+    const [trackingRows] = await conn.execute(
+      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
       [orderId]
     );
+    if (trackingRows.length === 0) {
+      await conn.execute(
+        `INSERT INTO delivery_tracking (order_id, status, delivered_at)
+         VALUES (?, 'delivered', NOW())`,
+        [orderId]
+      );
+    } else {
+      await conn.execute(
+        `UPDATE delivery_tracking SET status = 'delivered', delivered_at = NOW(), updated_at = NOW() WHERE order_id = ?`,
+        [orderId]
+      );
+    }
 
     // Update order
     await conn.execute(

@@ -150,8 +150,8 @@ const submitDTA = asyncHandler(async (req, res) => {
   );
   if (existing.length > 0) throw ApiError.conflict('An application with this email already exists');
 
-  const idFrontUrl = req.files?.id_front?.[0]?.path || null;
-  const idBackUrl = req.files?.id_back?.[0]?.path || null;
+  const idFrontUrl = req.files?.id_front?.[0]?.path || req.files?.id_document?.[0]?.path || null;
+  const idBackUrl = req.files?.id_back?.[0]?.path || req.files?.business_permit?.[0]?.path || null;
 
   let result;
   try {

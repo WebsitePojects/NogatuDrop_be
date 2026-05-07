@@ -88,7 +88,7 @@ router.patch(
   roleGuard('super_admin', 'staff'),
   param('trackingId').isInt(),
   [
-    body('status').optional().isIn(['in_progress', 'out_for_delivery', 'delivered']),
+    body('status').optional().isIn(['in_progress', 'out_for_delivery']),
     body('rider_name').optional().trim(),
     body('rider_user_id').optional().isInt(),
     body('est_delivery_at').optional().isISO8601(),

@@ -4,9 +4,11 @@ const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { productUpload: upload } = require('../middleware/upload');
-const { getProducts, getProduct, createProduct, updateProduct, deleteProduct } = require('../controllers/productController');
+const { getProducts, getPublicProducts, getProduct, createProduct, updateProduct, deleteProduct } = require('../controllers/productController');
 
 const router = Router();
+
+router.get('/public', getPublicProducts);
 
 router.use(auth);
 

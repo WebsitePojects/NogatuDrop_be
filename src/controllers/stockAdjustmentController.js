@@ -97,7 +97,7 @@ const getAdjustments = asyncHandler(async (req, res) => {
 
 // POST /api/v1/stock-adjustments — request an adjustment
 const createAdjustment = asyncHandler(async (req, res) => {
-  const quantity = Number(req.body.quantity);
+  const quantity = Number(req.body.quantity ?? req.body.requested_qty ?? req.body.requested_quantity);
   const type = normalizeAdjustmentType(req.body.type || req.body.adjustment_type);
 
   const inventoryId = await resolveInventoryId(pool, {

@@ -14,7 +14,17 @@ const dtaLimiter = rateLimit({
 const r = Router();
 r.get('/', auth, role('super_admin'), c.getApplications);
 r.get('/:id', auth, role('super_admin'), c.getApplication);
-r.post('/dta', dtaLimiter, dtaUpload.fields([{ name: 'id_front', maxCount: 1 }, { name: 'id_back', maxCount: 1 }]), c.submitDTA);
+r.post(
+  '/dta',
+  dtaLimiter,
+  dtaUpload.fields([
+    { name: 'id_front', maxCount: 1 },
+    { name: 'id_back', maxCount: 1 },
+    { name: 'id_document', maxCount: 1 },
+    { name: 'business_permit', maxCount: 1 },
+  ]),
+  c.submitDTA
+);
 r.patch('/:id/approve', auth, role('super_admin'), c.approveApplication);
 r.patch('/:id/reject', auth, role('super_admin'), c.rejectApplication);
 module.exports = r;

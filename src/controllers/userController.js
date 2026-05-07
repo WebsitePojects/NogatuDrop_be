@@ -4,6 +4,11 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 
+async function getRoleBySlug(slug) {
+  const [rows] = await pool.execute('SELECT id, slug FROM roles WHERE slug = ? LIMIT 1', [slug]);
+  return rows[0] || null;
+}
+
 // GET /api/v1/users
 const getUsers = asyncHandler(async (req, res) => {
   const { page, limit, search, role, status } = req.query;
@@ -121,18 +126,33 @@ const createUser = asyncHandler(async (req, res) => {
   let assignedRoleId = role_id;
 
   if (!assignedRoleId && role_slug) {
-    const [roleRows] = await pool.execute('SELECT id FROM roles WHERE slug = ? LIMIT 1', [role_slug]);
-    if (roleRows.length === 0) {
+    const role = await getRoleBySlug(role_slug);
+    if (!role) {
       throw ApiError.badRequest('Invalid role');
     }
-    assignedRoleId = roleRows[0].id;
+    assignedRoleId = role.id;
   }
 
   if (req.user.role_slug === 'admin') {
     assignedPartnerId = req.user.partner_id;
     // Admin can only create staff
-    const [staffRole] = await pool.execute("SELECT id FROM roles WHERE slug = 'staff' LIMIT 1");
-    assignedRoleId = staffRole[0].id;
+    const staffRole = await getRoleBySlug('staff');
+    assignedRoleId = staffRole.id;
+  }
+
+  if (['provincial_stockist', 'city_stockist'].includes(req.user.role_slug)) {
+    assignedPartnerId = req.user.partner_id;
+    const requestedRoleSlug = role_slug || 'staff';
+
+    if (!['staff', 'mobile_stockist'].includes(requestedRoleSlug)) {
+      throw ApiError.forbidden('Stockists can only create staff or mobile stockist users');
+    }
+
+    const scopedRole = await getRoleBySlug(requestedRoleSlug);
+    if (!scopedRole) {
+      throw ApiError.badRequest('Invalid role');
+    }
+    assignedRoleId = scopedRole.id;
   }
 
   if (!assignedRoleId) {
