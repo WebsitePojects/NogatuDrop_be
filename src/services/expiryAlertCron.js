@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const pool = require('../config/db');
 const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
+const { insertNotification } = require('../utils/notificationWriter');
 
 async function runExpiryAlert() {
   try {
@@ -22,7 +23,7 @@ async function runExpiryAlert() {
 
     // Get all super_admin emails
     const [admins] = await pool.execute(
-      `SELECT u.email, u.name FROM users u
+      `SELECT u.id, u.email, u.name FROM users u
        JOIN roles r ON r.id = u.role_id
        WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
     );
@@ -34,19 +35,14 @@ async function runExpiryAlert() {
         const tmpl = EMAIL.batchExpiry(batch.product_name, expiryFormatted, batch.warehouse_name);
         await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
 
-        await pool.execute(
-          `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-           VALUES (
-             (SELECT id FROM users WHERE email = ? LIMIT 1),
-             'expiry_alert', ?, ?, 'inventory', ?
-           )`,
-          [
-            admin.email,
-            `Expiry Alert: ${batch.product_name}`,
-            `${batch.product_name} at ${batch.warehouse_name} expires on ${expiryFormatted}. Current stock: ${batch.current_stock}`,
-            batch.id,
-          ]
-        );
+        await insertNotification(pool, {
+          userId: admin.id,
+          type: 'expiry_alert',
+          title: `Expiry Alert: ${batch.product_name}`,
+          message: `${batch.product_name} at ${batch.warehouse_name} expires on ${expiryFormatted}. Current stock: ${batch.current_stock}`,
+          entityType: 'inventory',
+          entityId: batch.id,
+        });
       }
 
       console.log(`[ExpiryAlertCron] Alert sent for ${batch.product_name} (expires ${expiryFormatted})`);

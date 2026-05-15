@@ -7,6 +7,7 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const cache = require('../services/cacheService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
+const { insertNotification } = require('../utils/notificationWriter');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -144,10 +145,14 @@ async function notifyPartnerUsers(conn, partnerId, type, title, message, entityI
     `SELECT id, email, name FROM users WHERE partner_id = ? AND status = 'active'`
   );
   for (const u of users) {
-    await conn.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, ?, ?, ?, 'order', ?)`,
-      [u.id, type, title, message, entityId]
-    );
+    await insertNotification(conn, {
+      userId: u.id,
+      type,
+      title,
+      message,
+      entityType: 'order',
+      entityId,
+    });
   }
   return users;
 }
@@ -162,10 +167,14 @@ async function notifySuperAdmins(conn, type, title, message, entityId) {
      WHERE r.slug = 'super_admin' AND u.status = 'active'`
   );
   for (const a of admins) {
-    await conn.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, ?, ?, ?, 'order', ?)`,
-      [a.id, type, title, message, entityId]
-    );
+    await insertNotification(conn, {
+      userId: a.id,
+      type,
+      title,
+      message,
+      entityType: 'order',
+      entityId,
+    });
   }
   return admins;
 }

@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const env = require('../config/env');
 const ApiError = require('../utils/ApiError');
+const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -13,10 +14,11 @@ const authMiddleware = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, env.JWT_SECRET);
+    const normalizedRoleSlug = normalizeRoleSlug(decoded.role_slug);
     req.user = {
       id: decoded.id,
       role: decoded.role,
-      role_slug: decoded.role_slug,
+      role_slug: normalizedRoleSlug,
       partner_id: decoded.partner_id,
       email: decoded.email,
     };

@@ -5,6 +5,7 @@ const ApiError = require('../utils/ApiError');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
+const { insertNotification } = require('../utils/notificationWriter');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -191,10 +192,14 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
       if (pu.id) {
         try {
-          await pool.execute(
-            `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, 'rider_dispatched', ?, ?, 'order', ?)`,
-            [pu.id, `Order Dispatched: #${orders[0].order_number}`, `Order #${orders[0].order_number} is on its way via ${courierName}.`, order_id]
-          );
+          await insertNotification(pool, {
+            userId: pu.id,
+            type: 'rider_dispatched',
+            title: `Order Dispatched: #${orders[0].order_number}`,
+            message: `Order #${orders[0].order_number} is on its way via ${courierName}.`,
+            entityType: 'order',
+            entityId: order_id,
+          });
         } catch (notifyErr) {
           console.error('[DeliveryToken] Failed to create rider_dispatched notification:', notifyErr?.message || notifyErr);
         }
@@ -424,10 +429,14 @@ const completeDelivery = asyncHandler(async (req, res) => {
       [order.partner_id]
     );
     for (const pu of partnerUsers) {
-      await conn.execute(
-        `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id) VALUES (?, 'order_delivered', ?, ?, 'order', ?)`,
-        [pu.id, `Order Delivered: #${order.order_number}`, `Order #${order.order_number} has been delivered.`, orderId]
-      );
+      await insertNotification(conn, {
+        userId: pu.id,
+        type: 'order_delivered',
+        title: `Order Delivered: #${order.order_number}`,
+        message: `Order #${order.order_number} has been delivered.`,
+        entityType: 'order',
+        entityId: orderId,
+      });
     }
 
     await conn.commit();

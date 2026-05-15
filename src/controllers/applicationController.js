@@ -4,6 +4,7 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const bcrypt = require('bcryptjs');
 const { sendEmail, EMAIL } = require('../services/emailService');
+const { insertNotification } = require('../utils/notificationWriter');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -179,11 +180,14 @@ const submitDTA = asyncHandler(async (req, res) => {
     const tmpl = EMAIL.dtaReceived(fullName, businessName || email);
     await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
 
-    await pool.execute(
-      `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-       VALUES (?, 'dta_received', ?, ?, 'application', ?)`,
-      [admin.id, `New Stockist Application: ${fullName}`, `${fullName} applied for ${stockistLevel.replace('_', ' ')}.`, result.insertId]
-    );
+    await insertNotification(pool, {
+      userId: admin.id,
+      type: 'dta_received',
+      title: `New Stockist Application: ${fullName}`,
+      message: `${fullName} applied for ${stockistLevel.replace('_', ' ')}.`,
+      entityType: 'application',
+      entityId: result.insertId,
+    });
   }
 
   res.status(201).json({ success: true, message: 'Application submitted successfully. We will contact you soon.' });

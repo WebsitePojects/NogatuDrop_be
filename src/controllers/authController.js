@@ -6,6 +6,7 @@ const env = require('../config/env');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const { sendEmail, EMAIL } = require('../services/emailService');
+const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 
 function parseExpiry(str) {
   const match = str.match(/^(\d+)([smhd])$/);
@@ -39,6 +40,7 @@ const login = asyncHandler(async (req, res) => {
   }
 
   const user = users[0];
+  const normalizedRoleSlug = normalizeRoleSlug(user.role_slug);
 
   if (user.status !== 'active') {
     throw ApiError.unauthorized('Account is inactive or suspended');
@@ -66,7 +68,7 @@ const login = asyncHandler(async (req, res) => {
     id: user.id,
     email: user.email,
     role: user.role_id,
-    role_slug: user.role_slug,
+    role_slug: normalizedRoleSlug,
     partner_id: user.partner_id,
   };
   const accessToken = jwt.sign(accessPayload, env.JWT_SECRET, {
@@ -107,7 +109,7 @@ const login = asyncHandler(async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role_name,
-        role_slug: user.role_slug,
+        role_slug: normalizedRoleSlug,
         partner_id: user.partner_id,
       },
     },
@@ -175,6 +177,7 @@ const refresh = asyncHandler(async (req, res) => {
   }
 
   const user = users[0];
+  const normalizedRoleSlug = normalizeRoleSlug(user.role_slug);
 
   // Issue new access token
   const accessToken = jwt.sign(
@@ -182,7 +185,7 @@ const refresh = asyncHandler(async (req, res) => {
       id: user.id,
       email: user.email,
       role: user.role_id,
-      role_slug: user.role_slug,
+      role_slug: normalizedRoleSlug,
       partner_id: user.partner_id,
     },
     env.JWT_SECRET,
@@ -217,7 +220,10 @@ const me = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: users[0],
+    data: {
+      ...users[0],
+      role_slug: normalizeRoleSlug(users[0].role_slug),
+    },
   });
 });
 

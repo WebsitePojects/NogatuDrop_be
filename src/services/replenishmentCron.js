@@ -3,6 +3,7 @@ const pool = require('../config/db');
 const env = require('../config/env');
 const generateOrderNum = require('../utils/generateOrderNum');
 const { sendEmail, EMAIL } = require('./emailService');
+const { insertNotification } = require('../utils/notificationWriter');
 
 function startReplenishmentCron() {
   console.log(`[ReplenishmentCron] Started — schedule: ${env.REPLENISH_CRON}`);
@@ -71,15 +72,14 @@ function startReplenishmentCron() {
 
           // In-app notifications for all admins
           for (const admin of admins) {
-            await conn.execute(`
-              INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-              VALUES (?, 'low_stock', ?, ?, 'purchase_order', ?)
-            `, [
-              admin.id,
-              `Low Stock: ${item.product_name}`,
-              `${item.product_name} at ${item.warehouse_name} is at ${item.current_stock} units. Auto PO ${poNumber} generated.`,
-              poId,
-            ]);
+            await insertNotification(conn, {
+              userId: admin.id,
+              type: 'low_stock',
+              title: `Low Stock: ${item.product_name}`,
+              message: `${item.product_name} at ${item.warehouse_name} is at ${item.current_stock} units. Auto PO ${poNumber} generated.`,
+              entityType: 'purchase_order',
+              entityId: poId,
+            });
           }
 
           await conn.commit();

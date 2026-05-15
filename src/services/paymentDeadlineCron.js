@@ -3,11 +3,12 @@ const pool = require('../config/db');
 const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
+const { insertNotification } = require('../utils/notificationWriter');
 
 async function runPaymentDeadlineCheck() {
   const conn = await pool.getConnection();
   try {
-    // Find approved orders where payment_deadline has passed and payment is still pending
+    // Find approved orders where payment_deadline has passed and payment is still pending.
     const [expiredOrders] = await conn.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id
        FROM orders o
@@ -21,7 +22,6 @@ async function runPaymentDeadlineCheck() {
     for (const order of expiredOrders) {
       await conn.beginTransaction();
       try {
-        // Cancel the order
         await conn.execute(
           `UPDATE orders
            SET status = 'cancelled',
@@ -32,7 +32,6 @@ async function runPaymentDeadlineCheck() {
           [order.id]
         );
 
-        // Release reserved stock for all items
         const [items] = await conn.execute(
           'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
           [order.id]
@@ -40,32 +39,34 @@ async function runPaymentDeadlineCheck() {
 
         for (const item of items) {
           const warehouseId = item.source_warehouse_id || order.source_warehouse_id;
-          if (warehouseId) {
-            await conn.execute(
-              `UPDATE inventories
-               SET reserved_stock = GREATEST(0, reserved_stock - ?)
-               WHERE product_id = ? AND warehouse_id = ?`,
-              [item.quantity, item.product_id, warehouseId]
-            );
+          if (!warehouseId) continue;
 
-            // Log stock movement
-            await insertStockMovement(conn, {
-              productId: item.product_id,
-              warehouseId,
-              movementType: 'release',
-              quantity: item.quantity,
-              referenceType: 'order',
-              referenceId: order.id,
-              notes: 'Reserved stock released — payment deadline expired',
-            });
-          }
+          await conn.execute(
+            `UPDATE inventories
+             SET reserved_stock = GREATEST(0, reserved_stock - ?)
+             WHERE product_id = ? AND warehouse_id = ?`,
+            [item.quantity, item.product_id, warehouseId]
+          );
+
+          await insertStockMovement(conn, {
+            productId: item.product_id,
+            warehouseId,
+            movementType: 'release',
+            quantity: item.quantity,
+            referenceType: 'order',
+            referenceId: order.id,
+            notes: 'Reserved stock released because payment deadline expired',
+          });
         }
 
         await conn.commit();
 
-        // Notify stockist users via email
         const [partnerUsers] = await pool.execute(
-          `SELECT u.email, u.name FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0 AND u.status = 'active'`,
+          `SELECT u.id, u.email, u.name
+           FROM users u
+           WHERE u.partner_id = ?
+             AND u.is_deleted = 0
+             AND u.status = 'active'`,
           [order.partner_id]
         );
 
@@ -75,20 +76,17 @@ async function runPaymentDeadlineCheck() {
             await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
           }
 
-          // In-app notification
-          await pool.execute(
-            `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-             VALUES (?, 'order_cancelled', ?, ?, 'order', ?)`,
-            [
-              pu.id,
-              `Order Cancelled: ${order.order_number}`,
-              `Order ${order.order_number} was auto-cancelled — payment deadline passed.`,
-              order.id,
-            ]
-          );
+          await insertNotification(pool, {
+            userId: pu.id,
+            type: 'order_cancelled',
+            title: `Order Cancelled: ${order.order_number}`,
+            message: `Order ${order.order_number} was auto-cancelled because the payment deadline passed.`,
+            entityType: 'order',
+            entityId: order.id,
+          });
         }
 
-        console.log(`[PaymentDeadlineCron] Cancelled order ${order.order_number} — deadline expired`);
+        console.log(`[PaymentDeadlineCron] Cancelled order ${order.order_number} because the payment deadline expired`);
       } catch (innerErr) {
         await conn.rollback();
         console.error(`[PaymentDeadlineCron] Failed to cancel order ${order.order_number}:`, innerErr.message);
@@ -107,7 +105,7 @@ async function runPaymentDeadlineCheck() {
 
 function startPaymentDeadlineCron() {
   cron.schedule(env.PAYMENT_DEADLINE_CRON, runPaymentDeadlineCheck);
-  console.log(`[PaymentDeadlineCron] Started — schedule: ${env.PAYMENT_DEADLINE_CRON}`);
+  console.log(`[PaymentDeadlineCron] Started - schedule: ${env.PAYMENT_DEADLINE_CRON}`);
 }
 
 module.exports = { startPaymentDeadlineCron };
