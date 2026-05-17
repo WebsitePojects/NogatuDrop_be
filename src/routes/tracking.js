@@ -3,6 +3,7 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const {
   getTracking,
   getPublicTracking,
@@ -34,15 +35,31 @@ router.post(
 
 router.use(auth);
 
-router.get('/active', roleGuard('super_admin'), getActiveTracking);
+router.get(
+  '/active',
+  roleGuard.requirePermission(PERMISSIONS.TRACKING_VIEW),
+  getActiveTracking
+);
 
-router.get('/:orderId/pings', param('orderId').isInt(), validate, getOrderPings);
+router.get(
+  '/:orderId/pings',
+  roleGuard.requirePermission(PERMISSIONS.TRACKING_VIEW),
+  param('orderId').isInt(),
+  validate,
+  getOrderPings
+);
 
-router.get('/:orderId', param('orderId').isInt(), validate, getTracking);
+router.get(
+  '/:orderId',
+  roleGuard.requirePermission(PERMISSIONS.TRACKING_VIEW),
+  param('orderId').isInt(),
+  validate,
+  getTracking
+);
 
 router.post(
   '/',
-  roleGuard('super_admin'),
+  roleGuard.requirePermission(PERMISSIONS.DELIVERY_STATUS_UPDATE),
   [
     body('order_id').isInt().withMessage('Order ID is required'),
     body('transfer_id').optional().isInt(),
@@ -56,7 +73,7 @@ router.post(
 
 router.post(
   '/ping',
-  roleGuard('staff'),
+  roleGuard.requirePermission(PERMISSIONS.DELIVERY_STATUS_UPDATE),
   [
     body('tracking_id').isInt().withMessage('Tracking ID is required'),
     body('lat').isFloat().withMessage('Latitude is required'),
@@ -71,7 +88,7 @@ router.post(
 // Backward-compatible route shape
 router.post(
   '/:trackingId/ping',
-  roleGuard('staff'),
+  roleGuard.requirePermission(PERMISSIONS.DELIVERY_STATUS_UPDATE),
   param('trackingId').isInt(),
   [
     body('lat').isFloat().withMessage('Latitude is required'),
@@ -85,7 +102,7 @@ router.post(
 
 router.patch(
   '/:trackingId/status',
-  roleGuard('super_admin', 'staff'),
+  roleGuard.requirePermission(PERMISSIONS.DELIVERY_STATUS_UPDATE),
   param('trackingId').isInt(),
   [
     body('status').optional().isIn(['in_progress', 'out_for_delivery']),

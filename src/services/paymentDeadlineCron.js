@@ -4,6 +4,13 @@ const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
+const { runWithCronLeaderLock } = require('./cronLeaderLock');
+
+const isMissingColumn = (err, columnName) => (
+  err &&
+  err.code === 'ER_BAD_FIELD_ERROR' &&
+  String(err.sqlMessage || '').includes(columnName)
+);
 
 async function runPaymentDeadlineCheck() {
   const conn = await pool.getConnection();
@@ -32,10 +39,25 @@ async function runPaymentDeadlineCheck() {
           [order.id]
         );
 
-        const [items] = await conn.execute(
-          'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
-          [order.id]
-        );
+        let items = [];
+        try {
+          const [rows] = await conn.execute(
+            'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
+            [order.id]
+          );
+          items = rows;
+        } catch (err) {
+          if (!isMissingColumn(err, 'source_warehouse_id')) {
+            throw err;
+          }
+
+          // Backward compatibility for databases where order_items has no source_warehouse_id.
+          const [rows] = await conn.execute(
+            'SELECT product_id, quantity FROM order_items WHERE order_id = ?',
+            [order.id]
+          );
+          items = rows.map((row) => ({ ...row, source_warehouse_id: null }));
+        }
 
         for (const item of items) {
           const warehouseId = item.source_warehouse_id || order.source_warehouse_id;
@@ -104,8 +126,13 @@ async function runPaymentDeadlineCheck() {
 }
 
 function startPaymentDeadlineCron() {
-  cron.schedule(env.PAYMENT_DEADLINE_CRON, runPaymentDeadlineCheck);
+  cron.schedule(env.PAYMENT_DEADLINE_CRON, async () => {
+    await runWithCronLeaderLock({
+      lockKey: 'payment-deadline',
+      task: runPaymentDeadlineCheck,
+    });
+  });
   console.log(`[PaymentDeadlineCron] Started - schedule: ${env.PAYMENT_DEADLINE_CRON}`);
 }
 
-module.exports = { startPaymentDeadlineCron };
+module.exports = { startPaymentDeadlineCron, runPaymentDeadlineCheck };

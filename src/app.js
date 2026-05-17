@@ -4,7 +4,9 @@ const cors = require('cors');
 const morgan = require('morgan');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
 const env = require('./config/env');
+const redis = require('./config/redis');
 const routes = require('./routes/index');
 const ApiError = require('./utils/ApiError');
 
@@ -33,12 +35,19 @@ app.use(cookieParser());
 
 // Rate limiting
 if (env.RATE_LIMIT_ENABLED) {
+  const sharedStore = !redis.isInMemory
+    ? new RedisStore({
+        sendCommand: (...args) => redis.call(...args),
+      })
+    : undefined;
+
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: { success: false, message: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
+    ...(sharedStore ? { store: sharedStore } : {}),
   });
   app.use('/api/', limiter);
 
@@ -47,6 +56,14 @@ if (env.RATE_LIMIT_ENABLED) {
     windowMs: 15 * 60 * 1000,
     max: 20,
     message: { success: false, message: 'Too many auth attempts, please try again later.' },
+    ...(sharedStore
+      ? {
+          store: new RedisStore({
+            sendCommand: (...args) => redis.call(...args),
+            prefix: 'rl:auth:',
+          }),
+        }
+      : {}),
   });
   app.use('/api/v1/auth/login', authLimiter);
   app.use('/api/v1/auth/forgot-password', authLimiter);
@@ -88,7 +105,11 @@ app.use((err, req, res, next) => {
   const message = err.message || 'Internal server error';
 
   if (env.NODE_ENV !== 'production') {
-    console.error('[Error]', err);
+    if (statusCode >= 500) {
+      console.error('[Error]', err);
+    } else {
+      console.warn(`[HTTP ${statusCode}] ${message}`);
+    }
   }
 
   res.status(statusCode).json({

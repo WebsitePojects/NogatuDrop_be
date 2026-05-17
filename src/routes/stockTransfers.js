@@ -3,20 +3,25 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { getTransfers, getTransfer, createTransfer, completeTransfer } = require('../controllers/stockTransferController');
 
 const router = Router();
 
 router.use(auth);
 
-const ALL_STOCKIST_ROLES = ['super_admin', 'provincial_stockist', 'city_stockist', 'staff'];
-
-router.get('/', roleGuard(...ALL_STOCKIST_ROLES), getTransfers);
-router.get('/:id', roleGuard(...ALL_STOCKIST_ROLES), param('id').isInt(), validate, getTransfer);
+router.get('/', roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_VIEW), getTransfers);
+router.get(
+  '/:id',
+  roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_VIEW),
+  param('id').isInt(),
+  validate,
+  getTransfer
+);
 
 router.post(
   '/',
-  roleGuard('super_admin', 'provincial_stockist', 'city_stockist'),
+  roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_CREATE),
   [
     body('from_warehouse_id').isInt().withMessage('Source warehouse ID is required'),
     body('to_warehouse_id').isInt().withMessage('Destination warehouse ID is required'),
@@ -29,6 +34,12 @@ router.post(
   createTransfer
 );
 
-router.patch('/:id/complete', roleGuard('super_admin'), param('id').isInt(), validate, completeTransfer);
+router.patch(
+  '/:id/complete',
+  roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_COMPLETE),
+  param('id').isInt(),
+  validate,
+  completeTransfer
+);
 
 module.exports = router;

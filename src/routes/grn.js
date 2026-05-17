@@ -1,11 +1,13 @@
 const { Router } = require('express');
 const auth = require('../middleware/authMiddleware');
-const role = require('../middleware/roleGuard');
+const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const c = require('../controllers/grnController');
 
 const r = Router();
-r.get('/', auth, role('super_admin', 'provincial_stockist', 'city_stockist', 'staff'), c.getGRNs);
-r.post('/', auth, role('super_admin', 'provincial_stockist', 'city_stockist', 'staff'), c.createGRN);
-r.get('/:id', auth, role('super_admin', 'provincial_stockist', 'city_stockist', 'staff'), c.getGRN);
-r.patch('/:id/complete', auth, role('super_admin', 'provincial_stockist', 'city_stockist', 'staff'), c.completeGRN);
+r.use(auth);
+r.get('/', roleGuard.requirePermission(PERMISSIONS.GRN_VIEW), c.getGRNs);
+r.post('/', roleGuard.requirePermission(PERMISSIONS.GRN_CREATE), c.createGRN);
+r.get('/:id', roleGuard.requirePermission(PERMISSIONS.GRN_VIEW), c.getGRN);
+r.patch('/:id/complete', roleGuard.requirePermission(PERMISSIONS.GRN_COMPLETE), c.completeGRN);
 module.exports = r;

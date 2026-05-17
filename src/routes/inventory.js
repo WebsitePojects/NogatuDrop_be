@@ -3,18 +3,20 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { getInventory, getInventoryItem, addInventory, updateInventory } = require('../controllers/inventoryController');
 
 const router = Router();
+const { requirePermission } = roleGuard;
 
 router.use(auth);
 
-router.get('/', getInventory);
-router.get('/:id', param('id').isInt(), validate, getInventoryItem);
+router.get('/', requirePermission(PERMISSIONS.INVENTORY_VIEW), getInventory);
+router.get('/:id', requirePermission(PERMISSIONS.INVENTORY_VIEW), param('id').isInt(), validate, getInventoryItem);
 
 router.post(
   '/',
-  roleGuard('super_admin'),
+  requirePermission(PERMISSIONS.INVENTORY_MANAGE),
   [
     body('product_id').isInt().withMessage('Product ID is required'),
     body('warehouse_id').isInt().withMessage('Warehouse ID is required'),
@@ -30,7 +32,7 @@ router.post(
 
 router.put(
   '/:id',
-  roleGuard('super_admin'),
+  requirePermission(PERMISSIONS.INVENTORY_MANAGE),
   param('id').isInt(),
   [
     body('current_stock').optional().isInt({ min: 0 }),

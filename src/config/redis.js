@@ -52,6 +52,14 @@ function createInMemoryRedis() {
       }
       return matched;
     },
+    async scan(cursor, matchKeyword, pattern, countKeyword, count) {
+      const matched = await this.keys(pattern);
+      const start = Number(cursor) || 0;
+      const batchSize = Number(count) || matched.length || 10;
+      const slice = matched.slice(start, start + batchSize);
+      const nextCursor = start + batchSize >= matched.length ? '0' : String(start + batchSize);
+      return [nextCursor, slice];
+    },
   };
 }
 
@@ -60,6 +68,7 @@ let redis;
 if (!env.REDIS_ENABLED) {
   console.log('[Redis] Disabled via REDIS_ENABLED=false. Using in-memory fallback cache.');
   redis = createInMemoryRedis();
+  redis.isInMemory = true;
 } else {
   redis = new Redis(env.REDIS_URL, {
     maxRetriesPerRequest: 3,
@@ -79,6 +88,8 @@ if (!env.REDIS_ENABLED) {
   redis.on('connect', () => {
     console.log('[Redis] Connected successfully');
   });
+
+  redis.isInMemory = false;
 }
 
 module.exports = redis;

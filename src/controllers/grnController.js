@@ -5,12 +5,69 @@ const paginate = require('../utils/paginate');
 const generateOrderNum = require('../utils/generateOrderNum');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
+const { ROLES, canonicalRole } = require('../rbac/roles');
 
 const isMissingColumn = (err, columnName) => (
   err &&
   err.code === 'ER_BAD_FIELD_ERROR' &&
   String(err.message || '').includes(`'${columnName}'`)
 );
+
+function isSuperAdmin(user) {
+  return canonicalRole(user?.role_slug) === ROLES.SUPER_ADMIN;
+}
+
+function scopedWarehouseClause(user, alias) {
+  if (isSuperAdmin(user)) {
+    return { clause: '', params: [] };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return {
+    clause: ` AND (${alias}.partner_id = ? OR EXISTS (
+      SELECT 1 FROM inventories si
+      WHERE si.warehouse_id = ${alias}.id
+        AND si.partner_id = ?
+    ))`,
+    params: [user.partner_id, user.partner_id],
+  };
+}
+
+async function getScopedWarehouse(db, user, warehouseId) {
+  const scope = scopedWarehouseClause(user, 'w');
+  try {
+    const [rows] = await db.execute(
+      `SELECT w.id, w.partner_id
+       FROM warehouses w
+       WHERE w.id = ? AND w.is_deleted = 0${scope.clause}
+       LIMIT 1`,
+      [warehouseId, ...scope.params]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    if (!(scope.params.length > 0 && isMissingColumn(err, 'w.partner_id'))) {
+      throw err;
+    }
+
+    const [rows] = await db.execute(
+      `SELECT w.id, NULL AS partner_id
+       FROM warehouses w
+       WHERE w.id = ?
+         AND w.is_deleted = 0
+         AND EXISTS (
+           SELECT 1 FROM inventories si
+           WHERE si.warehouse_id = w.id
+             AND si.partner_id = ?
+         )
+       LIMIT 1`,
+      [warehouseId, user.partner_id]
+    );
+    return rows[0] || null;
+  }
+}
 
 async function getGRNItemsSummary(db, grnId) {
   try {
@@ -116,11 +173,30 @@ async function insertGRNItem(db, grnId, item) {
   }
 }
 
-async function findInventoryRow(db, productId, warehouseId) {
+function scopedInventoryMutationClause(user, warehousePartnerId, alias = 'inventories') {
+  if (isSuperAdmin(user)) {
+    return { clause: '', params: [] };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return {
+    clause: ` AND COALESCE(${alias}.partner_id, ?) = ?`,
+    params: [warehousePartnerId || null, user.partner_id],
+  };
+}
+
+async function findInventoryRow(db, productId, warehouseId, user = null, warehousePartnerId = null) {
+  const scope = scopedInventoryMutationClause(user, warehousePartnerId);
   try {
     const [rows] = await db.execute(
-      'SELECT id FROM inventories WHERE product_id = ? AND warehouse_id = ? AND is_active = 1 LIMIT 1',
-      [productId, warehouseId]
+      `SELECT id FROM inventories
+       WHERE product_id = ? AND warehouse_id = ? AND is_active = 1${scope.clause}
+       LIMIT 1
+       FOR UPDATE`,
+      [productId, warehouseId, ...scope.params]
     );
     return rows;
   } catch (err) {
@@ -131,8 +207,11 @@ async function findInventoryRow(db, productId, warehouseId) {
 
   try {
     const [rows] = await db.execute(
-      'SELECT id FROM inventories WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0 LIMIT 1',
-      [productId, warehouseId]
+      `SELECT id FROM inventories
+       WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0${scope.clause}
+       LIMIT 1
+       FOR UPDATE`,
+      [productId, warehouseId, ...scope.params]
     );
     return rows;
   } catch (err) {
@@ -142,8 +221,11 @@ async function findInventoryRow(db, productId, warehouseId) {
   }
 
   const [rows] = await db.execute(
-    'SELECT id FROM inventories WHERE product_id = ? AND warehouse_id = ? LIMIT 1',
-    [productId, warehouseId]
+    `SELECT id FROM inventories
+     WHERE product_id = ? AND warehouse_id = ?${scope.clause}
+     LIMIT 1
+     FOR UPDATE`,
+    [productId, warehouseId, ...scope.params]
   );
   return rows;
 }
@@ -268,6 +350,11 @@ const createGRN = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
 
+    const warehouse = await getScopedWarehouse(conn, req.user, warehouse_id);
+    if (!warehouse) {
+      throw ApiError.notFound('Warehouse not found');
+    }
+
     const [result] = await conn.execute(
       `INSERT INTO goods_receipts (grn_number, po_id, warehouse_id, received_by, status, supplier, delivery_reference, notes)
        VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)`,
@@ -292,35 +379,44 @@ const createGRN = asyncHandler(async (req, res) => {
 // PATCH /api/v1/grn/:id/complete — complete GRN, increment stock
 const completeGRN = asyncHandler(async (req, res) => {
   const grnId = req.params.id;
-
-  const [grns] = await pool.execute(
-    'SELECT g.* FROM goods_receipts g WHERE g.id = ? AND g.is_deleted = 0 LIMIT 1',
-    [grnId]
-  );
-  if (grns.length === 0) throw ApiError.notFound('GRN not found');
-  if (grns[0].status === 'completed') throw ApiError.badRequest('GRN is already completed');
-
-  const grn = grns[0];
-
-  const items = await getGRNItemsDetailed(pool, grnId);
-
-  const discrepancies = items.filter(i => i.received_qty !== i.expected_qty);
+  const scope = scopedWarehouseClause(req.user, 'w');
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    await conn.execute(
-      `UPDATE goods_receipts SET status = 'completed', completed_at = NOW() WHERE id = ?`,
+    const [grns] = await conn.execute(
+      `SELECT g.*, w.partner_id AS warehouse_partner_id
+       FROM goods_receipts g
+       JOIN warehouses w ON w.id = g.warehouse_id
+       WHERE g.id = ? AND g.is_deleted = 0${scope.clause}
+       LIMIT 1
+       FOR UPDATE`,
+      [grnId, ...scope.params]
+    );
+    if (grns.length === 0) throw ApiError.notFound('GRN not found');
+    if (grns[0].status === 'completed') throw ApiError.badRequest('GRN is already completed');
+
+    const grn = grns[0];
+    const items = await getGRNItemsDetailed(conn, grnId);
+    const discrepancies = items.filter(i => i.received_qty !== i.expected_qty);
+
+    const [completed] = await conn.execute(
+      `UPDATE goods_receipts
+       SET status = 'completed', completed_at = NOW()
+       WHERE id = ? AND status <> 'completed'`,
       [grnId]
     );
+    if (completed.affectedRows === 0) {
+      throw ApiError.badRequest('GRN is already completed');
+    }
 
     // Increment inventory for each received item
     for (const item of items) {
       if (item.received_qty <= 0) continue;
 
       // Upsert inventory record
-      const invRows = await findInventoryRow(conn, item.product_id, grn.warehouse_id);
+      const invRows = await findInventoryRow(conn, item.product_id, grn.warehouse_id, req.user, grn.warehouse_partner_id);
 
       if (invRows.length > 0) {
         await conn.execute(
@@ -329,8 +425,14 @@ const completeGRN = asyncHandler(async (req, res) => {
         );
       } else {
         await conn.execute(
-          `INSERT INTO inventories (product_id, warehouse_id, current_stock, last_movement_at) VALUES (?, ?, ?, NOW())`,
-          [item.product_id, grn.warehouse_id, item.received_qty]
+          `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, last_movement_at)
+           VALUES (?, ?, ?, ?, NOW())`,
+          [
+            item.product_id,
+            grn.warehouse_id,
+            isSuperAdmin(req.user) ? grn.warehouse_partner_id || null : req.user.partner_id,
+            item.received_qty,
+          ]
         );
       }
 

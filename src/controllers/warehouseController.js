@@ -2,12 +2,22 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { appendPartnerScope } = require('../rbac/resourceScopes');
 
 // GET /api/v1/warehouses
 const getWarehouses = asyncHandler(async (req, res) => {
   const { page, limit, search, type } = req.query;
   const params = [];
   let where = 'WHERE w.is_deleted = 0';
+  where = appendPartnerScope({
+    where,
+    params,
+    user: req.user,
+    condition: `EXISTS (
+      SELECT 1 FROM inventories i
+      WHERE i.warehouse_id = w.id AND i.is_active = 1 AND i.partner_id = ?
+    )`,
+  });
 
   if (search) {
     where += ' AND (w.name LIKE ? OR w.location LIKE ?)';
@@ -43,8 +53,16 @@ const getWarehouse = asyncHandler(async (req, res) => {
             w.manager_name, w.manager_email, w.manager_phone,
             w.lat, w.lng, w.is_active, w.created_at, w.updated_at
      FROM warehouses w
-     WHERE w.id = ? AND w.is_deleted = 0 LIMIT 1`,
-    [req.params.id]
+     WHERE w.id = ? AND w.is_deleted = 0
+       AND (
+         ? = 'super_admin'
+         OR EXISTS (
+           SELECT 1 FROM inventories i
+           WHERE i.warehouse_id = w.id AND i.is_active = 1 AND i.partner_id = ?
+         )
+       )
+     LIMIT 1`,
+    [req.params.id, req.user.role_slug, req.user.partner_id || null]
   );
   if (rows.length === 0) throw ApiError.notFound('Warehouse not found');
   res.json({ success: true, data: rows[0] });

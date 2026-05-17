@@ -6,6 +6,7 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
+const { createPendingSettlementForOrder } = require('./settlementController');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -89,19 +90,93 @@ function assertCanAccessOrder(user, order) {
   throw ApiError.forbidden('You do not have permission to access this order');
 }
 
+function canAccessDeliveryProof(user, ownership) {
+  if (!user) return false;
+  if (user.role_slug === 'super_admin') return true;
+
+  const userPartnerId = Number(user.partner_id || 0);
+  if (!userPartnerId) return false;
+
+  return userPartnerId === Number(ownership.partner_id || 0)
+    || userPartnerId === Number(ownership.source_partner_id || 0);
+}
+
+function buildDeliveryProofScope(user, {
+  orderAlias = 'o',
+  sourcePartnerExpression = 'sw.partner_id',
+} = {}) {
+  if (user?.role_slug === 'super_admin') {
+    return { clause: '', params: [] };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return {
+    clause: ` AND (${orderAlias}.partner_id = ? OR ${sourcePartnerExpression} = ?)`,
+    params: [user.partner_id, user.partner_id],
+  };
+}
+
+async function getDeliveryProofOwnership(orderId) {
+  let rows;
+
+  try {
+    [rows] = await pool.execute(
+      `SELECT o.id, o.partner_id, sw.partner_id AS source_partner_id
+       FROM orders o
+       LEFT JOIN warehouses sw ON sw.id = o.source_warehouse_id
+       WHERE o.id = ? AND o.is_deleted = 0
+       LIMIT 1`,
+      [orderId]
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'source_warehouse_id') && !isMissingColumn(err, 'partner_id')) {
+      throw err;
+    }
+
+    [rows] = await pool.execute(
+      `SELECT o.id, o.partner_id, NULL AS source_partner_id
+       FROM orders o
+       WHERE o.id = ? AND o.is_deleted = 0
+       LIMIT 1`,
+      [orderId]
+    );
+  }
+
+  return rows[0] || null;
+}
+
 // POST /api/v1/delivery-tokens — generate magic link for an order
 const generateDeliveryLink = asyncHandler(async (req, res) => {
   const { order_id, courier_id, courier_tracking_number } = req.body;
   if (!order_id) throw ApiError.badRequest('order_id is required');
 
-  const [orders] = await pool.execute(
-    `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status
-     FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
-    [order_id]
-  );
+  let orders;
+  try {
+    [orders] = await pool.execute(
+      `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status, o.cod_amount
+       FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
+      [order_id]
+    );
+  } catch (err) {
+    if (!isMissingColumn(err, 'cod_amount')) {
+      throw err;
+    }
+
+    [orders] = await pool.execute(
+      `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status
+       FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
+      [order_id]
+    );
+    orders = orders.map((row) => ({ ...row, cod_amount: null }));
+  }
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   assertCanAccessOrder(req.user, orders[0]);
-  if (orders[0].payment_status !== 'paid') throw ApiError.badRequest('Payment must be verified before generating a delivery link');
+  if (orders[0].payment_status !== 'paid' && Number(orders[0].cod_amount || 0) <= 0) {
+    throw ApiError.badRequest('Payment must be verified before generating a delivery link');
+  }
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
     throw ApiError.badRequest('Cannot generate delivery link for this order status');
   }
@@ -249,6 +324,238 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   });
 });
 
+// GET /api/v1/delivery-tokens/pods/by-order/:orderId — authenticated POD review for office users
+const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
+  const { orderId } = req.params;
+  const ownership = await getDeliveryProofOwnership(orderId);
+
+  if (!ownership) {
+    throw ApiError.notFound('Order not found');
+  }
+
+  if (!canAccessDeliveryProof(req.user, ownership)) {
+    throw ApiError.forbidden('You do not have permission to access this proof of delivery');
+  }
+
+  let rows;
+
+  try {
+    [rows] = await pool.execute(
+      `SELECT pod.id AS pod_id,
+              pod.order_id,
+              pod.token_id,
+              pod.photo_url,
+              pod.gps_lat,
+              pod.gps_lng,
+              pod.recipient_name,
+              pod.recipient_signature,
+              pod.signature_hash,
+              pod.signed_at,
+              pod.notes,
+              pod.created_at AS pod_created_at,
+              o.order_number,
+              o.status AS order_status,
+              o.partner_id,
+              pt.business_name AS partner_name,
+              o.customer_name,
+              o.customer_address,
+              o.customer_phone,
+              o.delivered_at AS order_delivered_at,
+              dt.used_at AS token_used_at,
+              tr.status AS tracking_status,
+              tr.rider_name,
+              tr.courier_tracking_number,
+              tr.est_delivery_at,
+              tr.delivered_at AS tracking_delivered_at,
+              c.name AS courier_name,
+              sw.id AS source_warehouse_id,
+              sw.name AS source_warehouse_name,
+              sw.location AS source_warehouse_location,
+              tw.id AS target_warehouse_id,
+              tw.name AS target_warehouse_name,
+              tw.location AS target_warehouse_location
+       FROM proof_of_delivery pod
+       JOIN orders o ON o.id = pod.order_id
+       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
+       LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
+       LEFT JOIN couriers c ON c.id = tr.courier_id
+       LEFT JOIN warehouses sw ON sw.id = o.source_warehouse_id
+       LEFT JOIN warehouses tw ON tw.id = (
+         SELECT MIN(w2.id)
+         FROM warehouses w2
+         WHERE w2.partner_id = o.partner_id
+       )
+       WHERE pod.order_id = ?
+       ORDER BY pod.id DESC
+       LIMIT 1`,
+      [orderId]
+    );
+  } catch (err) {
+    if (
+      !isMissingColumn(err, 'gps_lat')
+      && !isMissingColumn(err, 'recipient_name')
+      && !isMissingColumn(err, 'source_warehouse_id')
+      && !isMissingColumn(err, 'partner_id')
+    ) {
+      throw err;
+    }
+
+    [rows] = await pool.execute(
+      `SELECT pod.id AS pod_id,
+              pod.order_id,
+              pod.token_id,
+              pod.photo_url,
+              NULL AS gps_lat,
+              NULL AS gps_lng,
+              NULL AS recipient_name,
+              NULL AS recipient_signature,
+              NULL AS signature_hash,
+              NULL AS signed_at,
+              pod.notes,
+              pod.created_at AS pod_created_at,
+              o.order_number,
+              o.status AS order_status,
+              o.partner_id,
+              pt.business_name AS partner_name,
+              o.customer_name,
+              o.customer_address,
+              o.customer_phone,
+              o.delivered_at AS order_delivered_at,
+              dt.used_at AS token_used_at,
+              tr.status AS tracking_status,
+              tr.rider_name,
+              tr.courier_tracking_number,
+              tr.est_delivery_at,
+              tr.delivered_at AS tracking_delivered_at,
+              c.name AS courier_name,
+              NULL AS source_warehouse_id,
+              NULL AS source_warehouse_name,
+              NULL AS source_warehouse_location,
+              NULL AS target_warehouse_id,
+              NULL AS target_warehouse_name,
+              NULL AS target_warehouse_location
+       FROM proof_of_delivery pod
+       JOIN orders o ON o.id = pod.order_id
+       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
+       LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
+       LEFT JOIN couriers c ON c.id = tr.courier_id
+       WHERE pod.order_id = ?
+       ORDER BY pod.id DESC
+       LIMIT 1`,
+      [orderId]
+    );
+  }
+
+  if (rows.length === 0) {
+    return res.json({ success: true, data: null });
+  }
+
+  return res.json({ success: true, data: rows[0] });
+});
+
+// GET /api/v1/delivery-tokens/pods — recent POD records within tenant/source scope
+const listDeliveryProofs = asyncHandler(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
+  const scope = buildDeliveryProofScope(req.user);
+  let rows;
+
+  try {
+    [rows] = await pool.execute(
+      `SELECT pod.id AS pod_id,
+              pod.order_id,
+              pod.photo_url,
+              pod.gps_lat,
+              pod.gps_lng,
+              pod.recipient_name,
+              pod.recipient_signature,
+              pod.signed_at,
+              pod.notes,
+              pod.created_at AS pod_created_at,
+              o.order_number,
+              o.status AS order_status,
+              o.partner_id,
+              pt.business_name AS partner_name,
+              o.delivered_at AS order_delivered_at,
+              tr.status AS tracking_status,
+              tr.rider_name,
+              tr.courier_tracking_number,
+              tr.delivered_at AS tracking_delivered_at,
+              c.name AS courier_name,
+              sw.partner_id AS source_partner_id,
+              sw.name AS source_warehouse_name,
+              sw.location AS source_warehouse_location,
+              tw.name AS target_warehouse_name,
+              tw.location AS target_warehouse_location
+       FROM proof_of_delivery pod
+       JOIN orders o ON o.id = pod.order_id
+       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
+       LEFT JOIN couriers c ON c.id = tr.courier_id
+       LEFT JOIN warehouses sw ON sw.id = o.source_warehouse_id
+       LEFT JOIN warehouses tw ON tw.id = (
+         SELECT MIN(w2.id)
+         FROM warehouses w2
+         WHERE w2.partner_id = o.partner_id
+       )
+       WHERE o.is_deleted = 0${scope.clause}
+       ORDER BY COALESCE(pod.signed_at, pod.created_at) DESC
+       LIMIT ?`,
+      [...scope.params, limit]
+    );
+  } catch (err) {
+    if (
+      !isMissingColumn(err, 'gps_lat')
+      && !isMissingColumn(err, 'recipient_name')
+      && !isMissingColumn(err, 'source_warehouse_id')
+      && !isMissingColumn(err, 'partner_id')
+    ) {
+      throw err;
+    }
+
+    [rows] = await pool.execute(
+      `SELECT pod.id AS pod_id,
+              pod.order_id,
+              pod.photo_url,
+              NULL AS gps_lat,
+              NULL AS gps_lng,
+              NULL AS recipient_name,
+              NULL AS recipient_signature,
+              NULL AS signed_at,
+              pod.notes,
+              pod.created_at AS pod_created_at,
+              o.order_number,
+              o.status AS order_status,
+              o.partner_id,
+              pt.business_name AS partner_name,
+              o.delivered_at AS order_delivered_at,
+              tr.status AS tracking_status,
+              tr.rider_name,
+              tr.courier_tracking_number,
+              tr.delivered_at AS tracking_delivered_at,
+              c.name AS courier_name,
+              NULL AS source_partner_id,
+              NULL AS source_warehouse_name,
+              NULL AS source_warehouse_location,
+              NULL AS target_warehouse_name,
+              NULL AS target_warehouse_location
+       FROM proof_of_delivery pod
+       JOIN orders o ON o.id = pod.order_id
+       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
+       LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
+       LEFT JOIN couriers c ON c.id = tr.courier_id
+       WHERE o.is_deleted = 0 AND o.partner_id = ?
+       ORDER BY pod.created_at DESC
+       LIMIT ?`,
+      [req.user.partner_id, limit]
+    );
+  }
+
+  return res.json({ success: true, data: rows });
+});
+
 // GET /deliver/:token — public, no auth — delivery page info for rider
 const getDeliveryInfo = asyncHandler(async (req, res) => {
   const { token } = req.params;
@@ -302,22 +609,32 @@ const completeDelivery = asyncHandler(async (req, res) => {
   const { id: tokenId, order_id: orderId } = tokens[0];
   const podUrl = req.file.path; // Cloudinary URL
   const recipientName = req.body.recipient_name || null;
+  const recipientSignature = req.body.recipient_signature || null;
   const gpsLat = req.body.latitude || req.body.gps_lat || null;
   const gpsLng = req.body.longitude || req.body.gps_lng || null;
+  const signatureHash = recipientSignature
+    ? crypto.createHash('sha256').update(String(recipientSignature)).digest('hex')
+    : null;
 
   let orders;
   try {
     [orders] = await pool.execute(
-      'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
+      'SELECT id, order_number, partner_id, source_warehouse_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
       [orderId]
     );
   } catch (err) {
     if (isMissingColumn(err, 'source_warehouse_id')) {
       [orders] = await pool.execute(
-        'SELECT id, order_number, partner_id FROM orders WHERE id = ? LIMIT 1',
+        'SELECT id, order_number, partner_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
         [orderId]
       );
       orders = orders.map((row) => ({ ...row, source_warehouse_id: null }));
+    } else if (isMissingColumn(err, 'cod_amount')) {
+      [orders] = await pool.execute(
+        'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
+        [orderId]
+      );
+      orders = orders.map((row) => ({ ...row, cod_amount: null }));
     } else {
       throw err;
     }
@@ -335,14 +652,27 @@ const completeDelivery = asyncHandler(async (req, res) => {
     // Create POD record
     try {
       await conn.execute(
-        `INSERT INTO proof_of_delivery (order_id, token_id, photo_url, gps_lat, gps_lng, recipient_name, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [orderId, tokenId, podUrl, gpsLat, gpsLng, recipientName, req.body.notes || null]
+        `INSERT INTO proof_of_delivery
+         (order_id, token_id, photo_url, gps_lat, gps_lng, recipient_name, recipient_signature, signature_hash, signed_at, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          orderId,
+          tokenId,
+          podUrl,
+          gpsLat,
+          gpsLng,
+          recipientName,
+          recipientSignature,
+          signatureHash,
+          recipientSignature ? new Date() : null,
+          req.body.notes || null,
+        ]
       );
     } catch (err) {
       if (
         !isMissingColumn(err, 'gps_lat') &&
-        !isMissingColumn(err, 'recipient_name')
+        !isMissingColumn(err, 'recipient_name') &&
+        !isMissingColumn(err, 'recipient_signature')
       ) {
         throw err;
       }
@@ -403,14 +733,19 @@ const completeDelivery = asyncHandler(async (req, res) => {
     for (const item of items) {
       const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
-        await conn.execute(
+        const [updated] = await conn.execute(
           `UPDATE inventories
-           SET current_stock = GREATEST(0, current_stock - ?),
-               reserved_stock = GREATEST(0, reserved_stock - ?),
+           SET current_stock = current_stock - ?,
+               reserved_stock = reserved_stock - ?,
                last_movement_at = NOW()
-           WHERE product_id = ? AND warehouse_id = ?`,
-          [item.quantity, item.quantity, item.product_id, wid]
+           WHERE product_id = ? AND warehouse_id = ?
+             AND current_stock >= ?
+             AND reserved_stock >= ?`,
+          [item.quantity, item.quantity, item.product_id, wid, item.quantity, item.quantity]
         );
+        if (updated.affectedRows === 0) {
+          throw ApiError.conflict('Reserved stock is no longer sufficient to complete this delivery');
+        }
         await insertStockMovement(conn, {
           productId: item.product_id,
           warehouseId: wid,
@@ -421,6 +756,15 @@ const completeDelivery = asyncHandler(async (req, res) => {
           notes: 'Stock out on delivery confirmation',
         });
       }
+    }
+
+    if (Number(order.cod_amount || 0) > 0) {
+      await createPendingSettlementForOrder(conn, {
+        orderId,
+        partnerId: order.partner_id,
+        amount: Number(order.cod_amount),
+        method: 'courier_remittance',
+      });
     }
 
     // Notify Stockist
@@ -456,4 +800,15 @@ const completeDelivery = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { generateDeliveryLink, getLatestDeliveryLinkForOrder, getDeliveryInfo, completeDelivery };
+module.exports = {
+  generateDeliveryLink,
+  getLatestDeliveryLinkForOrder,
+  getDeliveryProofForOrder,
+  listDeliveryProofs,
+  getDeliveryInfo,
+  completeDelivery,
+  __testables: {
+    canAccessDeliveryProof,
+    buildDeliveryProofScope,
+  },
+};

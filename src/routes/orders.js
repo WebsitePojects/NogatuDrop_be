@@ -3,6 +3,7 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { paymentProofUpload } = require('../middleware/upload');
 const {
   getOrders, getOrder, createOrder, createPublicOrder,
@@ -11,6 +12,7 @@ const {
 } = require('../controllers/orderController');
 
 const router = Router();
+const { requirePermission } = role;
 
 // Public — no auth
 router.post('/public', createPublicOrder);
@@ -18,25 +20,28 @@ router.post('/public', createPublicOrder);
 // Authenticated
 router.use(auth);
 
-router.get('/', getOrders);
-router.get('/:id', param('id').isInt(), validate, getOrder);
+router.get('/', requirePermission(PERMISSIONS.ORDERS_VIEW), getOrders);
+router.get('/:id', requirePermission(PERMISSIONS.ORDERS_VIEW), param('id').isInt(), validate, getOrder);
 
 router.post(
   '/',
-  role('provincial_stockist', 'city_stockist', 'mobile_stockist'),
-  [body('notes').optional().trim()],
+  requirePermission(PERMISSIONS.ORDERS_CREATE),
+  [
+    body('notes').optional().trim(),
+    body('payment_method').optional().isIn(['bank_transfer', 'cod']),
+  ],
   validate,
   createOrder
 );
 
-router.patch('/:id/approve', role('super_admin'), approveOrder);
-router.patch('/:id/reject', role('super_admin'), [body('reason').optional().trim()], validate, rejectOrder);
-router.patch('/:id/cancel', cancelOrder);
+router.patch('/:id/approve', requirePermission(PERMISSIONS.ORDERS_APPROVE), approveOrder);
+router.patch('/:id/reject', requirePermission(PERMISSIONS.ORDERS_REJECT), [body('reason').optional().trim()], validate, rejectOrder);
+router.patch('/:id/cancel', requirePermission(PERMISSIONS.ORDERS_CANCEL), cancelOrder);
 
 // Stockist uploads payment proof (Cloudinary)
-router.post('/:id/payment-proof', paymentProofUpload.single('proof'), uploadPaymentProof);
+router.post('/:id/payment-proof', requirePermission(PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), paymentProofUpload.single('proof'), uploadPaymentProof);
 
 // Super admin verifies payment proof
-router.patch('/:id/verify-payment', role('super_admin'), verifyPayment);
+router.patch('/:id/verify-payment', requirePermission(PERMISSIONS.ORDERS_VERIFY_PAYMENT), verifyPayment);
 
 module.exports = router;

@@ -3,6 +3,14 @@ const env = require('../config/env');
 
 let brevoClient = null;
 
+function hasUsableBrevoKey() {
+  const key = String(env.BREVO_API_KEY || '').trim();
+  if (!key) return false;
+
+  const lower = key.toLowerCase();
+  return !(lower === 'your_brevo_api_key' || lower.startsWith('your_'));
+}
+
 function getBrevoClient() {
   if (!brevoClient) {
     brevoClient = new BrevoClient({
@@ -13,17 +21,9 @@ function getBrevoClient() {
   return brevoClient;
 }
 
-/**
- * Send a transactional email via Brevo
- * @param {object} opts
- * @param {string|string[]} opts.to  - recipient email(s)
- * @param {string} opts.subject
- * @param {string} opts.html
- * @param {string} [opts.toName]
- */
 async function sendEmail({ to, toName, subject, html }) {
-  if (!env.BREVO_API_KEY) {
-    console.log(`[Email] BREVO_API_KEY not set — skipping email to ${to}: ${subject}`);
+  if (!hasUsableBrevoKey()) {
+    console.log(`[Email] Brevo key is not configured - skipping email to ${to}: ${subject}`);
     return;
   }
 
@@ -41,11 +41,14 @@ async function sendEmail({ to, toName, subject, html }) {
       htmlContent: html,
     });
   } catch (err) {
-    console.error('[Email] Failed to send:', err?.message || err);
+    const message = err?.message || String(err);
+    if (env.NODE_ENV !== 'production') {
+      console.warn('[Email] Failed to send (non-fatal in development):', message);
+      return;
+    }
+    console.error('[Email] Failed to send:', message);
   }
 }
-
-// ─── Email Templates ──────────────────────────────────────────────────────────
 
 const EMAIL = {
   orderPlaced: (orderNumber, stockistName) => ({
@@ -54,17 +57,21 @@ const EMAIL = {
   }),
 
   orderApproved: (orderNumber, deadlineHours, bankDetails) => ({
-    subject: `Order #${orderNumber} Approved — Pay within ${deadlineHours} hours`,
+    subject: deadlineHours
+      ? `Order #${orderNumber} Approved - Pay within ${deadlineHours} hours`
+      : `Order #${orderNumber} Approved - Cash on Delivery`,
     html: `
       <p>Your order <strong>#${orderNumber}</strong> has been approved.</p>
-      <p><strong>You have ${deadlineHours} hours to upload payment proof.</strong> The order will be auto-cancelled if payment is not verified in time.</p>
+      ${deadlineHours
+        ? `<p><strong>You have ${deadlineHours} hours to upload payment proof.</strong> The order will be auto-cancelled if payment is not verified in time.</p>`
+        : `<p><strong>This order is approved for cash on delivery.</strong> Delivery can proceed without advance payment proof.</p>`}
       ${bankDetails ? `<p><strong>Bank Account:</strong><br/>${bankDetails}</p>` : ''}
-      <p>Please log in to the system to upload your payment proof.</p>
+      <p>${deadlineHours ? 'Please log in to the system to upload your payment proof.' : 'Please log in to track delivery and settlement updates.'}</p>
     `,
   }),
 
   paymentProofUploaded: (orderNumber, stockistName) => ({
-    subject: `Payment Proof: #${orderNumber} — Verify Now`,
+    subject: `Payment Proof: #${orderNumber} - Verify Now`,
     html: `<p><strong>${stockistName}</strong> has uploaded payment proof for order <strong>#${orderNumber}</strong>. Please log in to verify.</p>`,
   }),
 
@@ -87,7 +94,7 @@ const EMAIL = {
   }),
 
   orderCancelledDeadline: (orderNumber) => ({
-    subject: `Order #${orderNumber} Cancelled — Deadline Passed`,
+    subject: `Order #${orderNumber} Cancelled - Deadline Passed`,
     html: `<p>Order <strong>#${orderNumber}</strong> has been automatically cancelled because payment was not uploaded within the deadline. Please place a new order if you still wish to proceed.</p>`,
   }),
 
@@ -122,7 +129,7 @@ const EMAIL = {
   }),
 
   dtaApproved: (applicantName, email, tempPassword) => ({
-    subject: 'Welcome to Nogatu — Account Ready',
+    subject: 'Welcome to Nogatu - Account Ready',
     html: `
       <p>Dear <strong>${applicantName}</strong>,</p>
       <p>Your Stockist application has been approved! Your account is now active.</p>

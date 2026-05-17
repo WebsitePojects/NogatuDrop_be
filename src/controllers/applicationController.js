@@ -4,7 +4,6 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const bcrypt = require('bcryptjs');
 const { sendEmail, EMAIL } = require('../services/emailService');
-const { insertNotification } = require('../utils/notificationWriter');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -29,26 +28,6 @@ const normalizeApplication = (row = {}) => ({
   id_back_url: row.id_back_url || row.business_permit_url || null,
   notes: row.notes || row.message || row.rejection_reason || null,
 });
-
-async function getActiveSuperAdmins() {
-  try {
-    const [rows] = await pool.execute(
-      `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
-       WHERE r.slug = 'super_admin' AND u.is_deleted = 0 AND u.status = 'active'`
-    );
-    return rows;
-  } catch (err) {
-    if (!isMissingColumn(err, 'is_deleted')) {
-      throw err;
-    }
-
-    const [rows] = await pool.execute(
-      `SELECT u.id, u.email, u.name FROM users u JOIN roles r ON r.id = u.role_id
-       WHERE r.slug = 'super_admin' AND u.status = 'active'`
-    );
-    return rows;
-  }
-}
 
 // GET /api/v1/applications
 const getApplications = asyncHandler(async (req, res) => {
@@ -126,71 +105,6 @@ const getApplication = asyncHandler(async (req, res) => {
 
   if (rows.length === 0) throw ApiError.notFound('Application not found');
   res.json({ success: true, data: normalizeApplication(rows[0]) });
-});
-
-// POST /api/v1/applications/dta — public, no auth
-const submitDTA = asyncHandler(async (req, res) => {
-  const fullName = req.body.full_name || req.body.applicant_name;
-  const businessName = req.body.business_name || null;
-  const email = req.body.email;
-  const phone = req.body.phone;
-  const address = req.body.address;
-  const stockistLevel = req.body.stockist_level || req.body.requested_level;
-  const notes = req.body.notes || req.body.message || null;
-
-  if (!fullName || !email || !phone || !address || !stockistLevel) {
-    throw ApiError.badRequest('full_name, email, phone, address, and stockist_level are required');
-  }
-  if (!['provincial_stockist', 'city_stockist'].includes(stockistLevel)) {
-    throw ApiError.badRequest('stockist_level must be provincial_stockist or city_stockist');
-  }
-
-  const [existing] = await pool.execute(
-    `SELECT id FROM dta_applications WHERE email = ? AND status IN ('pending', 'approved') LIMIT 1`,
-    [email]
-  );
-  if (existing.length > 0) throw ApiError.conflict('An application with this email already exists');
-
-  const idFrontUrl = req.files?.id_front?.[0]?.path || req.files?.id_document?.[0]?.path || null;
-  const idBackUrl = req.files?.id_back?.[0]?.path || req.files?.business_permit?.[0]?.path || null;
-
-  let result;
-  try {
-    [result] = await pool.execute(
-      `INSERT INTO dta_applications (full_name, business_name, email, phone, address, stockist_level, id_front_url, id_back_url, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [fullName, businessName, email, phone, address, stockistLevel, idFrontUrl, idBackUrl, notes]
-    );
-  } catch (err) {
-    if (!isApplicationSchemaMismatch(err)) {
-      throw err;
-    }
-
-    [result] = await pool.execute(
-      `INSERT INTO dta_applications (applicant_name, business_name, email, phone, address, requested_level, id_document_url, business_permit_url, message)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [fullName, businessName, email, phone, address, stockistLevel, idFrontUrl, idBackUrl, notes]
-    );
-  }
-
-  // Notify all super admins
-  const admins = await getActiveSuperAdmins();
-
-  for (const admin of admins) {
-    const tmpl = EMAIL.dtaReceived(fullName, businessName || email);
-    await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
-
-    await insertNotification(pool, {
-      userId: admin.id,
-      type: 'dta_received',
-      title: `New Stockist Application: ${fullName}`,
-      message: `${fullName} applied for ${stockistLevel.replace('_', ' ')}.`,
-      entityType: 'application',
-      entityId: result.insertId,
-    });
-  }
-
-  res.status(201).json({ success: true, message: 'Application submitted successfully. We will contact you soon.' });
 });
 
 // PATCH /api/v1/applications/:id/approve
@@ -302,4 +216,4 @@ const rejectApplication = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Application rejected' });
 });
 
-module.exports = { getApplications, getApplication, submitDTA, approveApplication, rejectApplication };
+module.exports = { getApplications, getApplication, approveApplication, rejectApplication };

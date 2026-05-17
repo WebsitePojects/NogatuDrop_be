@@ -3,12 +3,14 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { getCart, addToCart, updateCartItem, removeCartItem, clearCart } = require('../controllers/cartController');
 
 const router = Router();
+const { requirePermission } = roleGuard;
 
 router.use(auth);
-router.use(roleGuard('admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff'));
+router.use(requirePermission(PERMISSIONS.CART_USE));
 
 router.get('/', getCart);
 

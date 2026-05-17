@@ -2,12 +2,20 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { appendPartnerScope } = require('../rbac/resourceScopes');
+const { insertStockMovement } = require('../utils/stockMovementLogger');
 
 // GET /api/v1/inventory
 const getInventory = asyncHandler(async (req, res) => {
   const { page, limit, search, warehouse_id, status: stockStatus } = req.query;
   const params = [];
   let where = 'WHERE i.is_active = 1 AND p.is_deleted = 0 AND w.is_deleted = 0';
+  where = appendPartnerScope({
+    where,
+    params,
+    user: req.user,
+    expression: 'COALESCE(i.partner_id, w.partner_id)',
+  });
 
   if (search) {
     where += ' AND (p.name LIKE ? OR p.sku LIKE ? OR w.name LIKE ?)';
@@ -57,8 +65,9 @@ const getInventoryItem = asyncHandler(async (req, res) => {
      JOIN products p ON p.id = i.product_id
      JOIN warehouses w ON w.id = i.warehouse_id
      WHERE i.id = ? AND i.is_active = 1
+       AND (? = 'super_admin' OR COALESCE(i.partner_id, w.partner_id) = ?)
      LIMIT 1`,
-    [req.params.id]
+    [req.params.id, req.user.role_slug, req.user.partner_id || null]
   );
   if (rows.length === 0) throw ApiError.notFound('Inventory item not found');
   res.json({ success: true, data: rows[0] });
@@ -75,11 +84,38 @@ const addInventory = asyncHandler(async (req, res) => {
   const [warehouse] = await pool.execute('SELECT id FROM warehouses WHERE id = ? AND is_deleted = 0', [warehouse_id]);
   if (warehouse.length === 0) throw ApiError.notFound('Warehouse not found');
 
-  const [result] = await pool.execute(
-    `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, reorder_threshold, batch_number, expiry_date)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [product_id, warehouse_id, partner_id || null, current_stock || 0, reorder_threshold || 500, batch_number, expiry_date]
-  );
+  const conn = await pool.getConnection();
+  let inventoryId;
+  try {
+    await conn.beginTransaction();
+
+    const [result] = await conn.execute(
+      `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, reorder_threshold, batch_number, expiry_date, last_movement_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [product_id, warehouse_id, partner_id || null, current_stock || 0, reorder_threshold || 500, batch_number, expiry_date]
+    );
+    inventoryId = result.insertId;
+
+    if (Number(current_stock || 0) > 0) {
+      await insertStockMovement(conn, {
+        productId: product_id,
+        warehouseId: warehouse_id,
+        movementType: 'initial_stock',
+        quantity: Number(current_stock || 0),
+        referenceType: 'inventory',
+        referenceId: inventoryId,
+        notes: 'Initial inventory stock entry',
+        createdBy: req.user.id,
+      });
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 
   const [created] = await pool.execute(
     `SELECT i.*, p.name AS product_name, w.name AS warehouse_name
@@ -87,7 +123,7 @@ const addInventory = asyncHandler(async (req, res) => {
      JOIN products p ON p.id = i.product_id
      JOIN warehouses w ON w.id = i.warehouse_id
      WHERE i.id = ?`,
-    [result.insertId]
+    [inventoryId]
   );
 
   res.status(201).json({ success: true, message: 'Inventory added', data: created[0] });
@@ -98,8 +134,12 @@ const updateInventory = asyncHandler(async (req, res) => {
   const inventoryId = req.params.id;
   const { current_stock, reorder_threshold, batch_number, expiry_date, is_active } = req.body;
 
-  const [existing] = await pool.execute('SELECT id FROM inventories WHERE id = ? AND is_active = 1', [inventoryId]);
+  const [existing] = await pool.execute(
+    'SELECT id, product_id, warehouse_id, current_stock FROM inventories WHERE id = ? AND is_active = 1',
+    [inventoryId]
+  );
   if (existing.length === 0) throw ApiError.notFound('Inventory item not found');
+  const beforeStock = Number(existing[0].current_stock || 0);
 
   // Never update the `status` generated column
   const fields = [];
@@ -114,7 +154,37 @@ const updateInventory = asyncHandler(async (req, res) => {
   if (fields.length === 0) throw ApiError.badRequest('No fields to update');
 
   values.push(inventoryId);
-  await pool.execute(`UPDATE inventories SET ${fields.join(', ')} WHERE id = ?`, values);
+  if (current_stock !== undefined && Number(current_stock) !== beforeStock) {
+    fields.push('last_movement_at = NOW()');
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.execute(`UPDATE inventories SET ${fields.join(', ')} WHERE id = ?`, values);
+
+    if (current_stock !== undefined && Number(current_stock) !== beforeStock) {
+      const delta = Number(current_stock) - beforeStock;
+      await insertStockMovement(conn, {
+        productId: existing[0].product_id,
+        warehouseId: existing[0].warehouse_id,
+        movementType: delta >= 0 ? 'manual_increase' : 'manual_decrease',
+        quantity: Math.abs(delta),
+        referenceType: 'inventory',
+        referenceId: inventoryId,
+        notes: `Manual inventory stock update from ${beforeStock} to ${Number(current_stock)}`,
+        createdBy: req.user.id,
+      });
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 
   const [updated] = await pool.execute(
     `SELECT i.*, p.name AS product_name, w.name AS warehouse_name

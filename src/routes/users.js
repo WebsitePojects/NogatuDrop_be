@@ -3,18 +3,20 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { getUsers, getUser, createUser, updateUser, deleteUser } = require('../controllers/userController');
 
 const router = Router();
+const { requirePermission } = roleGuard;
 
 router.use(auth);
 
-router.get('/', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), getUsers);
-router.get('/:id', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), param('id').isInt(), validate, getUser);
+router.get('/', requirePermission(PERMISSIONS.USERS_VIEW), getUsers);
+router.get('/:id', requirePermission(PERMISSIONS.USERS_VIEW), param('id').isInt(), validate, getUser);
 
 router.post(
   '/',
-  roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'),
+  requirePermission(PERMISSIONS.USERS_MANAGE),
   [
     body('name')
       .optional({ nullable: true })
@@ -42,8 +44,8 @@ router.post(
       .withMessage('Password is required')
       .isLength({ min: 6 })
       .withMessage('Password must be at least 6 characters'),
-    body('role_id').optional().isInt(),
-    body('role_slug').optional().isIn(['super_admin', 'admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff']),
+    body('role_id').not().exists().withMessage('Use role_slug instead of role_id'),
+    body('role_slug').optional().isIn(['super_admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff']),
     body('partner_id').optional().isInt(),
     body('level').optional().isIn(['main', 'regional', 'city']),
     body('location').optional().trim(),
@@ -54,7 +56,7 @@ router.post(
 
 router.put(
   '/:id',
-  roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'),
+  requirePermission(PERMISSIONS.USERS_MANAGE),
   param('id').isInt(),
   [
     body('name').optional().trim().notEmpty(),
@@ -66,6 +68,6 @@ router.put(
   updateUser
 );
 
-router.delete('/:id', roleGuard('super_admin', 'admin', 'provincial_stockist', 'city_stockist'), param('id').isInt(), validate, deleteUser);
+router.delete('/:id', requirePermission(PERMISSIONS.USERS_MANAGE), param('id').isInt(), validate, deleteUser);
 
 module.exports = router;

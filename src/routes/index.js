@@ -19,9 +19,11 @@ const courierRoutes = require('./couriers');
 const deliveryTokenRoutes = require('./deliveryTokens');
 const grnRoutes = require('./grn');
 const mobileStockistRoutes = require('./mobileStockists');
-const applicationRoutes = require('./applications');
 const stockMovementRoutes = require('./stockMovements');
 const stockAdjustmentRoutes = require('./stockAdjustments');
+const cycleCountRoutes = require('./cycleCounts');
+const settlementRoutes = require('./settlements');
+const exportRoutes = require('./exports');
 const allianceRoutes = require('./alliance');
 
 const router = Router();
@@ -45,9 +47,11 @@ router.use('/couriers', courierRoutes);
 router.use('/delivery-tokens', deliveryTokenRoutes);
 router.use('/grn', grnRoutes);
 router.use('/mobile-stockists', mobileStockistRoutes);
-router.use('/applications', applicationRoutes);
 router.use('/stock-movements', stockMovementRoutes);
 router.use('/stock-adjustments', stockAdjustmentRoutes);
+router.use('/cycle-counts', cycleCountRoutes);
+router.use('/settlements', settlementRoutes);
+router.use('/exports', exportRoutes);
 router.use('/alliance', allianceRoutes);
 
 module.exports = router;

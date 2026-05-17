@@ -36,10 +36,39 @@ async function set(key, value, ttl) {
  */
 async function del(keys) {
   if (Array.isArray(keys)) {
-    if (keys.length > 0) await redis.del(...keys);
+    if (keys.length > 0) {
+      if (typeof redis.unlink === 'function') {
+        await redis.unlink(...keys);
+      } else {
+        await redis.del(...keys);
+      }
+    }
   } else {
-    await redis.del(keys);
+    if (typeof redis.unlink === 'function') {
+      await redis.unlink(keys);
+    } else {
+      await redis.del(keys);
+    }
   }
+}
+
+async function listKeysByPattern(pattern) {
+  if (typeof redis.scan !== 'function') {
+    return redis.keys(pattern);
+  }
+
+  const keys = [];
+  let cursor = '0';
+
+  do {
+    const [nextCursor, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = String(nextCursor);
+    if (Array.isArray(batch) && batch.length > 0) {
+      keys.push(...batch);
+    }
+  } while (cursor !== '0');
+
+  return keys;
 }
 
 /**
@@ -63,8 +92,10 @@ async function getOrSet(key, ttl, fetchFn) {
  * @param {string} pattern
  */
 async function delPattern(pattern) {
-  const keys = await redis.keys(pattern);
-  if (keys.length > 0) await redis.del(...keys);
+  const keys = await listKeysByPattern(pattern);
+  if (keys.length > 0) {
+    await del(keys);
+  }
 }
 
 module.exports = { get, set, del, getOrSet, delPattern };

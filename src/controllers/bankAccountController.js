@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { ROLES, canonicalRole } = require('../rbac/roles');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -22,6 +23,18 @@ async function executeSoftDeleteAware(db, primarySql, params = [], fallbackSql =
     }
     throw err;
   }
+}
+
+function scopedOrderClause(user, alias = 'o') {
+  if (canonicalRole(user?.role_slug) === ROLES.SUPER_ADMIN) {
+    return { clause: '', params: [] };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return { clause: ` AND ${alias}.partner_id = ?`, params: [user.partner_id] };
 }
 
 let bankAccountsHasIsDeletedCache = null;
@@ -132,11 +145,15 @@ const deleteBankAccount = asyncHandler(async (req, res) => {
 // GET /api/v1/bank-accounts/for-order/:orderId — get bank account for an order's source warehouse
 const getBankAccountForOrder = asyncHandler(async (req, res) => {
   let warehouseId = null;
+  const scope = scopedOrderClause(req.user);
 
   try {
     const [orders] = await pool.execute(
-      'SELECT source_warehouse_id FROM orders WHERE id = ? AND is_deleted = 0 LIMIT 1',
-      [req.params.orderId]
+      `SELECT o.source_warehouse_id
+       FROM orders o
+       WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
+       LIMIT 1`,
+      [req.params.orderId, ...scope.params]
     );
     if (orders.length === 0) throw ApiError.notFound('Order not found');
     warehouseId = orders[0].source_warehouse_id || null;
@@ -144,8 +161,11 @@ const getBankAccountForOrder = asyncHandler(async (req, res) => {
     // Backward compatibility for DBs not yet migrated with source_warehouse_id.
     if (err.code === 'ER_BAD_FIELD_ERROR') {
       const [orders] = await pool.execute(
-        'SELECT id FROM orders WHERE id = ? AND is_deleted = 0 LIMIT 1',
-        [req.params.orderId]
+        `SELECT o.id
+         FROM orders o
+         WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
+         LIMIT 1`,
+        [req.params.orderId, ...scope.params]
       );
       if (orders.length === 0) throw ApiError.notFound('Order not found');
       warehouseId = null;

@@ -3,18 +3,20 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
+const { PERMISSIONS } = require('../rbac/permissions');
 const { getWarehouses, getWarehouse, createWarehouse, updateWarehouse, deleteWarehouse } = require('../controllers/warehouseController');
 
 const router = Router();
+const { requirePermission } = roleGuard;
 
 router.use(auth);
 
-router.get('/', getWarehouses);
-router.get('/:id', param('id').isInt(), validate, getWarehouse);
+router.get('/', requirePermission(PERMISSIONS.INVENTORY_VIEW), getWarehouses);
+router.get('/:id', requirePermission(PERMISSIONS.INVENTORY_VIEW), param('id').isInt(), validate, getWarehouse);
 
 router.post(
   '/',
-  roleGuard('super_admin'),
+  requirePermission(PERMISSIONS.WAREHOUSES_MANAGE),
   [
     body('name').trim().notEmpty().withMessage('Warehouse name is required'),
     body('type').optional().isIn(['manufacturer', 'region', 'city']),
@@ -30,7 +32,7 @@ router.post(
 
 router.put(
   '/:id',
-  roleGuard('super_admin'),
+  requirePermission(PERMISSIONS.WAREHOUSES_MANAGE),
   param('id').isInt(),
   [
     body('name').optional().trim().notEmpty(),
@@ -43,6 +45,6 @@ router.put(
   updateWarehouse
 );
 
-router.delete('/:id', roleGuard('super_admin'), param('id').isInt(), validate, deleteWarehouse);
+router.delete('/:id', requirePermission(PERMISSIONS.WAREHOUSES_MANAGE), param('id').isInt(), validate, deleteWarehouse);
 
 module.exports = router;

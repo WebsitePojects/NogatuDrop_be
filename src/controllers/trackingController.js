@@ -1,6 +1,9 @@
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
+const { ROLES, canonicalRole } = require('../rbac/roles');
+const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
+const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -36,9 +39,96 @@ function normalizePublicStatus(orderStatus, trackingStatus) {
   return orderStatus || trackingStatus || 'pending';
 }
 
+function scopedOrderPredicate(user, orderAlias = 'o') {
+  const role = canonicalRole(user?.role_slug);
+
+  if (role === ROLES.SUPER_ADMIN) {
+    return { clause: '', params: [] };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return { clause: ` AND ${orderAlias}.partner_id = ?`, params: [user.partner_id] };
+}
+
+async function fetchWarehouseRowsByIds(ids) {
+  if (!ids.length) {
+    return [];
+  }
+
+  const placeholders = ids.map(() => '?').join(', ');
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id, partner_id, name, location, lat, lng
+       FROM warehouses
+       WHERE id IN (${placeholders}) AND is_deleted = 0`,
+      ids
+    );
+    return rows;
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_deleted')) {
+      throw err;
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT id, partner_id, name, location, lat, lng
+       FROM warehouses
+       WHERE id IN (${placeholders})`,
+      ids
+    );
+    return rows;
+  }
+}
+
+async function fetchPrimaryWarehouseRowsByPartnerIds(partnerIds) {
+  if (!partnerIds.length) {
+    return [];
+  }
+
+  const placeholders = partnerIds.map(() => '?').join(', ');
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT w.partner_id, w.id, w.name, w.location, w.lat, w.lng
+       FROM warehouses w
+       JOIN (
+         SELECT partner_id, MIN(id) AS first_id
+         FROM warehouses
+         WHERE partner_id IN (${placeholders}) AND is_deleted = 0
+         GROUP BY partner_id
+       ) picked
+         ON picked.first_id = w.id`,
+      partnerIds
+    );
+    return rows;
+  } catch (err) {
+    if (!isMissingColumn(err, 'is_deleted')) {
+      throw err;
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT w.partner_id, w.id, w.name, w.location, w.lat, w.lng
+       FROM warehouses w
+       JOIN (
+         SELECT partner_id, MIN(id) AS first_id
+         FROM warehouses
+         WHERE partner_id IN (${placeholders})
+         GROUP BY partner_id
+       ) picked
+         ON picked.first_id = w.id`,
+      partnerIds
+    );
+    return rows;
+  }
+}
+
 // GET /api/v1/tracking/:orderId
 const getTracking = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
+  const scope = scopedOrderPredicate(req.user);
 
   const [rows] = await pool.execute(
     `SELECT dt.id, dt.order_id, dt.transfer_id, dt.rider_user_id, dt.status,
@@ -49,8 +139,8 @@ const getTracking = asyncHandler(async (req, res) => {
      FROM delivery_tracking dt
      JOIN orders o ON o.id = dt.order_id
      LEFT JOIN couriers c ON c.id = dt.courier_id
-     WHERE dt.order_id = ? LIMIT 1`,
-    [orderId]
+     WHERE dt.order_id = ?${scope.clause} LIMIT 1`,
+    [orderId, ...scope.params]
   );
 
   if (rows.length === 0) throw ApiError.notFound('Tracking info not found');
@@ -106,6 +196,7 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 // GET /api/v1/tracking/:orderId/pings
 const getOrderPings = asyncHandler(async (req, res) => {
   const { orderId } = req.params;
+  const scope = scopedOrderPredicate(req.user);
 
   const [rows] = await pool.execute(
     `SELECT gp.id,
@@ -117,27 +208,37 @@ const getOrderPings = asyncHandler(async (req, res) => {
      FROM gps_pings gp
      JOIN delivery_tracking dt ON dt.id = gp.tracking_id
      JOIN orders o ON o.id = dt.order_id
-     WHERE dt.order_id = ? AND o.is_deleted = 0
+     WHERE dt.order_id = ? AND o.is_deleted = 0${scope.clause}
      ORDER BY gp.pinged_at ASC
      LIMIT 200`,
-    [orderId]
+    [orderId, ...scope.params]
   );
 
   res.json({ success: true, data: rows });
 });
 
 // GET /api/v1/tracking/active
-const getActiveTracking = asyncHandler(async (_req, res) => {
+const getActiveTracking = asyncHandler(async (req, res) => {
+  const scope = buildActiveTrackingScope({ user: req.user, orderAlias: 'o' });
+
   const [rows] = await pool.execute(
     `SELECT dt.id AS tracking_id,
             dt.order_id,
+            dt.transfer_id,
             o.order_number,
-            dt.status,
+            o.partner_id,
+            o.status AS order_status,
+            o.customer_name,
+            o.customer_address,
+            o.source_warehouse_id,
+            dt.status AS tracking_status,
+            dt.rider_name,
+            dt.est_delivery_at,
             dt.courier_tracking_number,
             c.name AS courier_name,
             dt.updated_at,
-            lp.lat AS latitude,
-            lp.lng AS longitude,
+            lp.lat AS latest_latitude,
+            lp.lng AS latest_longitude,
             lp.pinged_at AS last_pinged_at
      FROM delivery_tracking dt
      JOIN orders o ON o.id = dt.order_id
@@ -155,11 +256,70 @@ const getActiveTracking = asyncHandler(async (_req, res) => {
      ) lp ON lp.tracking_id = dt.id
      WHERE o.is_deleted = 0
        AND (o.status = 'delivering' OR dt.status IN ('in_progress', 'out_for_delivery'))
+       ${scope.clause}
      ORDER BY dt.updated_at DESC
-     LIMIT 100`
+     LIMIT 100`,
+    scope.params
   );
 
-  res.json({ success: true, data: rows });
+  const sourceWarehouseIds = Array.from(
+    new Set(rows.map((row) => Number(row.source_warehouse_id)).filter((value) => Number.isFinite(value) && value > 0))
+  );
+  const partnerIds = Array.from(
+    new Set(rows.map((row) => Number(row.partner_id)).filter((value) => Number.isFinite(value) && value > 0))
+  );
+
+  const [sourceWarehouses, targetWarehouses] = await Promise.all([
+    fetchWarehouseRowsByIds(sourceWarehouseIds),
+    fetchPrimaryWarehouseRowsByPartnerIds(partnerIds),
+  ]);
+
+  const sourceWarehouseById = new Map(sourceWarehouses.map((row) => [Number(row.id), row]));
+  const targetWarehouseByPartnerId = new Map(targetWarehouses.map((row) => [Number(row.partner_id), row]));
+
+  const data = rows.map((row) => {
+    const sourceWarehouse = sourceWarehouseById.get(Number(row.source_warehouse_id)) || null;
+    const targetWarehouse = targetWarehouseByPartnerId.get(Number(row.partner_id)) || null;
+    const mapSnapshot = buildTrackingMapSnapshot({
+      ...row,
+      source_warehouse_id: sourceWarehouse?.id || row.source_warehouse_id || null,
+      source_warehouse_name: sourceWarehouse?.name || null,
+      source_warehouse_location: sourceWarehouse?.location || null,
+      source_warehouse_lat: sourceWarehouse?.lat || null,
+      source_warehouse_lng: sourceWarehouse?.lng || null,
+      target_warehouse_id: targetWarehouse?.id || null,
+      target_warehouse_name: targetWarehouse?.name || null,
+      target_warehouse_location: targetWarehouse?.location || null,
+      target_warehouse_lat: targetWarehouse?.lat || null,
+      target_warehouse_lng: targetWarehouse?.lng || null,
+    });
+
+    return {
+      tracking_id: row.tracking_id,
+      order_id: row.order_id,
+      transfer_id: row.transfer_id,
+      order_number: row.order_number,
+      order_status: row.order_status,
+      tracking_status: row.tracking_status,
+      courier_name: row.courier_name || null,
+      courier_tracking_number: row.courier_tracking_number || null,
+      rider_name: row.rider_name || null,
+      est_delivery_at: row.est_delivery_at || null,
+      updated_at: row.updated_at,
+      latest_ping: mapSnapshot.current,
+      source_warehouse: mapSnapshot.source,
+      target_warehouse: mapSnapshot.route_kind === 'warehouse_transfer' ? mapSnapshot.destination : null,
+      customer: mapSnapshot.route_kind === 'customer_delivery'
+        ? {
+            name: row.customer_name || null,
+            address: row.customer_address || null,
+          }
+        : null,
+      map_snapshot: mapSnapshot,
+    };
+  });
+
+  res.json({ success: true, data });
 });
 
 // POST /api/v1/tracking/ping/:token
@@ -290,13 +450,18 @@ const postPingByToken = asyncHandler(async (req, res) => {
 const postPing = asyncHandler(async (req, res) => {
   const { tracking_id, lat, lng, speed_kmh, accuracy_meters } = req.body;
   const trackingId = tracking_id || req.params.trackingId;
+  const scope = scopedOrderPredicate(req.user);
 
   if (!trackingId) {
     throw ApiError.badRequest('Tracking ID is required');
   }
 
   const [tracking] = await pool.execute(
-    'SELECT id FROM delivery_tracking WHERE id = ?', [trackingId]
+    `SELECT dt.id
+     FROM delivery_tracking dt
+     JOIN orders o ON o.id = dt.order_id
+     WHERE dt.id = ? AND o.is_deleted = 0${scope.clause}`,
+    [trackingId, ...scope.params]
   );
   if (tracking.length === 0) throw ApiError.notFound('Tracking record not found');
 
@@ -312,13 +477,18 @@ const postPing = asyncHandler(async (req, res) => {
 const updateTrackingStatus = asyncHandler(async (req, res) => {
   const { status, rider_name, rider_user_id, est_delivery_at } = req.body;
   const trackingId = req.params.trackingId;
+  const scope = scopedOrderPredicate(req.user);
 
   if (status === 'delivered') {
     throw ApiError.badRequest('Use the courier proof-of-delivery link to mark an order delivered');
   }
 
   const [existing] = await pool.execute(
-    'SELECT id, order_id FROM delivery_tracking WHERE id = ?', [trackingId]
+    `SELECT dt.id, dt.order_id
+     FROM delivery_tracking dt
+     JOIN orders o ON o.id = dt.order_id
+     WHERE dt.id = ? AND o.is_deleted = 0${scope.clause}`,
+    [trackingId, ...scope.params]
   );
   if (existing.length === 0) throw ApiError.notFound('Tracking record not found');
 
@@ -349,12 +519,29 @@ const updateTrackingStatus = asyncHandler(async (req, res) => {
 // POST /api/v1/tracking (create tracking record)
 const createTracking = asyncHandler(async (req, res) => {
   const { order_id, transfer_id, rider_user_id, rider_name, est_delivery_at } = req.body;
+  const scope = scopedOrderPredicate(req.user);
+  const isNational = canonicalRole(req.user?.role_slug) === ROLES.SUPER_ADMIN;
 
   // Verify order exists
   const [order] = await pool.execute(
-    'SELECT id FROM orders WHERE id = ? AND is_deleted = 0', [order_id]
+    `SELECT o.id FROM orders o WHERE o.id = ? AND o.is_deleted = 0${scope.clause}`,
+    [order_id, ...scope.params]
   );
   if (order.length === 0) throw ApiError.notFound('Order not found');
+
+  if (transfer_id) {
+    if (!isNational) {
+      throw ApiError.forbidden('Only national operations can attach delivery tracking to stock transfers');
+    }
+
+    const [transfer] = await pool.execute(
+      'SELECT id FROM stock_transfers WHERE id = ? AND is_deleted = 0 LIMIT 1',
+      [transfer_id]
+    );
+    if (transfer.length === 0) {
+      throw ApiError.notFound('Stock transfer not found');
+    }
+  }
 
   // Check if tracking already exists
   const [existing] = await pool.execute(

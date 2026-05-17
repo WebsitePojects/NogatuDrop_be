@@ -83,7 +83,4 @@ const podUpload = createUpload('pod', true, [
   { width: 1200, height: 1200, crop: 'limit', quality: 'auto' },
 ]);
 
-// DTA application attachments
-const dtaUpload = createUpload('dta', false);
-
-module.exports = { productUpload, paymentProofUpload, podUpload, dtaUpload };
+module.exports = { productUpload, paymentProofUpload, podUpload };

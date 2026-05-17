@@ -8,6 +8,7 @@ const cache = require('../services/cacheService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
+const { createPendingSettlementForOrder } = require('./settlementController');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -68,6 +69,59 @@ async function getOrderItemsWithOptionalSourceColumn(db, orderId) {
     }
     throw err;
   }
+}
+
+async function reserveInventoryOrThrow(conn, { productId, warehouseId, quantity, productName }) {
+  let result;
+  try {
+    [result] = await conn.execute(
+      `UPDATE inventories
+       SET reserved_stock = reserved_stock + ?,
+           last_movement_at = NOW()
+       WHERE product_id = ?
+         AND warehouse_id = ?
+         AND is_deleted = 0
+         AND current_stock >= reserved_stock + ?`,
+      [quantity, productId, warehouseId, quantity]
+    );
+  } catch (err) {
+    if (!isMissingSoftDeleteColumn(err)) {
+      throw err;
+    }
+
+    [result] = await conn.execute(
+      `UPDATE inventories
+       SET reserved_stock = reserved_stock + ?,
+           last_movement_at = NOW()
+       WHERE product_id = ?
+         AND warehouse_id = ?
+         AND current_stock >= reserved_stock + ?`,
+      [quantity, productId, warehouseId, quantity]
+    );
+  }
+
+  if (result.affectedRows > 0) {
+    return;
+  }
+
+  const [inventory] = await executeSoftDeleteAware(
+    conn,
+    `SELECT current_stock, reserved_stock
+     FROM inventories
+     WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0
+     LIMIT 1`,
+    [productId, warehouseId],
+    `SELECT current_stock, reserved_stock
+     FROM inventories
+     WHERE product_id = ? AND warehouse_id = ?
+     LIMIT 1`
+  );
+
+  const available = inventory.length > 0
+    ? Number(inventory[0].current_stock || 0) - Number(inventory[0].reserved_stock || 0)
+    : 0;
+
+  throw ApiError.badRequest(`Insufficient stock for ${productName || 'product'} (available: ${available})`);
 }
 
 async function getWarehouseIdByPartner(db, partnerId) {
@@ -200,7 +254,7 @@ const getOrders = asyncHandler(async (req, res) => {
   const baseQuery = `
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
            o.placed_by, u.name AS placed_by_name, o.status, o.payment_status,
-           o.total_amount, o.payment_deadline, o.payment_proof_url,
+           o.total_amount, o.payment_deadline, o.payment_proof_url, o.cod_amount,
            o.placed_by_type, o.customer_name,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
@@ -275,7 +329,7 @@ const getOrder = asyncHandler(async (req, res) => {
 const createOrder = asyncHandler(async (req, res) => {
   const userId = req.user.id;
   const partnerId = req.user.partner_id;
-  const { notes } = req.body;
+  const { notes, payment_method } = req.body;
 
   if (!partnerId) throw ApiError.badRequest('Only Stockist users can place orders');
 
@@ -325,6 +379,16 @@ const createOrder = asyncHandler(async (req, res) => {
       totalAmount += item.quantity * item.lockedUnitPrice;
     }
 
+    const normalizedRole = req.user.role_slug === 'admin' ? 'provincial_stockist' : req.user.role_slug;
+    const wantsCod = payment_method === 'cod';
+    const codEligible = normalizedRole === 'mobile_stockist' && totalAmount <= 5000;
+
+    if (wantsCod && !codEligible) {
+      throw ApiError.badRequest('COD is available only for Mobile Stockist orders up to P5000');
+    }
+
+    const codAmount = wantsCod ? totalAmount : 0;
+
     // Check available stock if source warehouse known
     if (sourceWarehouseId) {
       for (const item of cartItems) {
@@ -348,13 +412,31 @@ const createOrder = asyncHandler(async (req, res) => {
     let orderResult;
     try {
       [orderResult] = await conn.execute(
-        `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, total_amount, notes)
-         VALUES (?, ?, ?, 'user', ?, ?, ?)`,
-        [orderNumber, partnerId, userId, sourceWarehouseId, totalAmount, notes || null]
+        `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, cod_amount, total_amount, notes)
+         VALUES (?, ?, ?, 'user', ?, ?, ?, ?)`,
+        [orderNumber, partnerId, userId, sourceWarehouseId, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
       // Backward compatibility for DBs missing v2 order columns.
-      if (isMissingColumn(err, 'source_warehouse_id') || isMissingColumn(err, 'placed_by_type')) {
+      if (isMissingColumn(err, 'cod_amount')) {
+        try {
+          [orderResult] = await conn.execute(
+            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id, total_amount, notes)
+             VALUES (?, ?, ?, 'user', ?, ?, ?)`,
+            [orderNumber, partnerId, userId, sourceWarehouseId, totalAmount, notes || null]
+          );
+        } catch (innerErr) {
+          if (isMissingColumn(innerErr, 'source_warehouse_id') || isMissingColumn(innerErr, 'placed_by_type')) {
+            [orderResult] = await conn.execute(
+              `INSERT INTO orders (order_number, partner_id, placed_by, total_amount, notes)
+               VALUES (?, ?, ?, ?, ?)`,
+              [orderNumber, partnerId, userId, totalAmount, notes || null]
+            );
+          } else {
+            throw innerErr;
+          }
+        }
+      } else if (isMissingColumn(err, 'source_warehouse_id') || isMissingColumn(err, 'placed_by_type')) {
         [orderResult] = await conn.execute(
           `INSERT INTO orders (order_number, partner_id, placed_by, total_amount, notes)
            VALUES (?, ?, ?, ?, ?)`,
@@ -390,11 +472,12 @@ const createOrder = asyncHandler(async (req, res) => {
     // Reserve stock
     if (sourceWarehouseId) {
       for (const item of cartItems) {
-        await conn.execute(
-          `UPDATE inventories SET reserved_stock = reserved_stock + ?
-           WHERE product_id = ? AND warehouse_id = ?`,
-          [item.quantity, item.product_id, sourceWarehouseId]
-        );
+        await reserveInventoryOrThrow(conn, {
+          productId: item.product_id,
+          warehouseId: sourceWarehouseId,
+          quantity: item.quantity,
+          productName: item.product_name,
+        });
         await insertStockMovement(conn, {
           productId: item.product_id,
           warehouseId: sourceWarehouseId,
@@ -438,7 +521,7 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
 const createPublicOrder = asyncHandler(async (req, res) => {
-  const { customer_name, customer_phone, customer_email, customer_address, items, notes } = req.body;
+  const { customer_name, customer_phone, customer_email, customer_address, items, notes, payment_method } = req.body;
 
   if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
@@ -520,6 +603,13 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       totalAmount += quantity * price;
     }
 
+    const wantsCod = payment_method === 'cod';
+    if (wantsCod && totalAmount > 5000) {
+      throw ApiError.badRequest('COD is available only for orders up to P5000');
+    }
+
+    const codAmount = wantsCod ? totalAmount : 0;
+
     if (sourceWarehouseId) {
       for (const item of resolvedItems) {
         const [inv] = await executeSoftDeleteAware(
@@ -543,15 +633,47 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     try {
       [orderResult] = await conn.execute(
         `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
-                             customer_name, customer_phone, customer_email, customer_address,
+                             customer_name, customer_phone, customer_email, customer_address, cod_amount,
                              total_amount, notes)
-         VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
         [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
-         customer_email || null, customer_address, totalAmount, notes || null]
+         customer_email || null, customer_address, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
       // Some DBs are partially migrated and only miss source_warehouse_id.
-      if (isMissingColumn(err, 'source_warehouse_id')) {
+      if (isMissingColumn(err, 'cod_amount')) {
+        try {
+          [orderResult] = await conn.execute(
+            `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+                                 customer_name, customer_phone, customer_email, customer_address,
+                                 total_amount, notes)
+             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+             customer_email || null, customer_address, totalAmount, notes || null]
+          );
+        } catch (innerErr) {
+          if (isMissingColumn(innerErr, 'source_warehouse_id')) {
+            try {
+              [orderResult] = await conn.execute(
+                `INSERT INTO orders (order_number, partner_id, placed_by_type,
+                                     customer_name, customer_phone, customer_email, customer_address,
+                                     total_amount, notes)
+                 VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+                [orderNumber, partnerId, customer_name, customer_phone || null,
+                 customer_email || null, customer_address, totalAmount, notes || null]
+              );
+            } catch (legacyErr) {
+              if (isMissingColumn(legacyErr, 'placed_by_type') || isMissingColumn(legacyErr, 'customer_name')) {
+                throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
+              }
+              throw legacyErr;
+            }
+          } else if (isMissingColumn(innerErr, 'placed_by_type') || isMissingColumn(innerErr, 'customer_name')) {
+            throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
+          }
+          throw innerErr;
+        }
+      } else if (isMissingColumn(err, 'source_warehouse_id')) {
         try {
           [orderResult] = await conn.execute(
             `INSERT INTO orders (order_number, partner_id, placed_by_type,
@@ -597,13 +719,12 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 
     if (sourceWarehouseId) {
       for (const item of resolvedItems) {
-        await conn.execute(
-          `UPDATE inventories
-           SET reserved_stock = reserved_stock + ?,
-               last_movement_at = NOW()
-           WHERE product_id = ? AND warehouse_id = ?`,
-          [item.quantity, item.product_id, sourceWarehouseId]
-        );
+        await reserveInventoryOrThrow(conn, {
+          productId: item.product_id,
+          warehouseId: sourceWarehouseId,
+          quantity: item.quantity,
+          productName: item.name,
+        });
         await insertStockMovement(conn, {
           productId: item.product_id,
           warehouseId: sourceWarehouseId,
@@ -648,6 +769,16 @@ const approveOrder = asyncHandler(async (req, res) => {
     sourceWarehouseId = await resolveSourceWarehouseIdForPartner(pool, orders[0].partner_id);
   }
 
+  let codAmount = 0;
+  try {
+    const [codRows] = await pool.execute('SELECT cod_amount FROM orders WHERE id = ? LIMIT 1', [orderId]);
+    codAmount = Number(codRows[0]?.cod_amount || 0);
+  } catch (err) {
+    if (!isMissingColumn(err, 'cod_amount')) {
+      throw err;
+    }
+  }
+
   const deadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
 
   // Find bank account for the source warehouse
@@ -672,24 +803,30 @@ const approveOrder = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     await conn.execute(
       `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(), payment_deadline = ? WHERE id = ?`,
-      [req.user.id, deadline, orderId]
+      [req.user.id, codAmount > 0 ? null : deadline, orderId]
     );
 
     const partnerUsers = await notifyPartnerUsers(
       conn, orders[0].partner_id, 'order_approved',
       `Order Approved: #${orders[0].order_number}`,
-      `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
+      codAmount > 0
+        ? `Your order #${orders[0].order_number} has been approved for cash on delivery.`
+        : `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
       orderId
     );
     await conn.commit();
 
     for (const pu of partnerUsers) {
-      const tmpl = EMAIL.orderApproved(orders[0].order_number, env.PAYMENT_DEADLINE_HOURS, bankDetails);
+      const tmpl = EMAIL.orderApproved(
+        orders[0].order_number,
+        codAmount > 0 ? 0 : env.PAYMENT_DEADLINE_HOURS,
+        codAmount > 0 ? 'Cash on delivery approved for this order.' : bankDetails
+      );
       await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
     }
 
     await cache.delPattern('dashboard:*');
-    res.json({ success: true, message: 'Order approved', data: { payment_deadline: deadline } });
+    res.json({ success: true, message: 'Order approved', data: { payment_deadline: codAmount > 0 ? null : deadline } });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -807,6 +944,16 @@ const cancelOrder = asyncHandler(async (req, res) => {
           `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
           [item.quantity, item.product_id, wid]
         );
+        await insertStockMovement(conn, {
+          productId: item.product_id,
+          warehouseId: wid,
+          movementType: 'release',
+          quantity: item.quantity,
+          referenceType: 'order',
+          referenceId: orderId,
+          notes: 'Reserved stock released on order cancellation',
+          createdBy: req.user.id,
+        });
       }
     }
 
@@ -878,7 +1025,7 @@ const verifyPayment = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status, payment_proof_url FROM orders WHERE id = ? AND is_deleted = 0',
+    'SELECT id, order_number, partner_id, status, payment_proof_url, total_amount FROM orders WHERE id = ? AND is_deleted = 0',
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
@@ -892,6 +1039,12 @@ const verifyPayment = asyncHandler(async (req, res) => {
       `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW() WHERE id = ?`,
       [req.user.id, orderId]
     );
+    await createPendingSettlementForOrder(conn, {
+      orderId,
+      partnerId: orders[0].partner_id,
+      amount: orders[0].total_amount,
+      method: 'bank_transfer',
+    });
 
     const partnerUsers = await notifyPartnerUsers(
       conn, orders[0].partner_id, 'payment_verified',

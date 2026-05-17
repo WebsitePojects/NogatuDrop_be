@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const pool = require('../config/db');
 const env = require('../config/env');
+const { runWithCronLeaderLock } = require('./cronLeaderLock');
 
 async function runTokenCleanup() {
   try {
@@ -17,8 +18,16 @@ async function runTokenCleanup() {
 }
 
 function startTokenCleanupCron() {
-  cron.schedule(env.TOKEN_CLEANUP_CRON, runTokenCleanup);
-  console.log(`[TokenCleanupCron] Started — schedule: ${env.TOKEN_CLEANUP_CRON}`);
+  cron.schedule(env.TOKEN_CLEANUP_CRON, async () => {
+    await runWithCronLeaderLock({
+      lockKey: 'token-cleanup',
+      task: runTokenCleanup,
+    });
+  });
+  console.log(`[TokenCleanupCron] Started â€” schedule: ${env.TOKEN_CLEANUP_CRON}`);
 }
 
-module.exports = { startTokenCleanupCron };
+module.exports = {
+  startTokenCleanupCron,
+  runTokenCleanup,
+};

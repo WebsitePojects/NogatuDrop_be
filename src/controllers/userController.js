@@ -3,9 +3,27 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { resolveUserAssignment } = require('../rbac/userAssignments');
+const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 
 async function getRoleBySlug(slug) {
   const [rows] = await pool.execute('SELECT id, slug FROM roles WHERE slug = ? LIMIT 1', [slug]);
+  return rows[0] || null;
+}
+
+async function getRoleById(id) {
+  const [rows] = await pool.execute('SELECT id, slug FROM roles WHERE id = ? LIMIT 1', [id]);
+  return rows[0] || null;
+}
+
+async function getPartnerById(id) {
+  const [rows] = await pool.execute(
+    `SELECT id, business_name, stockist_level, status, is_deleted
+     FROM partners
+     WHERE id = ?
+     LIMIT 1`,
+    [id]
+  );
   return rows[0] || null;
 }
 
@@ -121,50 +139,23 @@ const createUser = asyncHandler(async (req, res) => {
   );
   if (existing.length > 0) throw ApiError.conflict('Email already in use');
 
-  // Admin can only create staff under their own partner
-  let assignedPartnerId = partner_id || null;
-  let assignedRoleId = role_id;
-
-  if (!assignedRoleId && role_slug) {
-    const role = await getRoleBySlug(role_slug);
-    if (!role) {
-      throw ApiError.badRequest('Invalid role');
-    }
-    assignedRoleId = role.id;
+  if (normalizeRoleSlug(role_slug) === 'mobile_stockist') {
+    throw ApiError.badRequest('Create Mobile Stockist accounts from the Mobile Stockists module');
   }
 
-  if (req.user.role_slug === 'admin') {
-    assignedPartnerId = req.user.partner_id;
-    // Admin can only create staff
-    const staffRole = await getRoleBySlug('staff');
-    assignedRoleId = staffRole.id;
-  }
-
-  if (['provincial_stockist', 'city_stockist'].includes(req.user.role_slug)) {
-    assignedPartnerId = req.user.partner_id;
-    const requestedRoleSlug = role_slug || 'staff';
-
-    if (!['staff', 'mobile_stockist'].includes(requestedRoleSlug)) {
-      throw ApiError.forbidden('Stockists can only create staff or mobile stockist users');
-    }
-
-    const scopedRole = await getRoleBySlug(requestedRoleSlug);
-    if (!scopedRole) {
-      throw ApiError.badRequest('Invalid role');
-    }
-    assignedRoleId = scopedRole.id;
-  }
-
-  if (!assignedRoleId) {
-    throw ApiError.badRequest('Role is required');
-  }
+  const assignment = await resolveUserAssignment({
+    actor: req.user,
+    requested: { role_id, role_slug, partner_id },
+    getRoleBySlug,
+    getPartnerById,
+  });
 
   const hashedPassword = await bcrypt.hash(password, 12);
 
   const [result] = await pool.execute(
     `INSERT INTO users (name, email, password, phone, role_id, partner_id, level, location)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [fullName, email, hashedPassword, phone || null, assignedRoleId, assignedPartnerId, level || 'main', location || 'Regional Hub - North']
+    [fullName, email, hashedPassword, phone || null, assignment.roleId, assignment.partnerId, level || 'main', location || 'Regional Hub - North']
   );
 
   const [created] = await pool.execute(
@@ -180,19 +171,27 @@ const createUser = asyncHandler(async (req, res) => {
 
 // PUT /api/v1/users/:id
 const updateUser = asyncHandler(async (req, res) => {
-  const { name, email, phone, role_id, partner_id, level, location, status } = req.body;
+  const { name, email, phone, role_id, role_slug, partner_id, level, location, status } = req.body;
   const userId = req.params.id;
 
   // Verify user exists
   const checkParams = [userId];
-  let checkWhere = 'WHERE id = ? AND is_deleted = 0';
+  let checkWhere = 'WHERE u.id = ? AND u.is_deleted = 0';
   if (req.user.role_slug !== 'super_admin' && req.user.partner_id) {
-    checkWhere += ' AND partner_id = ?';
+    checkWhere += ' AND u.partner_id = ?';
     checkParams.push(req.user.partner_id);
   }
 
-  const [existing] = await pool.execute(`SELECT id FROM users ${checkWhere} LIMIT 1`, checkParams);
+  const [existing] = await pool.execute(
+    `SELECT u.id, u.partner_id, r.slug AS role_slug
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     ${checkWhere}
+     LIMIT 1`,
+    checkParams
+  );
   if (existing.length === 0) throw ApiError.notFound('User not found');
+  const existingUser = existing[0];
 
   // Check email uniqueness if changing
   if (email) {
@@ -206,11 +205,49 @@ const updateUser = asyncHandler(async (req, res) => {
   const fields = [];
   const values = [];
 
+  const requestedRoleSlug = role_slug
+    ? normalizeRoleSlug(role_slug)
+    : role_id
+      ? (await getRoleById(role_id))?.slug || null
+      : existingUser.role_slug;
+
+  if (
+    req.user.role_slug !== 'super_admin' &&
+    (
+      (requestedRoleSlug && requestedRoleSlug !== existingUser.role_slug) ||
+      (partner_id !== undefined && Number(partner_id || 0) !== Number(existingUser.partner_id || 0))
+    )
+  ) {
+    throw ApiError.forbidden('Only super admins can change user roles or Stockist affiliation');
+  }
+
+  if (
+    req.user.role_slug === 'super_admin' &&
+    (role_slug !== undefined || role_id !== undefined || partner_id !== undefined)
+  ) {
+    if (requestedRoleSlug === 'mobile_stockist' && existingUser.role_slug !== 'mobile_stockist') {
+      throw ApiError.badRequest('Create Mobile Stockist accounts from the Mobile Stockists module');
+    }
+
+    const assignment = await resolveUserAssignment({
+      actor: req.user,
+      requested: {
+        role_slug: requestedRoleSlug,
+        partner_id: partner_id !== undefined ? (partner_id || null) : existingUser.partner_id,
+      },
+      getRoleBySlug,
+      getPartnerById,
+    });
+
+    fields.push('role_id = ?');
+    values.push(assignment.roleId);
+    fields.push('partner_id = ?');
+    values.push(assignment.partnerId);
+  }
+
   if (name) { fields.push('name = ?'); values.push(name); }
   if (email) { fields.push('email = ?'); values.push(email); }
   if (phone !== undefined) { fields.push('phone = ?'); values.push(phone || null); }
-  if (role_id && req.user.role_slug === 'super_admin') { fields.push('role_id = ?'); values.push(role_id); }
-  if (partner_id !== undefined && req.user.role_slug === 'super_admin') { fields.push('partner_id = ?'); values.push(partner_id || null); }
   if (level) { fields.push('level = ?'); values.push(level); }
   if (location) { fields.push('location = ?'); values.push(location); }
   if (status) { fields.push('status = ?'); values.push(status); }

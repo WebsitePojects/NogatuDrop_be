@@ -3,10 +3,10 @@ const pool = require('../config/db');
 const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
 const { insertNotification } = require('../utils/notificationWriter');
+const { runWithCronLeaderLock } = require('./cronLeaderLock');
 
 async function runExpiryAlert() {
   try {
-    // Find batches expiring within 30 days
     const [batches] = await pool.execute(
       `SELECT i.id, i.product_id, i.warehouse_id, i.expiry_date, i.current_stock,
               p.name AS product_name, w.name AS warehouse_name
@@ -21,7 +21,6 @@ async function runExpiryAlert() {
 
     if (batches.length === 0) return;
 
-    // Get all super_admin emails
     const [admins] = await pool.execute(
       `SELECT u.id, u.email, u.name FROM users u
        JOIN roles r ON r.id = u.role_id
@@ -53,8 +52,16 @@ async function runExpiryAlert() {
 }
 
 function startExpiryAlertCron() {
-  cron.schedule(env.EXPIRY_ALERT_CRON, runExpiryAlert);
-  console.log(`[ExpiryAlertCron] Started — schedule: ${env.EXPIRY_ALERT_CRON}`);
+  cron.schedule(env.EXPIRY_ALERT_CRON, async () => {
+    await runWithCronLeaderLock({
+      lockKey: 'expiry-alert',
+      task: runExpiryAlert,
+    });
+  });
+  console.log(`[ExpiryAlertCron] Started â€” schedule: ${env.EXPIRY_ALERT_CRON}`);
 }
 
-module.exports = { startExpiryAlertCron };
+module.exports = {
+  startExpiryAlertCron,
+  runExpiryAlert,
+};

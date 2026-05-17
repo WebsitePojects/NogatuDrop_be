@@ -24,15 +24,20 @@ function isBcryptHash(value = '') {
 // POST /api/v1/auth/login
 const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
+  const identifier = String(email || '').trim();
+  const identifierLower = identifier.toLowerCase();
 
   const [users] = await pool.execute(
     `SELECT u.id, u.name, u.email, u.password, u.phone, u.partner_id, u.status,
             r.id AS role_id, r.name AS role_name, r.slug AS role_slug
      FROM users u
      JOIN roles r ON r.id = u.role_id
-     WHERE u.email = ? AND u.is_deleted = 0
+     WHERE (
+       LOWER(u.email) = ?
+       OR LOWER(SUBSTRING_INDEX(u.email, '@', 1)) = ?
+     ) AND u.is_deleted = 0
      LIMIT 1`,
-    [email]
+    [identifierLower, identifierLower]
   );
 
   if (users.length === 0) {
