@@ -6,7 +6,6 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
-const { createPendingSettlementForOrder } = require('./settlementController');
 
 const isMissingColumn = (err, columnName) => {
   if (!err || err.code !== 'ER_BAD_FIELD_ERROR') {
@@ -163,25 +162,16 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status, o.cod_amount
-       FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
-      [order_id]
-    );
-  } catch (err) {
-    if (!isMissingColumn(err, 'cod_amount')) {
-      throw err;
-    }
-
-    [orders] = await pool.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status
        FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
       [order_id]
     );
-    orders = orders.map((row) => ({ ...row, cod_amount: null }));
+  } catch (err) {
+    throw err;
   }
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   assertCanAccessOrder(req.user, orders[0]);
-  if (orders[0].payment_status !== 'paid' && Number(orders[0].cod_amount || 0) <= 0) {
+  if (orders[0].payment_status !== 'paid') {
     throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   }
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
@@ -628,22 +618,16 @@ const completeDelivery = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      'SELECT id, order_number, partner_id, source_warehouse_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
+      'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
       [orderId]
     );
   } catch (err) {
     if (isMissingColumn(err, 'source_warehouse_id')) {
       [orders] = await pool.execute(
-        'SELECT id, order_number, partner_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
+        'SELECT id, order_number, partner_id FROM orders WHERE id = ? LIMIT 1',
         [orderId]
       );
       orders = orders.map((row) => ({ ...row, source_warehouse_id: null }));
-    } else if (isMissingColumn(err, 'cod_amount')) {
-      [orders] = await pool.execute(
-        'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
-        [orderId]
-      );
-      orders = orders.map((row) => ({ ...row, cod_amount: null }));
     } else {
       throw err;
     }
@@ -766,16 +750,6 @@ const completeDelivery = asyncHandler(async (req, res) => {
         });
       }
     }
-
-    if (Number(order.cod_amount || 0) > 0) {
-      await createPendingSettlementForOrder(conn, {
-        orderId,
-        partnerId: order.partner_id,
-        amount: Number(order.cod_amount),
-        method: 'courier_remittance',
-      });
-    }
-
     // Notify Stockist
     const [partnerUsers] = await conn.execute(
       `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,

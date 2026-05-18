@@ -263,6 +263,18 @@ function buildOrderScope(user, {
   };
 }
 
+function normalizeOrderPaymentMethod(paymentMethod) {
+  if (paymentMethod == null || paymentMethod === '') {
+    return 'bank_transfer';
+  }
+
+  if (paymentMethod === 'bank_transfer') {
+    return paymentMethod;
+  }
+
+  throw ApiError.badRequest('Bank transfer is the only supported payment method');
+}
+
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
   const { page, limit, status, payment_status, search } = req.query;
@@ -407,15 +419,8 @@ const createOrder = asyncHandler(async (req, res) => {
       totalAmount += item.quantity * item.lockedUnitPrice;
     }
 
-    const normalizedRole = req.user.role_slug === 'admin' ? 'provincial_stockist' : req.user.role_slug;
-    const wantsCod = payment_method === 'cod';
-    const codEligible = normalizedRole === 'mobile_stockist' && totalAmount <= 5000;
-
-    if (wantsCod && !codEligible) {
-      throw ApiError.badRequest('COD is available only for Mobile Stockist orders up to P5000');
-    }
-
-    const codAmount = wantsCod ? totalAmount : 0;
+    normalizeOrderPaymentMethod(payment_method);
+    const codAmount = 0;
 
     // Check available stock if source warehouse known
     if (sourceWarehouseId) {
@@ -631,12 +636,8 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       totalAmount += quantity * price;
     }
 
-    const wantsCod = payment_method === 'cod';
-    if (wantsCod && totalAmount > 5000) {
-      throw ApiError.badRequest('COD is available only for orders up to P5000');
-    }
-
-    const codAmount = wantsCod ? totalAmount : 0;
+    normalizeOrderPaymentMethod(payment_method);
+    const codAmount = 0;
 
     if (sourceWarehouseId) {
       for (const item of resolvedItems) {
@@ -797,16 +798,6 @@ const approveOrder = asyncHandler(async (req, res) => {
     sourceWarehouseId = await resolveSourceWarehouseIdForPartner(pool, orders[0].partner_id);
   }
 
-  let codAmount = 0;
-  try {
-    const [codRows] = await pool.execute('SELECT cod_amount FROM orders WHERE id = ? LIMIT 1', [orderId]);
-    codAmount = Number(codRows[0]?.cod_amount || 0);
-  } catch (err) {
-    if (!isMissingColumn(err, 'cod_amount')) {
-      throw err;
-    }
-  }
-
   const deadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
 
   // Find bank account for the source warehouse
@@ -831,15 +822,13 @@ const approveOrder = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     await conn.execute(
       `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(), payment_deadline = ? WHERE id = ?`,
-      [req.user.id, codAmount > 0 ? null : deadline, orderId]
+      [req.user.id, deadline, orderId]
     );
 
     const partnerUsers = await notifyPartnerUsers(
       conn, orders[0].partner_id, 'order_approved',
       `Order Approved: #${orders[0].order_number}`,
-      codAmount > 0
-        ? `Your order #${orders[0].order_number} has been approved for cash on delivery.`
-        : `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
+      `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
       orderId
     );
     await conn.commit();
@@ -847,14 +836,14 @@ const approveOrder = asyncHandler(async (req, res) => {
     for (const pu of partnerUsers) {
       const tmpl = EMAIL.orderApproved(
         orders[0].order_number,
-        codAmount > 0 ? 0 : env.PAYMENT_DEADLINE_HOURS,
-        codAmount > 0 ? 'Cash on delivery approved for this order.' : bankDetails
+        env.PAYMENT_DEADLINE_HOURS,
+        bankDetails
       );
       await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
     }
 
     await cache.delPattern('dashboard:*');
-    res.json({ success: true, message: 'Order approved', data: { payment_deadline: codAmount > 0 ? null : deadline } });
+    res.json({ success: true, message: 'Order approved', data: { payment_deadline: deadline } });
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1106,5 +1095,6 @@ module.exports = {
   verifyPayment,
   __testables: {
     buildOrderScope,
+    normalizeOrderPaymentMethod,
   },
 };

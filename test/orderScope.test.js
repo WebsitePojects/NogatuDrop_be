@@ -30,3 +30,15 @@ test('order scope supports non-aliased direct orders queries', () => {
     { clause: ' AND placed_by = ?', params: [44] }
   );
 });
+
+test('order payment method defaults to bank transfer', () => {
+  assert.equal(__testables.normalizeOrderPaymentMethod(), 'bank_transfer');
+  assert.equal(__testables.normalizeOrderPaymentMethod('bank_transfer'), 'bank_transfer');
+});
+
+test('order payment method rejects cash on delivery', () => {
+  assert.throws(
+    () => __testables.normalizeOrderPaymentMethod('cod'),
+    /Bank transfer is the only supported payment method/
+  );
+});
