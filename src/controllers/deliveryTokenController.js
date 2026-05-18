@@ -8,11 +8,18 @@ const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { createPendingSettlementForOrder } = require('./settlementController');
 
-const isMissingColumn = (err, columnName) => (
-  err &&
-  err.code === 'ER_BAD_FIELD_ERROR' &&
-  String(err.message || '').includes(`'${columnName}'`)
-);
+const isMissingColumn = (err, columnName) => {
+  if (!err || err.code !== 'ER_BAD_FIELD_ERROR') {
+    return false;
+  }
+
+  const message = String(err.message || '');
+  const quotedIdentifiers = Array.from(message.matchAll(/'([^']+)'/g), (match) => match[1]);
+
+  return quotedIdentifiers.some((identifier) => (
+    identifier === columnName || identifier.endsWith(`.${columnName}`)
+  ));
+};
 
 async function getWarehouseIdByPartner(db, partnerId) {
   if (!partnerId) return null;
@@ -397,6 +404,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
       && !isMissingColumn(err, 'recipient_name')
       && !isMissingColumn(err, 'source_warehouse_id')
       && !isMissingColumn(err, 'partner_id')
+      && !isMissingColumn(err, 'created_at')
     ) {
       throw err;
     }
@@ -413,7 +421,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               NULL AS signature_hash,
               NULL AS signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -510,6 +518,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
       && !isMissingColumn(err, 'recipient_name')
       && !isMissingColumn(err, 'source_warehouse_id')
       && !isMissingColumn(err, 'partner_id')
+      && !isMissingColumn(err, 'created_at')
     ) {
       throw err;
     }
@@ -524,7 +533,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               NULL AS recipient_signature,
               NULL AS signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -547,7 +556,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN couriers c ON c.id = tr.courier_id
        WHERE o.is_deleted = 0 AND o.partner_id = ?
-       ORDER BY pod.created_at DESC
+       ORDER BY COALESCE(pod.signed_at, pod.submitted_at) DESC
        LIMIT ?`,
       [req.user.partner_id, limit]
     );

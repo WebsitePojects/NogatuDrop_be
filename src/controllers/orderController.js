@@ -233,16 +233,43 @@ async function notifySuperAdmins(conn, type, title, message, entityId) {
   return admins;
 }
 
+function buildOrderScope(user, {
+  orderAlias = 'o',
+} = {}) {
+  const orderRef = orderAlias ? `${orderAlias}.` : '';
+
+  if (user?.role_slug === 'super_admin') {
+    return { clause: '', params: [] };
+  }
+
+  if (user?.role_slug === 'mobile_stockist') {
+    if (!user?.id) {
+      return { clause: ' AND 1 = 0', params: [] };
+    }
+
+    return {
+      clause: ` AND ${orderRef}placed_by = ?`,
+      params: [user.id],
+    };
+  }
+
+  if (!user?.partner_id) {
+    return { clause: ' AND 1 = 0', params: [] };
+  }
+
+  return {
+    clause: ` AND ${orderRef}partner_id = ?`,
+    params: [user.partner_id],
+  };
+}
+
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
   const { page, limit, status, payment_status, search } = req.query;
+  const scope = buildOrderScope(req.user);
   const params = [];
-  let where = 'WHERE o.is_deleted = 0';
-
-  if (req.user.role_slug !== 'super_admin') {
-    where += ' AND o.partner_id = ?';
-    params.push(req.user.partner_id);
-  }
+  let where = `WHERE o.is_deleted = 0${scope.clause}`;
+  params.push(...scope.params);
 
   if (status) { where += ' AND o.status = ?'; params.push(status); }
   if (payment_status) { where += ' AND o.payment_status = ?'; params.push(payment_status); }
@@ -253,13 +280,15 @@ const getOrders = asyncHandler(async (req, res) => {
 
   const baseQuery = `
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
-           o.placed_by, u.name AS placed_by_name, o.status, o.payment_status,
+           o.placed_by, u.name AS placed_by_name, u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
+           o.status, o.payment_status,
            o.total_amount, o.payment_deadline, o.payment_proof_url, o.cod_amount,
            o.placed_by_type, o.customer_name,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
     JOIN partners pt ON pt.id = o.partner_id
     LEFT JOIN users u ON u.id = o.placed_by
+    LEFT JOIN roles ur ON ur.id = u.role_id
     ${where}
     ORDER BY o.created_at DESC`;
 
@@ -268,6 +297,7 @@ const getOrders = asyncHandler(async (req, res) => {
     FROM orders o
     JOIN partners pt ON pt.id = o.partner_id
     LEFT JOIN users u ON u.id = o.placed_by
+    LEFT JOIN roles ur ON ur.id = u.role_id
     ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
@@ -289,20 +319,18 @@ const getOrders = asyncHandler(async (req, res) => {
 
 // GET /api/v1/orders/:id
 const getOrder = asyncHandler(async (req, res) => {
-  const params = [req.params.id];
-  let where = 'WHERE o.id = ? AND o.is_deleted = 0';
-
-  if (req.user.role_slug !== 'super_admin') {
-    where += ' AND o.partner_id = ?';
-    params.push(req.user.partner_id);
-  }
+  const scope = buildOrderScope(req.user);
+  const params = [req.params.id, ...scope.params];
+  const where = `WHERE o.id = ? AND o.is_deleted = 0${scope.clause}`;
 
   const [rows] = await pool.execute(
     `SELECT o.*, pt.business_name AS partner_name, u.name AS placed_by_name,
+            u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
             a.name AS approved_by_name, verifier.name AS payment_verified_by_name
      FROM orders o
      JOIN partners pt ON pt.id = o.partner_id
      LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles ur ON ur.id = u.role_id
      LEFT JOIN users a ON a.id = o.approved_by
      LEFT JOIN users verifier ON verifier.id = o.payment_proof_verified_by
      ${where} LIMIT 1`,
@@ -910,14 +938,12 @@ const cancelOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const whereExtra = req.user.role_slug !== 'super_admin' ? ' AND partner_id = ?' : '';
-  const params = req.user.role_slug !== 'super_admin'
-    ? [orderId, req.user.partner_id]
-    : [orderId];
+  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const params = [orderId, ...scope.params];
 
   const orders = await getOrderRowsWithOptionalSourceColumn(
     pool,
-    `WHERE id = ? AND is_deleted = 0${whereExtra}`,
+    `WHERE id = ? AND is_deleted = 0${scope.clause}`,
     params
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
@@ -974,11 +1000,11 @@ const uploadPaymentProof = asyncHandler(async (req, res) => {
 
   if (!req.file) throw ApiError.badRequest('Payment proof file is required');
 
-  const whereExtra = req.user.role_slug !== 'super_admin' ? ' AND partner_id = ?' : '';
-  const params = req.user.role_slug !== 'super_admin' ? [orderId, req.user.partner_id] : [orderId];
+  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const params = [orderId, ...scope.params];
 
   const [orders] = await pool.execute(
-    `SELECT id, order_number, partner_id, status FROM orders WHERE id = ? AND is_deleted = 0${whereExtra}`,
+    `SELECT id, order_number, partner_id, status FROM orders WHERE id = ? AND is_deleted = 0${scope.clause}`,
     params
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
@@ -1078,4 +1104,7 @@ module.exports = {
   cancelOrder,
   uploadPaymentProof,
   verifyPayment,
+  __testables: {
+    buildOrderScope,
+  },
 };

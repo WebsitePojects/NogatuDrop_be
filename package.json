@@ -14,10 +14,12 @@
     "migrate:affiliations": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_role_affiliations_2026_05_17.sql",
     "migrate:stock-movements": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_stock_movement_types_2026_05_17.sql",
     "migrate:ops-personnel": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_operational_personnel_chain_2026_05_18.sql",
+    "migrate:catalog-sync": "node --env-file=.env.dev scripts/syncNogatuMlmCatalog.js",
     "smoke:verify": "node --env-file=.env.dev scripts/smokeApiVerify.js",
     "smoke:deep": "node --env-file=.env.dev scripts/smokeApiHealth.js",
     "smoke:roles": "node --env-file=.env.dev scripts/smokeRoleOperations.js",
     "smoke:mutations": "node --env-file=.env.dev scripts/smokeOperationalMutations.js",
+    "smoke:catalog": "node --env-file=.env.dev scripts/smokeCatalogSync.js",
     "smoke:health": "npm run smoke:verify",
     "post:migration": "node --env-file=.env.dev scripts/postMigration.js",
     "post:migration:deep": "set RUN_DEEP_SMOKE=true&& node --env-file=.env.dev scripts/postMigration.js"
