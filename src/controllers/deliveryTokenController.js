@@ -6,13 +6,19 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
-const { createPendingSettlementForOrder } = require('./settlementController');
 
-const isMissingColumn = (err, columnName) => (
-  err &&
-  err.code === 'ER_BAD_FIELD_ERROR' &&
-  String(err.message || '').includes(`'${columnName}'`)
-);
+const isMissingColumn = (err, columnName) => {
+  if (!err || err.code !== 'ER_BAD_FIELD_ERROR') {
+    return false;
+  }
+
+  const message = String(err.message || '');
+  const quotedIdentifiers = Array.from(message.matchAll(/'([^']+)'/g), (match) => match[1]);
+
+  return quotedIdentifiers.some((identifier) => (
+    identifier === columnName || identifier.endsWith(`.${columnName}`)
+  ));
+};
 
 async function getWarehouseIdByPartner(db, partnerId) {
   if (!partnerId) return null;
@@ -156,25 +162,16 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status, o.cod_amount
-       FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
-      [order_id]
-    );
-  } catch (err) {
-    if (!isMissingColumn(err, 'cod_amount')) {
-      throw err;
-    }
-
-    [orders] = await pool.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status
        FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
       [order_id]
     );
-    orders = orders.map((row) => ({ ...row, cod_amount: null }));
+  } catch (err) {
+    throw err;
   }
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   assertCanAccessOrder(req.user, orders[0]);
-  if (orders[0].payment_status !== 'paid' && Number(orders[0].cod_amount || 0) <= 0) {
+  if (orders[0].payment_status !== 'paid') {
     throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   }
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
@@ -397,6 +394,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
       && !isMissingColumn(err, 'recipient_name')
       && !isMissingColumn(err, 'source_warehouse_id')
       && !isMissingColumn(err, 'partner_id')
+      && !isMissingColumn(err, 'created_at')
     ) {
       throw err;
     }
@@ -413,7 +411,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               NULL AS signature_hash,
               NULL AS signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -510,6 +508,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
       && !isMissingColumn(err, 'recipient_name')
       && !isMissingColumn(err, 'source_warehouse_id')
       && !isMissingColumn(err, 'partner_id')
+      && !isMissingColumn(err, 'created_at')
     ) {
       throw err;
     }
@@ -524,7 +523,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               NULL AS recipient_signature,
               NULL AS signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -547,7 +546,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN couriers c ON c.id = tr.courier_id
        WHERE o.is_deleted = 0 AND o.partner_id = ?
-       ORDER BY pod.created_at DESC
+       ORDER BY COALESCE(pod.signed_at, pod.submitted_at) DESC
        LIMIT ?`,
       [req.user.partner_id, limit]
     );
@@ -619,22 +618,16 @@ const completeDelivery = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      'SELECT id, order_number, partner_id, source_warehouse_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
+      'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
       [orderId]
     );
   } catch (err) {
     if (isMissingColumn(err, 'source_warehouse_id')) {
       [orders] = await pool.execute(
-        'SELECT id, order_number, partner_id, cod_amount FROM orders WHERE id = ? LIMIT 1',
+        'SELECT id, order_number, partner_id FROM orders WHERE id = ? LIMIT 1',
         [orderId]
       );
       orders = orders.map((row) => ({ ...row, source_warehouse_id: null }));
-    } else if (isMissingColumn(err, 'cod_amount')) {
-      [orders] = await pool.execute(
-        'SELECT id, order_number, partner_id, source_warehouse_id FROM orders WHERE id = ? LIMIT 1',
-        [orderId]
-      );
-      orders = orders.map((row) => ({ ...row, cod_amount: null }));
     } else {
       throw err;
     }
@@ -757,16 +750,6 @@ const completeDelivery = asyncHandler(async (req, res) => {
         });
       }
     }
-
-    if (Number(order.cod_amount || 0) > 0) {
-      await createPendingSettlementForOrder(conn, {
-        orderId,
-        partnerId: order.partner_id,
-        amount: Number(order.cod_amount),
-        method: 'courier_remittance',
-      });
-    }
-
     // Notify Stockist
     const [partnerUsers] = await conn.execute(
       `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,

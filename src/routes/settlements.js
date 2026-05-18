@@ -18,7 +18,7 @@ router.post(
   [
     body('order_id').isInt().withMessage('order_id is required'),
     body('amount').isFloat({ min: 0 }).withMessage('amount is required'),
-    body('method').optional().isIn(['bank_transfer', 'cod', 'courier_remittance', 'manual']),
+    body('method').optional().isIn(['bank_transfer', 'courier_remittance', 'manual']),
   ],
   validate,
   controller.createSettlement

@@ -28,7 +28,7 @@ router.post(
   requirePermission(PERMISSIONS.ORDERS_CREATE),
   [
     body('notes').optional().trim(),
-    body('payment_method').optional().isIn(['bank_transfer', 'cod']),
+    body('payment_method').optional().isIn(['bank_transfer']),
   ],
   validate,
   createOrder
