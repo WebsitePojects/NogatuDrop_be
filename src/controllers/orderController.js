@@ -275,6 +275,31 @@ function normalizeOrderPaymentMethod(paymentMethod) {
   throw ApiError.badRequest('Bank transfer is the only supported payment method');
 }
 
+function getPublicOrderUnitPrice(product) {
+  const retailPrice = product?.retail_price == null || product?.retail_price === ''
+    ? null
+    : Number(product.retail_price);
+  if (Number.isFinite(retailPrice) && retailPrice >= 0) {
+    return retailPrice;
+  }
+
+  const price = product?.price == null || product?.price === ''
+    ? null
+    : Number(product.price);
+  if (Number.isFinite(price) && price >= 0) {
+    return price;
+  }
+
+  const partnerPrice = product?.partner_price == null || product?.partner_price === ''
+    ? null
+    : Number(product.partner_price);
+  if (Number.isFinite(partnerPrice) && partnerPrice >= 0) {
+    return partnerPrice;
+  }
+
+  throw ApiError.badRequest('Product price is unavailable');
+}
+
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
   const { page, limit, status, payment_status, search } = req.query;
@@ -626,12 +651,12 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 
       const [products] = await executeSoftDeleteAware(
         conn,
-        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
+        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
         [item.product_id],
-        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
+        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
       );
       if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
-      const price = parseFloat(products[0].partner_price);
+      const price = getPublicOrderUnitPrice(products[0]);
       resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
       totalAmount += quantity * price;
     }
@@ -1095,6 +1120,7 @@ module.exports = {
   verifyPayment,
   __testables: {
     buildOrderScope,
+    getPublicOrderUnitPrice,
     normalizeOrderPaymentMethod,
   },
 };

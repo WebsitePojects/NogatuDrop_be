@@ -12,6 +12,20 @@ const ApiError = require('./utils/ApiError');
 
 const app = express();
 
+function createRateLimiter(options, redisPrefix) {
+  return rateLimit({
+    ...options,
+    ...(redisPrefix && !redis.isInMemory
+      ? {
+          store: new RedisStore({
+            sendCommand: (...args) => redis.call(...args),
+            prefix: redisPrefix,
+          }),
+        }
+      : {}),
+  });
+}
+
 // Security headers
 app.use(helmet());
 
@@ -35,38 +49,41 @@ app.use(cookieParser());
 
 // Rate limiting
 if (env.RATE_LIMIT_ENABLED) {
-  const sharedStore = !redis.isInMemory
-    ? new RedisStore({
-        sendCommand: (...args) => redis.call(...args),
-      })
-    : undefined;
-
-  const limiter = rateLimit({
+  const limiter = createRateLimiter({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: { success: false, message: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
-    ...(sharedStore ? { store: sharedStore } : {}),
-  });
+  }, 'rl:api:');
   app.use('/api/', limiter);
 
   // Stricter limit on auth endpoints
-  const authLimiter = rateLimit({
+  const authLimiter = createRateLimiter({
     windowMs: 15 * 60 * 1000,
     max: 20,
     message: { success: false, message: 'Too many auth attempts, please try again later.' },
-    ...(sharedStore
-      ? {
-          store: new RedisStore({
-            sendCommand: (...args) => redis.call(...args),
-            prefix: 'rl:auth:',
-          }),
-        }
-      : {}),
-  });
+  }, 'rl:auth:');
   app.use('/api/v1/auth/login', authLimiter);
   app.use('/api/v1/auth/forgot-password', authLimiter);
+
+  const publicOrderLimiter = createRateLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: { success: false, message: 'Too many public order attempts, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:public-order:');
+  app.use('/api/v1/orders/public', publicOrderLimiter);
+
+  const publicTrackingLimiter = createRateLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    message: { success: false, message: 'Too many tracking lookups, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:public-tracking:');
+  app.use('/api/v1/tracking/public', publicTrackingLimiter);
 }
 
 // Health check
