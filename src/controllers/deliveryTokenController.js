@@ -6,6 +6,10 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
+const {
+  resolveAffiliationContext,
+  buildOrderScopeFromContext,
+} = require('../rbac/affiliationScopes');
 
 const isMissingColumn = (err, columnName) => {
   if (!err || err.code !== 'ER_BAD_FIELD_ERROR') {
@@ -90,39 +94,66 @@ async function getLatestActiveToken(orderId) {
   return rows[0] || null;
 }
 
-function assertCanAccessOrder(user, order) {
-  if (user.role_slug === 'super_admin') return;
-  if (Number(user.partner_id) === Number(order.partner_id)) return;
+function assertCanAccessOrder(affiliationContext, order) {
+  const scope = buildOrderScopeFromContext(affiliationContext, { orderAlias: '' });
+  if (!scope.clause) {
+    return;
+  }
+
+  if (scope.clause === ' AND 1 = 0') {
+    throw ApiError.forbidden('You do not have permission to access this order');
+  }
+
+  // Simple in-memory mirror of the order visibility rules for single-record checks.
+  const role = affiliationContext?.role;
+  const partnerId = Number(affiliationContext?.partnerId || 0) || null;
+  const partnerLevel = affiliationContext?.partnerLevel;
+  const childCityPartnerIds = Array.isArray(affiliationContext?.childCityPartnerIds)
+    ? affiliationContext.childCityPartnerIds.map(Number)
+    : [];
+
+  if (role === 'mobile_stockist') {
+    if (Number(order.placed_by) !== Number(affiliationContext?.userId || 0)) {
+      throw ApiError.forbidden('You do not have permission to access this order');
+    }
+    return;
+  }
+
+  if (partnerLevel === 'city_stockist') {
+    if (Number(order.partner_id) !== partnerId) {
+      throw ApiError.forbidden('You do not have permission to access this order');
+    }
+    return;
+  }
+
+  if (partnerLevel === 'provincial_stockist') {
+    if (Number(order.partner_id) === partnerId) {
+      return;
+    }
+    if (
+      childCityPartnerIds.includes(Number(order.partner_id))
+      && String(order.placed_by_role_slug || '') === 'city_stockist'
+    ) {
+      return;
+    }
+  }
+
   throw ApiError.forbidden('You do not have permission to access this order');
 }
 
-function canAccessDeliveryProof(user, ownership) {
-  if (!user) return false;
-  if (user.role_slug === 'super_admin') return true;
-
-  const userPartnerId = Number(user.partner_id || 0);
-  if (!userPartnerId) return false;
-
-  return userPartnerId === Number(ownership.partner_id || 0)
-    || userPartnerId === Number(ownership.source_partner_id || 0);
+function canAccessDeliveryProof(affiliationContext, ownership) {
+  try {
+    assertCanAccessOrder(affiliationContext, ownership);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function buildDeliveryProofScope(user, {
+function buildDeliveryProofScope(affiliationContext, {
   orderAlias = 'o',
-  sourcePartnerExpression = 'sw.partner_id',
 } = {}) {
-  if (user?.role_slug === 'super_admin') {
-    return { clause: '', params: [] };
-  }
-
-  if (!user?.partner_id) {
-    return { clause: ' AND 1 = 0', params: [] };
-  }
-
-  return {
-    clause: ` AND (${orderAlias}.partner_id = ? OR ${sourcePartnerExpression} = ?)`,
-    params: [user.partner_id, user.partner_id],
-  };
+  return buildOrderScopeFromContext(affiliationContext, { orderAlias });
 }
 
 async function getDeliveryProofOwnership(orderId) {
@@ -130,20 +161,21 @@ async function getDeliveryProofOwnership(orderId) {
 
   try {
     [rows] = await pool.execute(
-      `SELECT o.id, o.partner_id, sw.partner_id AS source_partner_id
+      `SELECT o.id, o.partner_id, o.placed_by, r.slug AS placed_by_role_slug
        FROM orders o
-       LEFT JOIN warehouses sw ON sw.id = o.source_warehouse_id
+       LEFT JOIN users u ON u.id = o.placed_by
+       LEFT JOIN roles r ON r.id = u.role_id
        WHERE o.id = ? AND o.is_deleted = 0
        LIMIT 1`,
       [orderId]
     );
   } catch (err) {
-    if (!isMissingColumn(err, 'source_warehouse_id') && !isMissingColumn(err, 'partner_id')) {
+    if (!isMissingColumn(err, 'partner_id')) {
       throw err;
     }
 
     [rows] = await pool.execute(
-      `SELECT o.id, o.partner_id, NULL AS source_partner_id
+      `SELECT o.id, o.partner_id, o.placed_by, NULL AS placed_by_role_slug
        FROM orders o
        WHERE o.id = ? AND o.is_deleted = 0
        LIMIT 1`,
@@ -162,7 +194,8 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      `SELECT o.id, o.order_number, o.partner_id, o.payment_status, o.status
+      `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.payment_status, o.status,
+              r.slug AS placed_by_role_slug
        FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
       [order_id]
     );
@@ -170,7 +203,8 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
     throw err;
   }
   if (orders.length === 0) throw ApiError.notFound('Order not found');
-  assertCanAccessOrder(req.user, orders[0]);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  assertCanAccessOrder(affiliationContext, orders[0]);
   if (orders[0].payment_status !== 'paid') {
     throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   }
@@ -296,12 +330,17 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
 
   const [orders] = await pool.execute(
-    'SELECT id, partner_id FROM orders WHERE id = ? AND is_deleted = 0 LIMIT 1',
+    `SELECT o.id, o.partner_id, o.placed_by, r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
     [orderId]
   );
 
   if (orders.length === 0) throw ApiError.notFound('Order not found');
-  assertCanAccessOrder(req.user, orders[0]);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  assertCanAccessOrder(affiliationContext, orders[0]);
 
   const token = await getLatestActiveToken(orderId);
   if (!token) {
@@ -325,12 +364,13 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
 const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
   const { orderId } = req.params;
   const ownership = await getDeliveryProofOwnership(orderId);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
 
   if (!ownership) {
     throw ApiError.notFound('Order not found');
   }
 
-  if (!canAccessDeliveryProof(req.user, ownership)) {
+  if (!canAccessDeliveryProof(affiliationContext, ownership)) {
     throw ApiError.forbidden('You do not have permission to access this proof of delivery');
   }
 
@@ -456,7 +496,8 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
 // GET /api/v1/delivery-tokens/pods — recent POD records within tenant/source scope
 const listDeliveryProofs = asyncHandler(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
-  const scope = buildDeliveryProofScope(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildDeliveryProofScope(affiliationContext);
   let rows;
 
   try {

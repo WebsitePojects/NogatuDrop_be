@@ -9,6 +9,11 @@ const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { createPendingSettlementForOrder } = require('./settlementController');
+const {
+  resolveAffiliationContext,
+  buildOrderScopeFromContext,
+  canApproveOrderFromContext,
+} = require('../rbac/affiliationScopes');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -69,6 +74,34 @@ async function getOrderItemsWithOptionalSourceColumn(db, orderId) {
     }
     throw err;
   }
+}
+
+async function getPublicOrderPlacedByUserId(db) {
+  const [rows] = await executeSoftDeleteAware(
+    db,
+    `SELECT u.id
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin'
+       AND u.status = 'active'
+       AND u.is_deleted = 0
+     ORDER BY u.id ASC
+     LIMIT 1`,
+    [],
+    `SELECT u.id
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin'
+       AND u.status = 'active'
+     ORDER BY u.id ASC
+     LIMIT 1`
+  );
+
+  if (rows.length === 0) {
+    throw ApiError.serviceUnavailable('No active super admin is available to own public orders');
+  }
+
+  return rows[0].id;
 }
 
 async function reserveInventoryOrThrow(conn, { productId, warehouseId, quantity, productName }) {
@@ -235,32 +268,20 @@ async function notifySuperAdmins(conn, type, title, message, entityId) {
 
 function buildOrderScope(user, {
   orderAlias = 'o',
+  affiliationContext = null,
+  placedByRoleAlias = null,
 } = {}) {
-  const orderRef = orderAlias ? `${orderAlias}.` : '';
-
-  if (user?.role_slug === 'super_admin') {
-    return { clause: '', params: [] };
-  }
-
-  if (user?.role_slug === 'mobile_stockist') {
-    if (!user?.id) {
-      return { clause: ' AND 1 = 0', params: [] };
-    }
-
-    return {
-      clause: ` AND ${orderRef}placed_by = ?`,
-      params: [user.id],
-    };
-  }
-
-  if (!user?.partner_id) {
-    return { clause: ' AND 1 = 0', params: [] };
-  }
-
-  return {
-    clause: ` AND ${orderRef}partner_id = ?`,
-    params: [user.partner_id],
+  const context = affiliationContext || {
+    role: user?.role_slug,
+    userId: user?.id,
+    partnerId: user?.partner_id,
+    partnerLevel: user?.role_slug === 'provincial_stockist' || user?.role_slug === 'city_stockist'
+      ? user?.role_slug
+      : null,
+    childCityPartnerIds: [],
   };
+
+  return buildOrderScopeFromContext(context, { orderAlias, placedByRoleAlias });
 }
 
 function normalizeOrderPaymentMethod(paymentMethod) {
@@ -303,7 +324,11 @@ function getPublicOrderUnitPrice(product) {
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
   const { page, limit, status, payment_status, search } = req.query;
-  const scope = buildOrderScope(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, {
+    affiliationContext,
+    placedByRoleAlias: 'ur',
+  });
   const params = [];
   let where = `WHERE o.is_deleted = 0${scope.clause}`;
   params.push(...scope.params);
@@ -356,7 +381,8 @@ const getOrders = asyncHandler(async (req, res) => {
 
 // GET /api/v1/orders/:id
 const getOrder = asyncHandler(async (req, res) => {
-  const scope = buildOrderScope(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { affiliationContext });
   const params = [req.params.id, ...scope.params];
   const where = `WHERE o.id = ? AND o.is_deleted = 0${scope.clause}`;
 
@@ -639,6 +665,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
     let totalAmount = 0;
     const resolvedItems = [];
@@ -686,11 +713,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     let orderResult;
     try {
       [orderResult] = await conn.execute(
-        `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+        `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
                              customer_name, customer_phone, customer_email, customer_address, cod_amount,
                              total_amount, notes)
-         VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
          customer_email || null, customer_address, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
@@ -698,22 +725,22 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       if (isMissingColumn(err, 'cod_amount')) {
         try {
           [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
                                  customer_name, customer_phone, customer_email, customer_address,
                                  total_amount, notes)
-             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
              customer_email || null, customer_address, totalAmount, notes || null]
           );
         } catch (innerErr) {
           if (isMissingColumn(innerErr, 'source_warehouse_id')) {
             try {
               [orderResult] = await conn.execute(
-                `INSERT INTO orders (order_number, partner_id, placed_by_type,
+                `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
                                      customer_name, customer_phone, customer_email, customer_address,
                                      total_amount, notes)
-                 VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-                [orderNumber, partnerId, customer_name, customer_phone || null,
+                 VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+                [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
                  customer_email || null, customer_address, totalAmount, notes || null]
               );
             } catch (legacyErr) {
@@ -730,11 +757,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       } else if (isMissingColumn(err, 'source_warehouse_id')) {
         try {
           [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by_type,
+            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
                                  customer_name, customer_phone, customer_email, customer_address,
                                  total_amount, notes)
-             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, customer_name, customer_phone || null,
+             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
              customer_email || null, customer_address, totalAmount, notes || null]
           );
         } catch (innerErr) {
@@ -810,13 +837,23 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
-  const orders = await getOrderRowsWithOptionalSourceColumn(
-    pool,
-    'WHERE id = ? AND is_deleted = 0',
+  const [orders] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be approved');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (!canApproveOrderFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to approve this order');
+  }
 
   let sourceWarehouseId = orders[0].source_warehouse_id || null;
   if (!sourceWarehouseId) {
@@ -882,13 +919,23 @@ const rejectOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const orders = await getOrderRowsWithOptionalSourceColumn(
-    pool,
-    'WHERE id = ? AND is_deleted = 0',
+  const [orders] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be rejected');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (!canApproveOrderFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to reject this order');
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -952,7 +999,8 @@ const cancelOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { orderAlias: '', affiliationContext });
   const params = [orderId, ...scope.params];
 
   const orders = await getOrderRowsWithOptionalSourceColumn(
@@ -1014,7 +1062,8 @@ const uploadPaymentProof = asyncHandler(async (req, res) => {
 
   if (!req.file) throw ApiError.badRequest('Payment proof file is required');
 
-  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { orderAlias: '', affiliationContext });
   const params = [orderId, ...scope.params];
 
   const [orders] = await pool.execute(
@@ -1120,6 +1169,7 @@ module.exports = {
   verifyPayment,
   __testables: {
     buildOrderScope,
+    getPublicOrderPlacedByUserId,
     getPublicOrderUnitPrice,
     normalizeOrderPaymentMethod,
   },

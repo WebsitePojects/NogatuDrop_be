@@ -36,8 +36,10 @@ test('rbac policy assigns daily operation capabilities by normal production role
 
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.USERS_MANAGE), true);
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.CART_USE), true);
+  assert.equal(hasPermission('provincial_stockist', PERMISSIONS.ORDERS_APPROVE), true);
 
   assert.equal(hasPermission('city_stockist', PERMISSIONS.MOBILE_STOCKISTS_MANAGE), true);
+  assert.equal(hasPermission('city_stockist', PERMISSIONS.ORDERS_APPROVE), true);
   assert.equal(hasPermission('city_stockist', PERMISSIONS.ORDERS_VERIFY_PAYMENT), false);
 
   assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), true);

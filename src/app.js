@@ -9,8 +9,25 @@ const env = require('./config/env');
 const redis = require('./config/redis');
 const routes = require('./routes/index');
 const ApiError = require('./utils/ApiError');
+const { attachRequestContext } = require('./middleware/requestContext');
+const { buildReadinessSnapshot } = require('./services/readinessService');
 
 const app = express();
+
+morgan.token('request-id', (req) => req.requestId || '-');
+
+function productionMorganJson(tokens, req, res) {
+  return JSON.stringify({
+    request_id: tokens['request-id'](req, res),
+    method: tokens.method(req, res),
+    url: tokens.url(req, res),
+    status: Number(tokens.status(req, res) || 0),
+    response_time_ms: Number(tokens['response-time'](req, res) || 0),
+    content_length: Number(tokens.res(req, res, 'content-length') || 0),
+    remote_addr: tokens['remote-addr'](req, res),
+    user_agent: tokens['user-agent'](req, res),
+  });
+}
 
 function createRateLimiter(options, redisPrefix) {
   return rateLimit({
@@ -37,8 +54,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Alliance-API-Key'],
 }));
 
+app.use(attachRequestContext);
+
 // Request logging
-app.use(morgan(env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+app.use(
+  morgan(
+    env.NODE_ENV === 'production'
+      ? productionMorganJson
+      : ':request-id :method :url :status :res[content-length] - :response-time ms'
+  )
+);
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
@@ -88,7 +113,23 @@ if (env.RATE_LIMIT_ENABLED) {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, message: 'Nogatu NCDMS API is running', timestamp: new Date().toISOString() });
+  res.json({
+    success: true,
+    status: 'ok',
+    message: 'Nogatu NCDMS API is running',
+    request_id: req.requestId,
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.round(process.uptime()),
+  });
+});
+
+app.get('/api/ready', async (req, res, next) => {
+  try {
+    const snapshot = await buildReadinessSnapshot({ requestId: req.requestId });
+    res.status(snapshot.success ? 200 : 503).json(snapshot);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // API routes
@@ -132,6 +173,7 @@ app.use((err, req, res, next) => {
   res.status(statusCode).json({
     success: false,
     message,
+    request_id: req.requestId || null,
     details: Array.isArray(err.details) ? err.details : [],
     ...(env.NODE_ENV !== 'production' && { stack: err.stack }),
   });
