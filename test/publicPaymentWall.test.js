@@ -25,6 +25,9 @@ test('public order proof upload is exposed as a non-auth storefront route', () =
   assert.equal(orderRoutesSource.includes("router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadPublicPaymentProof);"), true);
   assert.equal(orderControllerSource.includes('const uploadPublicPaymentProof = asyncHandler(async (req, res) => {'), true);
   assert.equal(orderControllerSource.includes("throw ApiError.badRequest('order_number and customer_phone are required');"), true);
+  assert.equal(orderControllerSource.includes('normalizePhoneForLookup'), true);
+  assert.equal(orderControllerSource.includes("throw ApiError.badRequest('The phone number does not match the public order record');"), true);
+  assert.equal(orderControllerSource.includes("throw ApiError.badRequest('This order is closed and can no longer accept payment proof');"), true);
 });
 
 test('public tracking returns unpaid bank instructions and payment-proof state', () => {

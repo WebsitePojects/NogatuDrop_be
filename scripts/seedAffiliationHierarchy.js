@@ -190,6 +190,8 @@ async function upsertMobileStockist(conn, data) {
            phone = ?,
            address = ?,
            region = ?,
+           lat = ?,
+           lng = ?,
            status = 'active',
            is_deleted = 0
        WHERE id = ?`,
@@ -200,6 +202,8 @@ async function upsertMobileStockist(conn, data) {
         data.phone || null,
         data.address || null,
         data.region || null,
+        data.lat ?? null,
+        data.lng ?? null,
         existing[0].id,
       ]
     );
@@ -216,9 +220,11 @@ async function upsertMobileStockist(conn, data) {
       phone,
       address,
       region,
+      lat,
+      lng,
       status,
       is_deleted
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`,
     [
       data.partnerId,
       data.userId,
@@ -227,6 +233,8 @@ async function upsertMobileStockist(conn, data) {
       data.phone || null,
       data.address || null,
       data.region || null,
+      data.lat ?? null,
+      data.lng ?? null,
     ]
   );
 
@@ -253,6 +261,8 @@ async function upsertWarehouse(conn, data) {
            manager_name = ?,
            manager_email = ?,
            manager_phone = ?,
+           lat = ?,
+           lng = ?,
            is_active = 1,
            is_deleted = 0
        WHERE id = ?`,
@@ -264,6 +274,8 @@ async function upsertWarehouse(conn, data) {
         data.managerName,
         data.managerEmail,
         data.managerPhone || null,
+        data.lat ?? null,
+        data.lng ?? null,
         existing[0].id,
       ]
     );
@@ -282,9 +294,11 @@ async function upsertWarehouse(conn, data) {
       manager_name,
       manager_email,
       manager_phone,
+      lat,
+      lng,
       is_active,
       is_deleted
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)`,
     [
       data.partnerId,
       data.name,
@@ -295,6 +309,8 @@ async function upsertWarehouse(conn, data) {
       data.managerName,
       data.managerEmail,
       data.managerPhone || null,
+      data.lat ?? null,
+      data.lng ?? null,
     ]
   );
 
@@ -469,6 +485,8 @@ async function seedBranch(conn, branch, roleIds, products, passwordHash) {
       phone: unit.mobile.phone,
       address: unit.mobile.address,
       region: unit.city.region || branch.provincial.region || null,
+      lat: unit.mobile.lat,
+      lng: unit.mobile.lng,
     });
 
     citySummaries.push({
@@ -491,6 +509,16 @@ async function seedBranch(conn, branch, roleIds, products, passwordHash) {
   };
 }
 
+async function repairCoreDevChainCoordinates(conn) {
+  await conn.execute(
+    `UPDATE mobile_stockists ms
+     JOIN users u ON u.id = ms.user_id
+     SET ms.lat = ?, ms.lng = ?
+     WHERE u.email = 'mobile@nogatu.com'`,
+    [14.4882, 121.0286]
+  );
+}
+
 async function main() {
   const conn = await pool.getConnection();
 
@@ -505,6 +533,8 @@ async function main() {
     for (const branch of AFFILIATION_HIERARCHY_FIXTURE) {
       branches.push(await seedBranch(conn, branch, roleIds, products, passwordHash));
     }
+
+    await repairCoreDevChainCoordinates(conn);
 
     await conn.commit();
 

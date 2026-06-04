@@ -18,6 +18,7 @@ const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
+  canVerifyPaymentFromContext,
 } = require('../rbac/affiliationScopes');
 
 const isMissingSoftDeleteColumn = (err) => (
@@ -439,6 +440,10 @@ function buildBankDetailsString(bankAccount) {
   return `${bankAccount.bank_name} - ${bankAccount.account_name} - ${bankAccount.account_number}`;
 }
 
+function normalizePhoneForLookup(value) {
+  return String(value || '').replace(/\D+/g, '');
+}
+
 function buildPublicPaymentContext({
   orderNumber,
   totalAmount,
@@ -490,7 +495,14 @@ const getOrders = asyncHandler(async (req, res) => {
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
            o.placed_by, u.name AS placed_by_name, u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
            o.status, o.payment_status,
-           o.total_amount, o.payment_deadline, o.payment_proof_url, o.cod_amount,
+           o.total_amount, o.payment_deadline, o.payment_proof_url, o.payment_proof_uploaded_at, o.cod_amount,
+           EXISTS(
+             SELECT 1
+             FROM delivery_tokens dt
+             WHERE dt.order_id = o.id
+               AND dt.is_used = 0
+               AND dt.expires_at > NOW()
+           ) AS has_active_delivery_link,
            o.placed_by_type, o.customer_name,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
@@ -1247,19 +1259,24 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
 
   const normalizedOrderNumber = String(order_number).trim().toUpperCase();
   const [orders] = await pool.execute(
-    `SELECT id, order_number, partner_id, status, payment_status, customer_name
+    `SELECT id, order_number, partner_id, status, payment_status, customer_name, customer_phone
      FROM orders
      WHERE order_number = ?
-       AND customer_phone = ?
        AND placed_by_type = 'public'
        AND is_deleted = 0
      LIMIT 1`,
-    [normalizedOrderNumber, customer_phone]
+    [normalizedOrderNumber]
   );
 
-  if (orders.length === 0) throw ApiError.notFound('Public order not found');
-  if (!['approved', 'delivering'].includes(orders[0].status)) {
-    throw ApiError.badRequest('This order is not ready for payment proof upload');
+  if (orders.length === 0) throw ApiError.notFound('Public order not found for this order number');
+
+  const providedPhone = normalizePhoneForLookup(customer_phone);
+  const storedPhone = normalizePhoneForLookup(orders[0].customer_phone);
+  if (!providedPhone || !storedPhone || providedPhone !== storedPhone) {
+    throw ApiError.badRequest('The phone number does not match the public order record');
+  }
+  if (['cancelled', 'rejected'].includes(String(orders[0].status || '').toLowerCase())) {
+    throw ApiError.badRequest('This order is closed and can no longer accept payment proof');
   }
   if (orders[0].payment_status === 'paid') {
     throw ApiError.badRequest('Payment has already been verified for this order');
@@ -1307,12 +1324,22 @@ const verifyPayment = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status, payment_proof_url, total_amount FROM orders WHERE id = ? AND is_deleted = 0',
+    `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_proof_url, o.total_amount,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'approved') throw ApiError.badRequest('Order must be in approved status');
   if (!orders[0].payment_proof_url) throw ApiError.badRequest('No payment proof has been uploaded');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (req.user.role_slug !== 'super_admin' && !canVerifyPaymentFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to verify payment for this order');
+  }
 
   const conn = await pool.getConnection();
   try {

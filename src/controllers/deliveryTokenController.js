@@ -9,6 +9,7 @@ const { insertNotification } = require('../utils/notificationWriter');
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
+  canManageDeliveryLinkFromContext,
 } = require('../rbac/affiliationScopes');
 
 const isMissingColumn = (err, columnName) => {
@@ -150,6 +151,16 @@ function canAccessDeliveryProof(affiliationContext, ownership) {
   }
 }
 
+function assertCanManageDeliveryLink(affiliationContext, order) {
+  if (affiliationContext?.role === 'super_admin') {
+    return;
+  }
+
+  if (!canManageDeliveryLinkFromContext(affiliationContext, order)) {
+    throw ApiError.forbidden('You do not have permission to generate or view the delivery link for this order');
+  }
+}
+
 function buildDeliveryProofScope(affiliationContext, {
   orderAlias = 'o',
 } = {}) {
@@ -196,7 +207,10 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
     [orders] = await pool.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.payment_status, o.status,
               r.slug AS placed_by_role_slug
-       FROM orders o WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.placed_by
+       LEFT JOIN roles r ON r.id = u.role_id
+       WHERE o.id = ? AND o.is_deleted = 0 LIMIT 1`,
       [order_id]
     );
   } catch (err) {
@@ -205,6 +219,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   const affiliationContext = await resolveAffiliationContext(pool, req.user);
   assertCanAccessOrder(affiliationContext, orders[0]);
+  assertCanManageDeliveryLink(affiliationContext, orders[0]);
   if (orders[0].payment_status !== 'paid') {
     throw ApiError.badRequest('Payment must be verified before generating a delivery link');
   }
@@ -341,6 +356,7 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   const affiliationContext = await resolveAffiliationContext(pool, req.user);
   assertCanAccessOrder(affiliationContext, orders[0]);
+  assertCanManageDeliveryLink(affiliationContext, orders[0]);
 
   const token = await getLatestActiveToken(orderId);
   if (!token) {

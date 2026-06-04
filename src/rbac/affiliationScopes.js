@@ -203,10 +203,20 @@ function canApproveOrderFromContext(context, order) {
   return false;
 }
 
+function canVerifyPaymentFromContext(context, order) {
+  return canApproveOrderFromContext(context, order);
+}
+
+function canManageDeliveryLinkFromContext(context, order) {
+  return canApproveOrderFromContext(context, order);
+}
+
 module.exports = {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
+  canVerifyPaymentFromContext,
+  canManageDeliveryLinkFromContext,
   __testables: {
     getPlacedByRoleExpression,
   },
