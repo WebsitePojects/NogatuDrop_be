@@ -203,6 +203,85 @@ const getProducts = asyncHandler(async (req, res) => {
   res.json({ success: true, ...result });
 });
 
+async function scopePublicProducts(db, products) {
+  if (!Array.isArray(products) || products.length === 0) {
+    return products;
+  }
+
+  // Get active candidate warehouses
+  let candidateWarehouseIds = [];
+  try {
+    const [rows] = await db.execute(
+      `SELECT w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+         AND p.is_deleted = 0 AND w.is_deleted = 0`
+    );
+    candidateWarehouseIds = rows.map((r) => r.warehouse_id);
+  } catch (err) {
+    try {
+      const [rows] = await db.execute(
+        `SELECT w.id AS warehouse_id
+         FROM partners p
+         JOIN warehouses w ON w.partner_id = p.id
+         WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')`
+      );
+      candidateWarehouseIds = rows.map((r) => r.warehouse_id);
+    } catch (innerErr) {
+      return products.map(p => ({ ...p, available_qty: 999, is_orderable: true }));
+    }
+  }
+
+  if (candidateWarehouseIds.length === 0) {
+    return products.map(p => ({ ...p, available_qty: 0, is_orderable: false }));
+  }
+
+  const productIds = products.map((p) => p.id);
+  const placeholders = productIds.map(() => '?').join(', ');
+  const warehousePlaceholders = candidateWarehouseIds.map(() => '?').join(', ');
+
+  let inventoryRows = [];
+  try {
+    [inventoryRows] = await db.execute(
+      `SELECT product_id, current_stock, reserved_stock
+       FROM inventories
+       WHERE warehouse_id IN (${warehousePlaceholders})
+         AND product_id IN (${placeholders})
+         AND is_deleted = 0`,
+      [...candidateWarehouseIds, ...productIds]
+    );
+  } catch (err) {
+    try {
+      [inventoryRows] = await db.execute(
+        `SELECT product_id, current_stock, reserved_stock
+         FROM inventories
+         WHERE warehouse_id IN (${warehousePlaceholders})
+           AND product_id IN (${placeholders})`,
+        [...candidateWarehouseIds, ...productIds]
+      );
+    } catch (innerErr) {
+      return products.map(p => ({ ...p, available_qty: 999, is_orderable: true }));
+    }
+  }
+
+  const stockMap = new Map();
+  for (const row of inventoryRows) {
+    const pId = Number(row.product_id);
+    const available = Math.max(0, Number(row.current_stock || 0) - Number(row.reserved_stock || 0));
+    stockMap.set(pId, (stockMap.get(pId) || 0) + available);
+  }
+
+  return products.map((product) => {
+    const availableQty = stockMap.get(Number(product.id)) || 0;
+    return {
+      ...product,
+      available_qty: availableQty,
+      is_orderable: availableQty > 0,
+    };
+  });
+}
+
 // GET /api/v1/products/public
 const getPublicProducts = asyncHandler(async (req, res) => {
   const { page, limit, search, category } = req.query;
@@ -225,6 +304,7 @@ const getPublicProducts = asyncHandler(async (req, res) => {
   const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
+  result.data = await scopePublicProducts(pool, result.data);
   res.json({ success: true, ...result });
 });
 

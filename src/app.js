@@ -14,6 +14,36 @@ const { buildReadinessSnapshot } = require('./services/readinessService');
 
 const app = express();
 
+const allowedOrigins = String(env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function isLoopbackOrigin(origin) {
+  try {
+    const { hostname } = new URL(origin);
+    return ['localhost', '127.0.0.1', '::1'].includes(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
+
+  if (allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  if (env.NODE_ENV !== 'production' && isLoopbackOrigin(origin)) {
+    return true;
+  }
+
+  return false;
+}
+
 morgan.token('request-id', (req) => req.requestId || '-');
 
 function productionMorganJson(tokens, req, res) {
@@ -48,7 +78,13 @@ app.use(helmet());
 
 // CORS
 app.use(cors({
-  origin: env.ALLOWED_ORIGIN,
+  origin(origin, callback) {
+    if (isAllowedCorsOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(ApiError.forbidden(`Origin ${origin} is not allowed by CORS`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Alliance-API-Key'],

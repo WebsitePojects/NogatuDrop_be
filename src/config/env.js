@@ -24,7 +24,7 @@ const env = {
   JWT_REFRESH_EXPIRES_IN: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
 
   // CORS
-  ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173',
+  ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173',
 
   // Brevo (transactional email — replaces SMS)
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',

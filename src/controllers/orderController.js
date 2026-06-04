@@ -10,6 +10,11 @@ const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { createPendingSettlementForOrder } = require('./settlementController');
 const {
+  getBankAccountForWarehouseOrDefault,
+  assertBankAccountAvailable,
+} = require('../services/bankAccountResolver');
+const { getPublicOrderPricingTotals } = require('../services/publicCheckoutPricing');
+const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
@@ -223,6 +228,111 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
+async function listPublicFulfillmentCandidates(db) {
+  try {
+    const [rows] = await executeSoftDeleteAware(
+      db,
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+         AND p.is_deleted = 0 AND w.is_deleted = 0
+       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`,
+      [],
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`
+    );
+    return rows;
+  } catch (err) {
+    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
+      throw err;
+    }
+  }
+
+  const [rows] = await executeSoftDeleteAware(
+    db,
+    `SELECT p.id AS partner_id, i.warehouse_id
+     FROM partners p
+     JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
+     JOIN warehouses w ON w.id = i.warehouse_id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       AND p.is_deleted = 0 AND w.is_deleted = 0
+     GROUP BY p.id, i.warehouse_id
+     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`,
+    [],
+    `SELECT p.id AS partner_id, i.warehouse_id
+     FROM partners p
+     JOIN inventories i ON i.partner_id = p.id
+     JOIN warehouses w ON w.id = i.warehouse_id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+     GROUP BY p.id, i.warehouse_id
+     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`
+  );
+  return rows;
+}
+
+async function canWarehouseFulfillItems(db, warehouseId, items) {
+  for (const item of items) {
+    const [inventoryRows] = await executeSoftDeleteAware(
+      db,
+      `SELECT current_stock, reserved_stock
+       FROM inventories
+       WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0
+       LIMIT 1`,
+      [item.product_id, warehouseId],
+      `SELECT current_stock, reserved_stock
+       FROM inventories
+       WHERE product_id = ? AND warehouse_id = ?
+       LIMIT 1`
+    );
+
+    const availableQty = inventoryRows.length > 0
+      ? Number(inventoryRows[0].current_stock || 0) - Number(inventoryRows[0].reserved_stock || 0)
+      : 0;
+
+    if (availableQty < item.quantity) {
+      return {
+        ok: false,
+        productName: item.name,
+        availableQty,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+async function resolvePublicFulfillmentRoute(db, items) {
+  const candidates = await listPublicFulfillmentCandidates(db);
+  if (candidates.length === 0) {
+    throw ApiError.serviceUnavailable('No available Stockist to handle this order');
+  }
+
+  let firstShortage = null;
+
+  for (const candidate of candidates) {
+    const fulfillmentCheck = await canWarehouseFulfillItems(db, candidate.warehouse_id, items);
+    if (fulfillmentCheck.ok) {
+      return candidate;
+    }
+
+    if (!firstShortage) {
+      firstShortage = fulfillmentCheck;
+    }
+  }
+
+  if (firstShortage) {
+    throw ApiError.badRequest(
+      `Insufficient stock for ${firstShortage.productName || 'product'} (available: ${firstShortage.availableQty || 0})`
+    );
+  }
+
+  throw ApiError.serviceUnavailable('No available Stockist can fulfill this order right now');
+}
+
 // ─── Helper: notify users of a partner ───────────────────────────────────────
 async function notifyPartnerUsers(conn, partnerId, type, title, message, entityId) {
   const [users] = await executeSoftDeleteAware(
@@ -319,6 +429,42 @@ function getPublicOrderUnitPrice(product) {
   }
 
   throw ApiError.badRequest('Product price is unavailable');
+}
+
+function buildBankDetailsString(bankAccount) {
+  if (!bankAccount) {
+    return null;
+  }
+
+  return `${bankAccount.bank_name} - ${bankAccount.account_name} - ${bankAccount.account_number}`;
+}
+
+function buildPublicPaymentContext({
+  orderNumber,
+  totalAmount,
+  merchandiseSubtotal = null,
+  shippingFee = null,
+  systemFee = null,
+  bankAccount,
+  paymentDeadline,
+  paymentProofUploadedAt = null,
+  paymentStatus = 'pending',
+}) {
+  return {
+    order_number: orderNumber,
+    total_amount: Number(totalAmount || 0),
+    merchandise_subtotal: merchandiseSubtotal == null ? null : Number(merchandiseSubtotal || 0),
+    shipping_fee: shippingFee == null ? null : Number(shippingFee || 0),
+    system_fee: systemFee == null ? null : Number(systemFee || 0),
+    payment_status: paymentStatus || 'pending',
+    payment_deadline: paymentDeadline || null,
+    payment_proof_uploaded_at: paymentProofUploadedAt || null,
+    bank_account: bankAccount ? {
+      bank_name: bankAccount.bank_name,
+      account_name: bankAccount.account_name,
+      account_number: bankAccount.account_number,
+    } : null,
+  };
 }
 
 // GET /api/v1/orders
@@ -472,6 +618,9 @@ const createOrder = asyncHandler(async (req, res) => {
 
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
+    const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
+    const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    assertBankAccountAvailable(bankAccount);
 
     // Check available stock if source warehouse known
     if (sourceWarehouseId) {
@@ -610,64 +759,12 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
 
-  // Auto-assign nearest stockist (city or provincial) based on customer address
-  // For now, assign the first available city/provincial stockist
-  // In production this uses ST_Distance_Sphere on warehouse coordinates
-  let nearestPartner;
-  try {
-    [nearestPartner] = await executeSoftDeleteAware(
-      pool,
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0
-       LIMIT 1`,
-      [],
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       LIMIT 1`
-    );
-  } catch (err) {
-    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
-      throw err;
-    }
-
-    [nearestPartner] = await executeSoftDeleteAware(
-      pool,
-      `SELECT p.id AS partner_id, i.warehouse_id
-       FROM partners p
-       JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
-       JOIN warehouses w ON w.id = i.warehouse_id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0
-       GROUP BY p.id, i.warehouse_id
-       ORDER BY MIN(i.id)
-       LIMIT 1`,
-      [],
-      `SELECT p.id AS partner_id, i.warehouse_id
-       FROM partners p
-       JOIN inventories i ON i.partner_id = p.id
-       JOIN warehouses w ON w.id = i.warehouse_id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       GROUP BY p.id, i.warehouse_id
-       ORDER BY MIN(i.id)
-       LIMIT 1`
-    );
-  }
-
-  if (nearestPartner.length === 0) throw ApiError.serviceUnavailable('No available Stockist to handle this order');
-
-  const { partner_id: partnerId, warehouse_id: sourceWarehouseId } = nearestPartner[0];
-
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
-    let totalAmount = 0;
+    let merchandiseSubtotal = 0;
     const resolvedItems = [];
 
     for (const item of items) {
@@ -685,30 +782,22 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
       const price = getPublicOrderUnitPrice(products[0]);
       resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
-      totalAmount += quantity * price;
+      merchandiseSubtotal += quantity * price;
     }
+
+    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal);
+    const totalAmount = pricingTotals.totalDue;
+
+    const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems);
+    const partnerId = fulfillmentRoute.partner_id;
+    const sourceWarehouseId = fulfillmentRoute.warehouse_id;
 
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
-
-    if (sourceWarehouseId) {
-      for (const item of resolvedItems) {
-        const [inv] = await executeSoftDeleteAware(
-          conn,
-          `SELECT current_stock, reserved_stock FROM inventories
-           WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
-          [item.product_id, sourceWarehouseId],
-          `SELECT current_stock, reserved_stock FROM inventories
-           WHERE product_id = ? AND warehouse_id = ?`
-        );
-        const available = inv.length > 0 ? Number(inv[0].current_stock || 0) - Number(inv[0].reserved_stock || 0) : 0;
-        if (available < item.quantity) {
-          throw ApiError.badRequest(`Insufficient stock for ${item.name} (available: ${available})`);
-        }
-      }
-    }
-
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
+    const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
+    const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    assertBankAccountAvailable(bankAccount);
 
     let orderResult;
     try {
@@ -818,12 +907,49 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       }
     }
 
+    const partnerUsers = await notifyPartnerUsers(
+      conn,
+      partnerId,
+      'public_order_placed',
+      `Public Order Placed: #${orderNumber}`,
+      `Public storefront order #${orderNumber} is placed and awaiting review.`,
+      orderId
+    );
+    const admins = await notifySuperAdmins(
+      conn,
+      'public_order_placed',
+      `Public Order Placed: #${orderNumber}`,
+      `Public storefront order #${orderNumber} is placed and awaiting review.`,
+      orderId
+    );
+
     await conn.commit();
+
+    for (const pu of partnerUsers) {
+      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
+      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+    }
+    for (const admin of admins) {
+      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
 
     res.status(201).json({
       success: true,
-      message: 'Order placed successfully. You will be contacted shortly.',
-      data: { order_number: orderNumber, total_amount: totalAmount },
+      message: 'Order placed successfully. Complete your bank transfer and upload your payment proof.',
+      data: {
+        order_number: orderNumber,
+        total_amount: totalAmount,
+        payment: buildPublicPaymentContext({
+          orderNumber,
+          totalAmount,
+          merchandiseSubtotal: pricingTotals.merchandiseSubtotal,
+          shippingFee: pricingTotals.shippingFee,
+          systemFee: pricingTotals.systemFee,
+          bankAccount,
+          paymentDeadline: paymentDeadline.toISOString(),
+        }),
+      },
     });
   } catch (err) {
     await conn.rollback();
@@ -1109,6 +1235,73 @@ const uploadPaymentProof = asyncHandler(async (req, res) => {
   }
 });
 
+const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
+  const { order_number, customer_phone } = req.body;
+
+  if (!order_number || !customer_phone) {
+    throw ApiError.badRequest('order_number and customer_phone are required');
+  }
+  if (!req.file) {
+    throw ApiError.badRequest('Payment proof file is required');
+  }
+
+  const normalizedOrderNumber = String(order_number).trim().toUpperCase();
+  const [orders] = await pool.execute(
+    `SELECT id, order_number, partner_id, status, payment_status, customer_name
+     FROM orders
+     WHERE order_number = ?
+       AND customer_phone = ?
+       AND placed_by_type = 'public'
+       AND is_deleted = 0
+     LIMIT 1`,
+    [normalizedOrderNumber, customer_phone]
+  );
+
+  if (orders.length === 0) throw ApiError.notFound('Public order not found');
+  if (!['approved', 'delivering'].includes(orders[0].status)) {
+    throw ApiError.badRequest('This order is not ready for payment proof upload');
+  }
+  if (orders[0].payment_status === 'paid') {
+    throw ApiError.badRequest('Payment has already been verified for this order');
+  }
+
+  const proofUrl = req.file.path;
+  const orderId = orders[0].id;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ?`,
+      [proofUrl, orderId]
+    );
+
+    const admins = await notifySuperAdmins(
+      conn, 'payment_proof_uploaded',
+      `Payment Proof: #${orders[0].order_number}`,
+      `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`,
+      orderId
+    );
+    await conn.commit();
+
+    for (const admin of admins) {
+      const tmpl = EMAIL.paymentProofUploaded(orders[0].order_number, orders[0].customer_name || 'Public customer');
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment proof uploaded. We will verify your payment shortly.',
+      data: { payment_proof_url: proofUrl },
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 // PATCH /api/v1/orders/:id/verify-payment — super_admin verifies payment proof
 const verifyPayment = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
@@ -1162,6 +1355,7 @@ module.exports = {
   getOrder,
   createOrder,
   createPublicOrder,
+  uploadPublicPaymentProof,
   approveOrder,
   rejectOrder,
   cancelOrder,

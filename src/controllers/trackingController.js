@@ -5,6 +5,7 @@ const { ROLES, canonicalRole } = require('../rbac/roles');
 const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
 const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
 const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
+const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -149,6 +150,10 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 
   const [rows] = await pool.execute(
     `SELECT o.status AS order_status,
+            o.payment_status,
+            o.payment_proof_uploaded_at,
+            o.total_amount,
+            o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status,
             dt.est_delivery_at,
             c.name AS courier_name
@@ -164,6 +169,9 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 
   const row = rows[0];
   const latestPing = row.tracking_id ? await getLatestPingByTrackingId(row.tracking_id) : null;
+  const bankAccount = !['cancelled', 'rejected'].includes(row.order_status) && row.payment_status !== 'paid'
+    ? await getBankAccountForWarehouseOrDefault(pool, row.source_warehouse_id || null)
+    : null;
   const gps = latestPing
     ? {
         latitude: latestPing.latitude,
@@ -178,6 +186,14 @@ const getPublicTracking = asyncHandler(async (req, res) => {
     success: true,
     data: {
       status: normalizePublicStatus(row.order_status, row.tracking_status),
+      payment_status: row.payment_status || 'pending',
+      payment_proof_uploaded_at: row.payment_proof_uploaded_at || null,
+      total_amount: Number(row.total_amount || 0),
+      bank_account: bankAccount ? {
+        bank_name: bankAccount.bank_name,
+        account_name: bankAccount.account_name,
+        account_number: bankAccount.account_number,
+      } : null,
       courier: row.courier_name || null,
       gps,
       eta: row.est_delivery_at || null,
