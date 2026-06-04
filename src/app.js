@@ -198,12 +198,17 @@ app.use((err, req, res, next) => {
   const statusCode = err.statusCode || 500;
   const message = err.message || 'Internal server error';
 
-  if (env.NODE_ENV !== 'production') {
-    if (statusCode >= 500) {
-      console.error('[Error]', err);
-    } else {
-      console.warn(`[HTTP ${statusCode}] ${message}`);
-    }
+  if (statusCode >= 500) {
+    console.error('[HTTP 5xx]', {
+      request_id: req.requestId || null,
+      method: req.method,
+      url: req.originalUrl,
+      status: statusCode,
+      message,
+      stack: err.stack,
+    });
+  } else if (env.NODE_ENV !== 'production') {
+    console.warn(`[HTTP ${statusCode}] ${message}`);
   }
 
   res.status(statusCode).json({
