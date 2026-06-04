@@ -4,6 +4,8 @@ const ApiError = require('../utils/ApiError');
 const { ROLES, canonicalRole } = require('../rbac/roles');
 const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
 const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
+const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
+const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -39,18 +41,8 @@ function normalizePublicStatus(orderStatus, trackingStatus) {
   return orderStatus || trackingStatus || 'pending';
 }
 
-function scopedOrderPredicate(user, orderAlias = 'o') {
-  const role = canonicalRole(user?.role_slug);
-
-  if (role === ROLES.SUPER_ADMIN) {
-    return { clause: '', params: [] };
-  }
-
-  if (!user?.partner_id) {
-    return { clause: ' AND 1 = 0', params: [] };
-  }
-
-  return { clause: ` AND ${orderAlias}.partner_id = ?`, params: [user.partner_id] };
+function scopedOrderPredicate(affiliationContext, orderAlias = 'o') {
+  return buildOrderScopeFromContext(affiliationContext, { orderAlias });
 }
 
 async function fetchWarehouseRowsByIds(ids) {
@@ -128,7 +120,8 @@ async function fetchPrimaryWarehouseRowsByPartnerIds(partnerIds) {
 // GET /api/v1/tracking/:orderId
 const getTracking = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
-  const scope = scopedOrderPredicate(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = scopedOrderPredicate(affiliationContext);
 
   const [rows] = await pool.execute(
     `SELECT dt.id, dt.order_id, dt.transfer_id, dt.rider_user_id, dt.status,
@@ -157,6 +150,10 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 
   const [rows] = await pool.execute(
     `SELECT o.status AS order_status,
+            o.payment_status,
+            o.payment_proof_uploaded_at,
+            o.total_amount,
+            o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status,
             dt.est_delivery_at,
             c.name AS courier_name
@@ -172,6 +169,9 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 
   const row = rows[0];
   const latestPing = row.tracking_id ? await getLatestPingByTrackingId(row.tracking_id) : null;
+  const bankAccount = !['cancelled', 'rejected'].includes(row.order_status) && row.payment_status !== 'paid'
+    ? await getBankAccountForWarehouseOrDefault(pool, row.source_warehouse_id || null)
+    : null;
   const gps = latestPing
     ? {
         latitude: latestPing.latitude,
@@ -186,6 +186,14 @@ const getPublicTracking = asyncHandler(async (req, res) => {
     success: true,
     data: {
       status: normalizePublicStatus(row.order_status, row.tracking_status),
+      payment_status: row.payment_status || 'pending',
+      payment_proof_uploaded_at: row.payment_proof_uploaded_at || null,
+      total_amount: Number(row.total_amount || 0),
+      bank_account: bankAccount ? {
+        bank_name: bankAccount.bank_name,
+        account_name: bankAccount.account_name,
+        account_number: bankAccount.account_number,
+      } : null,
       courier: row.courier_name || null,
       gps,
       eta: row.est_delivery_at || null,
@@ -196,7 +204,8 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 // GET /api/v1/tracking/:orderId/pings
 const getOrderPings = asyncHandler(async (req, res) => {
   const { orderId } = req.params;
-  const scope = scopedOrderPredicate(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = scopedOrderPredicate(affiliationContext);
 
   const [rows] = await pool.execute(
     `SELECT gp.id,
@@ -219,7 +228,8 @@ const getOrderPings = asyncHandler(async (req, res) => {
 
 // GET /api/v1/tracking/active
 const getActiveTracking = asyncHandler(async (req, res) => {
-  const scope = buildActiveTrackingScope({ user: req.user, orderAlias: 'o' });
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildActiveTrackingScope({ affiliationContext, orderAlias: 'o' });
 
   const [rows] = await pool.execute(
     `SELECT dt.id AS tracking_id,
@@ -450,7 +460,8 @@ const postPingByToken = asyncHandler(async (req, res) => {
 const postPing = asyncHandler(async (req, res) => {
   const { tracking_id, lat, lng, speed_kmh, accuracy_meters } = req.body;
   const trackingId = tracking_id || req.params.trackingId;
-  const scope = scopedOrderPredicate(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = scopedOrderPredicate(affiliationContext);
 
   if (!trackingId) {
     throw ApiError.badRequest('Tracking ID is required');
@@ -477,7 +488,8 @@ const postPing = asyncHandler(async (req, res) => {
 const updateTrackingStatus = asyncHandler(async (req, res) => {
   const { status, rider_name, rider_user_id, est_delivery_at } = req.body;
   const trackingId = req.params.trackingId;
-  const scope = scopedOrderPredicate(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = scopedOrderPredicate(affiliationContext);
 
   if (status === 'delivered') {
     throw ApiError.badRequest('Use the courier proof-of-delivery link to mark an order delivered');
@@ -519,7 +531,8 @@ const updateTrackingStatus = asyncHandler(async (req, res) => {
 // POST /api/v1/tracking (create tracking record)
 const createTracking = asyncHandler(async (req, res) => {
   const { order_id, transfer_id, rider_user_id, rider_name, est_delivery_at } = req.body;
-  const scope = scopedOrderPredicate(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = scopedOrderPredicate(affiliationContext);
   const isNational = canonicalRole(req.user?.role_slug) === ROLES.SUPER_ADMIN;
 
   // Verify order exists

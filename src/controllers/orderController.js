@@ -9,6 +9,17 @@ const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { createPendingSettlementForOrder } = require('./settlementController');
+const {
+  getBankAccountForWarehouseOrDefault,
+  assertBankAccountAvailable,
+} = require('../services/bankAccountResolver');
+const { getPublicOrderPricingTotals } = require('../services/publicCheckoutPricing');
+const {
+  resolveAffiliationContext,
+  buildOrderScopeFromContext,
+  canApproveOrderFromContext,
+  canVerifyPaymentFromContext,
+} = require('../rbac/affiliationScopes');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -69,6 +80,34 @@ async function getOrderItemsWithOptionalSourceColumn(db, orderId) {
     }
     throw err;
   }
+}
+
+async function getPublicOrderPlacedByUserId(db) {
+  const [rows] = await executeSoftDeleteAware(
+    db,
+    `SELECT u.id
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin'
+       AND u.status = 'active'
+       AND u.is_deleted = 0
+     ORDER BY u.id ASC
+     LIMIT 1`,
+    [],
+    `SELECT u.id
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE r.slug = 'super_admin'
+       AND u.status = 'active'
+     ORDER BY u.id ASC
+     LIMIT 1`
+  );
+
+  if (rows.length === 0) {
+    throw ApiError.serviceUnavailable('No active super admin is available to own public orders');
+  }
+
+  return rows[0].id;
 }
 
 async function reserveInventoryOrThrow(conn, { productId, warehouseId, quantity, productName }) {
@@ -190,6 +229,111 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
+async function listPublicFulfillmentCandidates(db) {
+  try {
+    const [rows] = await executeSoftDeleteAware(
+      db,
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+         AND p.is_deleted = 0 AND w.is_deleted = 0
+       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`,
+      [],
+      `SELECT p.id AS partner_id, w.id AS warehouse_id
+       FROM partners p
+       JOIN warehouses w ON w.partner_id = p.id
+       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`
+    );
+    return rows;
+  } catch (err) {
+    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
+      throw err;
+    }
+  }
+
+  const [rows] = await executeSoftDeleteAware(
+    db,
+    `SELECT p.id AS partner_id, i.warehouse_id
+     FROM partners p
+     JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
+     JOIN warehouses w ON w.id = i.warehouse_id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+       AND p.is_deleted = 0 AND w.is_deleted = 0
+     GROUP BY p.id, i.warehouse_id
+     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`,
+    [],
+    `SELECT p.id AS partner_id, i.warehouse_id
+     FROM partners p
+     JOIN inventories i ON i.partner_id = p.id
+     JOIN warehouses w ON w.id = i.warehouse_id
+     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
+     GROUP BY p.id, i.warehouse_id
+     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`
+  );
+  return rows;
+}
+
+async function canWarehouseFulfillItems(db, warehouseId, items) {
+  for (const item of items) {
+    const [inventoryRows] = await executeSoftDeleteAware(
+      db,
+      `SELECT current_stock, reserved_stock
+       FROM inventories
+       WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0
+       LIMIT 1`,
+      [item.product_id, warehouseId],
+      `SELECT current_stock, reserved_stock
+       FROM inventories
+       WHERE product_id = ? AND warehouse_id = ?
+       LIMIT 1`
+    );
+
+    const availableQty = inventoryRows.length > 0
+      ? Number(inventoryRows[0].current_stock || 0) - Number(inventoryRows[0].reserved_stock || 0)
+      : 0;
+
+    if (availableQty < item.quantity) {
+      return {
+        ok: false,
+        productName: item.name,
+        availableQty,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+async function resolvePublicFulfillmentRoute(db, items) {
+  const candidates = await listPublicFulfillmentCandidates(db);
+  if (candidates.length === 0) {
+    throw ApiError.serviceUnavailable('No available Stockist to handle this order');
+  }
+
+  let firstShortage = null;
+
+  for (const candidate of candidates) {
+    const fulfillmentCheck = await canWarehouseFulfillItems(db, candidate.warehouse_id, items);
+    if (fulfillmentCheck.ok) {
+      return candidate;
+    }
+
+    if (!firstShortage) {
+      firstShortage = fulfillmentCheck;
+    }
+  }
+
+  if (firstShortage) {
+    throw ApiError.badRequest(
+      `Insufficient stock for ${firstShortage.productName || 'product'} (available: ${firstShortage.availableQty || 0})`
+    );
+  }
+
+  throw ApiError.serviceUnavailable('No available Stockist can fulfill this order right now');
+}
+
 // ─── Helper: notify users of a partner ───────────────────────────────────────
 async function notifyPartnerUsers(conn, partnerId, type, title, message, entityId) {
   const [users] = await executeSoftDeleteAware(
@@ -235,32 +379,20 @@ async function notifySuperAdmins(conn, type, title, message, entityId) {
 
 function buildOrderScope(user, {
   orderAlias = 'o',
+  affiliationContext = null,
+  placedByRoleAlias = null,
 } = {}) {
-  const orderRef = orderAlias ? `${orderAlias}.` : '';
-
-  if (user?.role_slug === 'super_admin') {
-    return { clause: '', params: [] };
-  }
-
-  if (user?.role_slug === 'mobile_stockist') {
-    if (!user?.id) {
-      return { clause: ' AND 1 = 0', params: [] };
-    }
-
-    return {
-      clause: ` AND ${orderRef}placed_by = ?`,
-      params: [user.id],
-    };
-  }
-
-  if (!user?.partner_id) {
-    return { clause: ' AND 1 = 0', params: [] };
-  }
-
-  return {
-    clause: ` AND ${orderRef}partner_id = ?`,
-    params: [user.partner_id],
+  const context = affiliationContext || {
+    role: user?.role_slug,
+    userId: user?.id,
+    partnerId: user?.partner_id,
+    partnerLevel: user?.role_slug === 'provincial_stockist' || user?.role_slug === 'city_stockist'
+      ? user?.role_slug
+      : null,
+    childCityPartnerIds: [],
   };
+
+  return buildOrderScopeFromContext(context, { orderAlias, placedByRoleAlias });
 }
 
 function normalizeOrderPaymentMethod(paymentMethod) {
@@ -275,10 +407,79 @@ function normalizeOrderPaymentMethod(paymentMethod) {
   throw ApiError.badRequest('Bank transfer is the only supported payment method');
 }
 
+function getPublicOrderUnitPrice(product) {
+  const retailPrice = product?.retail_price == null || product?.retail_price === ''
+    ? null
+    : Number(product.retail_price);
+  if (Number.isFinite(retailPrice) && retailPrice >= 0) {
+    return retailPrice;
+  }
+
+  const price = product?.price == null || product?.price === ''
+    ? null
+    : Number(product.price);
+  if (Number.isFinite(price) && price >= 0) {
+    return price;
+  }
+
+  const partnerPrice = product?.partner_price == null || product?.partner_price === ''
+    ? null
+    : Number(product.partner_price);
+  if (Number.isFinite(partnerPrice) && partnerPrice >= 0) {
+    return partnerPrice;
+  }
+
+  throw ApiError.badRequest('Product price is unavailable');
+}
+
+function buildBankDetailsString(bankAccount) {
+  if (!bankAccount) {
+    return null;
+  }
+
+  return `${bankAccount.bank_name} - ${bankAccount.account_name} - ${bankAccount.account_number}`;
+}
+
+function normalizePhoneForLookup(value) {
+  return String(value || '').replace(/\D+/g, '');
+}
+
+function buildPublicPaymentContext({
+  orderNumber,
+  totalAmount,
+  merchandiseSubtotal = null,
+  shippingFee = null,
+  systemFee = null,
+  bankAccount,
+  paymentDeadline,
+  paymentProofUploadedAt = null,
+  paymentStatus = 'pending',
+}) {
+  return {
+    order_number: orderNumber,
+    total_amount: Number(totalAmount || 0),
+    merchandise_subtotal: merchandiseSubtotal == null ? null : Number(merchandiseSubtotal || 0),
+    shipping_fee: shippingFee == null ? null : Number(shippingFee || 0),
+    system_fee: systemFee == null ? null : Number(systemFee || 0),
+    payment_status: paymentStatus || 'pending',
+    payment_deadline: paymentDeadline || null,
+    payment_proof_uploaded_at: paymentProofUploadedAt || null,
+    bank_account: bankAccount ? {
+      bank_name: bankAccount.bank_name,
+      account_name: bankAccount.account_name,
+      account_number: bankAccount.account_number,
+    } : null,
+  };
+}
+
 // GET /api/v1/orders
 const getOrders = asyncHandler(async (req, res) => {
   const { page, limit, status, payment_status, search } = req.query;
-  const scope = buildOrderScope(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, {
+    affiliationContext,
+    placedByRoleAlias: 'ur',
+  });
   const params = [];
   let where = `WHERE o.is_deleted = 0${scope.clause}`;
   params.push(...scope.params);
@@ -294,7 +495,14 @@ const getOrders = asyncHandler(async (req, res) => {
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
            o.placed_by, u.name AS placed_by_name, u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
            o.status, o.payment_status,
-           o.total_amount, o.payment_deadline, o.payment_proof_url, o.cod_amount,
+           o.total_amount, o.payment_deadline, o.payment_proof_url, o.payment_proof_uploaded_at, o.cod_amount,
+           EXISTS(
+             SELECT 1
+             FROM delivery_tokens dt
+             WHERE dt.order_id = o.id
+               AND dt.is_used = 0
+               AND dt.expires_at > NOW()
+           ) AS has_active_delivery_link,
            o.placed_by_type, o.customer_name,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
@@ -331,7 +539,8 @@ const getOrders = asyncHandler(async (req, res) => {
 
 // GET /api/v1/orders/:id
 const getOrder = asyncHandler(async (req, res) => {
-  const scope = buildOrderScope(req.user);
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { affiliationContext });
   const params = [req.params.id, ...scope.params];
   const where = `WHERE o.id = ? AND o.is_deleted = 0${scope.clause}`;
 
@@ -421,6 +630,9 @@ const createOrder = asyncHandler(async (req, res) => {
 
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
+    const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
+    const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    assertBankAccountAvailable(bankAccount);
 
     // Check available stock if source warehouse known
     if (sourceWarehouseId) {
@@ -559,63 +771,12 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
 
-  // Auto-assign nearest stockist (city or provincial) based on customer address
-  // For now, assign the first available city/provincial stockist
-  // In production this uses ST_Distance_Sphere on warehouse coordinates
-  let nearestPartner;
-  try {
-    [nearestPartner] = await executeSoftDeleteAware(
-      pool,
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0
-       LIMIT 1`,
-      [],
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       LIMIT 1`
-    );
-  } catch (err) {
-    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
-      throw err;
-    }
-
-    [nearestPartner] = await executeSoftDeleteAware(
-      pool,
-      `SELECT p.id AS partner_id, i.warehouse_id
-       FROM partners p
-       JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
-       JOIN warehouses w ON w.id = i.warehouse_id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0
-       GROUP BY p.id, i.warehouse_id
-       ORDER BY MIN(i.id)
-       LIMIT 1`,
-      [],
-      `SELECT p.id AS partner_id, i.warehouse_id
-       FROM partners p
-       JOIN inventories i ON i.partner_id = p.id
-       JOIN warehouses w ON w.id = i.warehouse_id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       GROUP BY p.id, i.warehouse_id
-       ORDER BY MIN(i.id)
-       LIMIT 1`
-    );
-  }
-
-  if (nearestPartner.length === 0) throw ApiError.serviceUnavailable('No available Stockist to handle this order');
-
-  const { partner_id: partnerId, warehouse_id: sourceWarehouseId } = nearestPartner[0];
-
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
-    let totalAmount = 0;
+    let merchandiseSubtotal = 0;
     const resolvedItems = [];
 
     for (const item of items) {
@@ -626,46 +787,38 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 
       const [products] = await executeSoftDeleteAware(
         conn,
-        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
+        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
         [item.product_id],
-        'SELECT id, name, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
+        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
       );
       if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
-      const price = parseFloat(products[0].partner_price);
+      const price = getPublicOrderUnitPrice(products[0]);
       resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
-      totalAmount += quantity * price;
+      merchandiseSubtotal += quantity * price;
     }
+
+    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal);
+    const totalAmount = pricingTotals.totalDue;
+
+    const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems);
+    const partnerId = fulfillmentRoute.partner_id;
+    const sourceWarehouseId = fulfillmentRoute.warehouse_id;
 
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
-
-    if (sourceWarehouseId) {
-      for (const item of resolvedItems) {
-        const [inv] = await executeSoftDeleteAware(
-          conn,
-          `SELECT current_stock, reserved_stock FROM inventories
-           WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
-          [item.product_id, sourceWarehouseId],
-          `SELECT current_stock, reserved_stock FROM inventories
-           WHERE product_id = ? AND warehouse_id = ?`
-        );
-        const available = inv.length > 0 ? Number(inv[0].current_stock || 0) - Number(inv[0].reserved_stock || 0) : 0;
-        if (available < item.quantity) {
-          throw ApiError.badRequest(`Insufficient stock for ${item.name} (available: ${available})`);
-        }
-      }
-    }
-
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
+    const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
+    const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    assertBankAccountAvailable(bankAccount);
 
     let orderResult;
     try {
       [orderResult] = await conn.execute(
-        `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+        `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
                              customer_name, customer_phone, customer_email, customer_address, cod_amount,
                              total_amount, notes)
-         VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
          customer_email || null, customer_address, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
@@ -673,22 +826,22 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       if (isMissingColumn(err, 'cod_amount')) {
         try {
           [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by_type, source_warehouse_id,
+            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
                                  customer_name, customer_phone, customer_email, customer_address,
                                  total_amount, notes)
-             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, sourceWarehouseId, customer_name, customer_phone || null,
+             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
              customer_email || null, customer_address, totalAmount, notes || null]
           );
         } catch (innerErr) {
           if (isMissingColumn(innerErr, 'source_warehouse_id')) {
             try {
               [orderResult] = await conn.execute(
-                `INSERT INTO orders (order_number, partner_id, placed_by_type,
+                `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
                                      customer_name, customer_phone, customer_email, customer_address,
                                      total_amount, notes)
-                 VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-                [orderNumber, partnerId, customer_name, customer_phone || null,
+                 VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+                [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
                  customer_email || null, customer_address, totalAmount, notes || null]
               );
             } catch (legacyErr) {
@@ -705,11 +858,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       } else if (isMissingColumn(err, 'source_warehouse_id')) {
         try {
           [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by_type,
+            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
                                  customer_name, customer_phone, customer_email, customer_address,
                                  total_amount, notes)
-             VALUES (?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, customer_name, customer_phone || null,
+             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
              customer_email || null, customer_address, totalAmount, notes || null]
           );
         } catch (innerErr) {
@@ -766,12 +919,49 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       }
     }
 
+    const partnerUsers = await notifyPartnerUsers(
+      conn,
+      partnerId,
+      'public_order_placed',
+      `Public Order Placed: #${orderNumber}`,
+      `Public storefront order #${orderNumber} is placed and awaiting review.`,
+      orderId
+    );
+    const admins = await notifySuperAdmins(
+      conn,
+      'public_order_placed',
+      `Public Order Placed: #${orderNumber}`,
+      `Public storefront order #${orderNumber} is placed and awaiting review.`,
+      orderId
+    );
+
     await conn.commit();
+
+    for (const pu of partnerUsers) {
+      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
+      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+    }
+    for (const admin of admins) {
+      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
 
     res.status(201).json({
       success: true,
-      message: 'Order placed successfully. You will be contacted shortly.',
-      data: { order_number: orderNumber, total_amount: totalAmount },
+      message: 'Order placed successfully. Complete your bank transfer and upload your payment proof.',
+      data: {
+        order_number: orderNumber,
+        total_amount: totalAmount,
+        payment: buildPublicPaymentContext({
+          orderNumber,
+          totalAmount,
+          merchandiseSubtotal: pricingTotals.merchandiseSubtotal,
+          shippingFee: pricingTotals.shippingFee,
+          systemFee: pricingTotals.systemFee,
+          bankAccount,
+          paymentDeadline: paymentDeadline.toISOString(),
+        }),
+      },
     });
   } catch (err) {
     await conn.rollback();
@@ -785,13 +975,23 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
-  const orders = await getOrderRowsWithOptionalSourceColumn(
-    pool,
-    'WHERE id = ? AND is_deleted = 0',
+  const [orders] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be approved');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (!canApproveOrderFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to approve this order');
+  }
 
   let sourceWarehouseId = orders[0].source_warehouse_id || null;
   if (!sourceWarehouseId) {
@@ -857,13 +1057,23 @@ const rejectOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const orders = await getOrderRowsWithOptionalSourceColumn(
-    pool,
-    'WHERE id = ? AND is_deleted = 0',
+  const [orders] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'pending') throw ApiError.badRequest('Only pending orders can be rejected');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (!canApproveOrderFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to reject this order');
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -927,7 +1137,8 @@ const cancelOrder = asyncHandler(async (req, res) => {
   const { reason } = req.body;
   const orderId = req.params.id;
 
-  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { orderAlias: '', affiliationContext });
   const params = [orderId, ...scope.params];
 
   const orders = await getOrderRowsWithOptionalSourceColumn(
@@ -989,7 +1200,8 @@ const uploadPaymentProof = asyncHandler(async (req, res) => {
 
   if (!req.file) throw ApiError.badRequest('Payment proof file is required');
 
-  const scope = buildOrderScope(req.user, { orderAlias: '' });
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const scope = buildOrderScope(req.user, { orderAlias: '', affiliationContext });
   const params = [orderId, ...scope.params];
 
   const [orders] = await pool.execute(
@@ -1035,17 +1247,99 @@ const uploadPaymentProof = asyncHandler(async (req, res) => {
   }
 });
 
+const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
+  const { order_number, customer_phone } = req.body;
+
+  if (!order_number || !customer_phone) {
+    throw ApiError.badRequest('order_number and customer_phone are required');
+  }
+  if (!req.file) {
+    throw ApiError.badRequest('Payment proof file is required');
+  }
+
+  const normalizedOrderNumber = String(order_number).trim().toUpperCase();
+  const [orders] = await pool.execute(
+    `SELECT id, order_number, partner_id, status, payment_status, customer_name, customer_phone
+     FROM orders
+     WHERE order_number = ?
+       AND placed_by_type = 'public'
+       AND is_deleted = 0
+     LIMIT 1`,
+    [normalizedOrderNumber]
+  );
+
+  if (orders.length === 0) throw ApiError.notFound('Public order not found for this order number');
+
+  const providedPhone = normalizePhoneForLookup(customer_phone);
+  const storedPhone = normalizePhoneForLookup(orders[0].customer_phone);
+  if (!providedPhone || !storedPhone || providedPhone !== storedPhone) {
+    throw ApiError.badRequest('The phone number does not match the public order record');
+  }
+  if (['cancelled', 'rejected'].includes(String(orders[0].status || '').toLowerCase())) {
+    throw ApiError.badRequest('This order is closed and can no longer accept payment proof');
+  }
+  if (orders[0].payment_status === 'paid') {
+    throw ApiError.badRequest('Payment has already been verified for this order');
+  }
+
+  const proofUrl = req.file.path;
+  const orderId = orders[0].id;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ?`,
+      [proofUrl, orderId]
+    );
+
+    const admins = await notifySuperAdmins(
+      conn, 'payment_proof_uploaded',
+      `Payment Proof: #${orders[0].order_number}`,
+      `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`,
+      orderId
+    );
+    await conn.commit();
+
+    for (const admin of admins) {
+      const tmpl = EMAIL.paymentProofUploaded(orders[0].order_number, orders[0].customer_name || 'Public customer');
+      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment proof uploaded. We will verify your payment shortly.',
+      data: { payment_proof_url: proofUrl },
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 // PATCH /api/v1/orders/:id/verify-payment — super_admin verifies payment proof
 const verifyPayment = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    'SELECT id, order_number, partner_id, status, payment_proof_url, total_amount FROM orders WHERE id = ? AND is_deleted = 0',
+    `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_proof_url, o.total_amount,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0`,
     [orderId]
   );
   if (orders.length === 0) throw ApiError.notFound('Order not found');
   if (orders[0].status !== 'approved') throw ApiError.badRequest('Order must be in approved status');
   if (!orders[0].payment_proof_url) throw ApiError.badRequest('No payment proof has been uploaded');
+
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (req.user.role_slug !== 'super_admin' && !canVerifyPaymentFromContext(affiliationContext, orders[0])) {
+    throw ApiError.forbidden('You do not have permission to verify payment for this order');
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -1088,6 +1382,7 @@ module.exports = {
   getOrder,
   createOrder,
   createPublicOrder,
+  uploadPublicPaymentProof,
   approveOrder,
   rejectOrder,
   cancelOrder,
@@ -1095,6 +1390,8 @@ module.exports = {
   verifyPayment,
   __testables: {
     buildOrderScope,
+    getPublicOrderPlacedByUserId,
+    getPublicOrderUnitPrice,
     normalizeOrderPaymentMethod,
   },
 };

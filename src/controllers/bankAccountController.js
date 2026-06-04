@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const { ROLES, canonicalRole } = require('../rbac/roles');
+const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -174,32 +175,7 @@ const getBankAccountForOrder = asyncHandler(async (req, res) => {
     }
   }
 
-  let bank = null;
-
-  if (warehouseId) {
-    const [banks] = await executeSoftDeleteAware(
-      pool,
-      `SELECT bank_name, account_name, account_number FROM bank_accounts
-       WHERE warehouse_id = ? AND is_active = 1 AND is_deleted = 0 ORDER BY is_default DESC LIMIT 1`,
-      [warehouseId],
-      `SELECT bank_name, account_name, account_number FROM bank_accounts
-       WHERE warehouse_id = ? AND is_active = 1 ORDER BY is_default DESC LIMIT 1`
-    );
-    if (banks.length > 0) bank = banks[0];
-  }
-
-  // Fallback: company default account
-  if (!bank) {
-    const [defaults] = await executeSoftDeleteAware(
-      pool,
-      `SELECT bank_name, account_name, account_number FROM bank_accounts
-       WHERE is_default = 1 AND is_active = 1 AND is_deleted = 0 LIMIT 1`,
-      [],
-      `SELECT bank_name, account_name, account_number FROM bank_accounts
-       WHERE is_default = 1 AND is_active = 1 LIMIT 1`
-    );
-    if (defaults.length > 0) bank = defaults[0];
-  }
+  const bank = await getBankAccountForWarehouseOrDefault(pool, warehouseId);
 
   res.json({ success: true, data: bank });
 });

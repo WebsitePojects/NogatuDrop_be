@@ -6,49 +6,61 @@ const { __testables } = require('../src/controllers/deliveryTokenController');
 test('delivery proof access allows super admin', () => {
   assert.equal(
     __testables.canAccessDeliveryProof(
-      { role_slug: 'super_admin', partner_id: null },
-      { partner_id: 9, source_partner_id: 4 }
+      { role: 'super_admin', partnerId: null, partnerLevel: null, childCityPartnerIds: [] },
+      { partner_id: 9, placed_by: 11, placed_by_role_slug: 'city_stockist' }
     ),
     true
   );
 });
 
-test('delivery proof access allows destination stockist partner', () => {
+test('delivery proof access allows direct provincial child-city delivery proof access', () => {
   assert.equal(
     __testables.canAccessDeliveryProof(
-      { role_slug: 'provincial_stockist', partner_id: 9 },
-      { partner_id: 9, source_partner_id: 4 }
+      {
+        role: 'provincial_stockist',
+        userId: 22,
+        partnerId: 2,
+        partnerLevel: 'provincial_stockist',
+        childCityPartnerIds: [4],
+      },
+      { partner_id: 4, placed_by: 11, placed_by_role_slug: 'city_stockist' }
     ),
     true
   );
 });
 
-test('delivery proof access allows source warehouse partner', () => {
+test('delivery proof access denies provincial visibility into mobile-child delivery proof', () => {
   assert.equal(
     __testables.canAccessDeliveryProof(
-      { role_slug: 'provincial_stockist', partner_id: 4 },
-      { partner_id: 9, source_partner_id: 4 }
+      {
+        role: 'provincial_stockist',
+        userId: 22,
+        partnerId: 2,
+        partnerLevel: 'provincial_stockist',
+        childCityPartnerIds: [4],
+      },
+      { partner_id: 4, placed_by: 33, placed_by_role_slug: 'mobile_stockist' }
     ),
-    true
+    false
   );
 });
 
 test('delivery proof access denies unrelated scoped partner', () => {
   assert.equal(
     __testables.canAccessDeliveryProof(
-      { role_slug: 'city_stockist', partner_id: 22 },
-      { partner_id: 9, source_partner_id: 4 }
+      { role: 'city_stockist', userId: 44, partnerId: 22, partnerLevel: 'city_stockist', childCityPartnerIds: [] },
+      { partner_id: 9, placed_by: 11, placed_by_role_slug: 'city_stockist' }
     ),
     false
   );
 });
 
-test('delivery proof list scope includes destination and source partner ownership', () => {
+test('delivery proof list scope mirrors city order visibility', () => {
   const scope = __testables.buildDeliveryProofScope(
-    { role_slug: 'staff', partner_id: 12 },
-    { orderAlias: 'o', sourcePartnerExpression: 'sw.partner_id' }
+    { role: 'staff', userId: 51, partnerId: 12, partnerLevel: 'city_stockist', childCityPartnerIds: [] },
+    { orderAlias: 'o' }
   );
 
-  assert.equal(scope.clause, ' AND (o.partner_id = ? OR sw.partner_id = ?)');
-  assert.deepEqual(scope.params, [12, 12]);
+  assert.equal(scope.clause, ' AND o.partner_id = ?');
+  assert.deepEqual(scope.params, [12]);
 });

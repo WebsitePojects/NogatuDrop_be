@@ -1,20 +1,7 @@
-const { ROLES, canonicalRole } = require('./roles');
+const { buildOrderScopeFromContext } = require('./affiliationScopes');
 
-function buildActiveTrackingScope({ user, orderAlias = 'o' }) {
-  const role = canonicalRole(user?.role_slug);
-
-  if (role === ROLES.SUPER_ADMIN) {
-    return { clause: '', params: [] };
-  }
-
-  if (!user?.partner_id) {
-    return { clause: ' AND 1 = 0', params: [] };
-  }
-
-  return {
-    clause: ` AND ${orderAlias}.partner_id = ?`,
-    params: [user.partner_id],
-  };
+function buildActiveTrackingScope({ affiliationContext, orderAlias = 'o' }) {
+  return buildOrderScopeFromContext(affiliationContext, { orderAlias });
 }
 
 module.exports = {

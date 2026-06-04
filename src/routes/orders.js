@@ -7,6 +7,7 @@ const { PERMISSIONS } = require('../rbac/permissions');
 const { paymentProofUpload } = require('../middleware/upload');
 const {
   getOrders, getOrder, createOrder, createPublicOrder,
+  uploadPublicPaymentProof,
   approveOrder, rejectOrder, cancelOrder,
   uploadPaymentProof, verifyPayment,
 } = require('../controllers/orderController');
@@ -16,6 +17,7 @@ const { requirePermission } = role;
 
 // Public — no auth
 router.post('/public', createPublicOrder);
+router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadPublicPaymentProof);
 
 // Authenticated
 router.use(auth);
