@@ -57,16 +57,12 @@ const EMAIL = {
   }),
 
   orderApproved: (orderNumber, deadlineHours, bankDetails) => ({
-    subject: deadlineHours
-      ? `Order #${orderNumber} Approved - Pay within ${deadlineHours} hours`
-      : `Order #${orderNumber} Approved - Cash on Delivery`,
+    subject: `Order #${orderNumber} Approved - Pay within ${deadlineHours} hours`,
     html: `
       <p>Your order <strong>#${orderNumber}</strong> has been approved.</p>
-      ${deadlineHours
-        ? `<p><strong>You have ${deadlineHours} hours to upload payment proof.</strong> The order will be auto-cancelled if payment is not verified in time.</p>`
-        : `<p><strong>This order is approved for cash on delivery.</strong> Delivery can proceed without advance payment proof.</p>`}
+      <p><strong>You have ${deadlineHours} hours to upload payment proof.</strong> The order will be auto-cancelled if payment is not verified in time.</p>
       ${bankDetails ? `<p><strong>Bank Account:</strong><br/>${bankDetails}</p>` : ''}
-      <p>${deadlineHours ? 'Please log in to the system to upload your payment proof.' : 'Please log in to track delivery and settlement updates.'}</p>
+      <p>Please log in to the system to upload your payment proof.</p>
     `,
   }),
 

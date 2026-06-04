@@ -19,10 +19,12 @@
     "migrate:all": "npm run migrate:finalize && npm run migrate:repair && npm run migrate:readiness && npm run migrate:affiliations && npm run migrate:stock-movements && npm run migrate:ops-personnel && npm run migrate:ops-seed && npm run post:migration",
     "db:import:dump": "node --env-file=.env.dev scripts/runSqlFile.js nogatu_ncdms.sql",
     "db:import:rootdump": "node --env-file=.env.dev scripts/runSqlFile.js ../nogatu_ncdms.sql",
+    "migrate:catalog-sync": "node --env-file=.env.dev scripts/syncNogatuMlmCatalog.js",
     "smoke:verify": "node --env-file=.env.dev scripts/smokeApiVerify.js",
     "smoke:deep": "node --env-file=.env.dev scripts/smokeApiHealth.js",
     "smoke:roles": "node --env-file=.env.dev scripts/smokeRoleOperations.js",
     "smoke:mutations": "node --env-file=.env.dev scripts/smokeOperationalMutations.js",
+    "smoke:catalog": "node --env-file=.env.dev scripts/smokeCatalogSync.js",
     "smoke:health": "npm run smoke:verify",
     "post:migration": "node --env-file=.env.dev scripts/postMigration.js",
     "post:migration:deep": "set RUN_DEEP_SMOKE=true&& node --env-file=.env.dev scripts/postMigration.js"
