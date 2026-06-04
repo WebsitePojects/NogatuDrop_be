@@ -5,19 +5,38 @@ const { sendEmail, EMAIL } = require('./emailService');
 const { insertNotification } = require('../utils/notificationWriter');
 const { runWithCronLeaderLock } = require('./cronLeaderLock');
 
+function isMissingColumn(err, columnName) {
+  return err?.code === 'ER_BAD_FIELD_ERROR' && String(err.message || '').includes(columnName);
+}
+
 async function runExpiryAlert() {
   try {
-    const [batches] = await pool.execute(
-      `SELECT i.id, i.product_id, i.warehouse_id, i.expiry_date, i.current_stock,
-              p.name AS product_name, w.name AS warehouse_name
-       FROM inventories i
-       JOIN products p ON p.id = i.product_id
-       JOIN warehouses w ON w.id = i.warehouse_id
-       WHERE i.expiry_date IS NOT NULL
-         AND i.expiry_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)
-         AND i.current_stock > 0
-         AND i.is_deleted = 0`
-    );
+    let batches;
+    try {
+      [batches] = await pool.execute(
+        `SELECT i.id, i.product_id, i.warehouse_id, i.expiry_date, i.current_stock,
+                p.name AS product_name, w.name AS warehouse_name
+         FROM inventories i
+         JOIN products p ON p.id = i.product_id
+         JOIN warehouses w ON w.id = i.warehouse_id
+         WHERE i.expiry_date IS NOT NULL
+           AND i.expiry_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+           AND i.current_stock > 0
+           AND i.is_deleted = 0`
+      );
+    } catch (err) {
+      if (!isMissingColumn(err, 'i.is_deleted')) throw err;
+      [batches] = await pool.execute(
+        `SELECT i.id, i.product_id, i.warehouse_id, i.expiry_date, i.current_stock,
+                p.name AS product_name, w.name AS warehouse_name
+         FROM inventories i
+         JOIN products p ON p.id = i.product_id
+         JOIN warehouses w ON w.id = i.warehouse_id
+         WHERE i.expiry_date IS NOT NULL
+           AND i.expiry_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+           AND i.current_stock > 0`
+      );
+    }
 
     if (batches.length === 0) return;
 
