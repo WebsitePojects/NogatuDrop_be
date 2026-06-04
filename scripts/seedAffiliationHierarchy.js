@@ -10,16 +10,27 @@ const CITY_STOCK = 240;
 const EXPIRY_DATE = '2030-12-31';
 
 async function getRoleIds(conn) {
+  const requiredRoles = ['provincial_stockist', 'city_stockist', 'mobile_stockist'];
   const [rows] = await conn.execute(
     `SELECT id, slug
      FROM roles
-     WHERE slug IN ('provincial_stockist', 'city_stockist', 'mobile_stockist')`
+     WHERE slug IN (?, ?, ?)`,
+    requiredRoles
   );
 
-  return rows.reduce((map, row) => {
+  const roleIds = rows.reduce((map, row) => {
     map[row.slug] = Number(row.id);
     return map;
   }, {});
+
+  const missingRoles = requiredRoles.filter((slug) => !roleIds[slug]);
+  if (missingRoles.length > 0) {
+    throw new Error(
+      `Missing required Stockist roles: ${missingRoles.join(', ')}. Run npm run migrate:city-mobile-logins:prod before npm run seed:prod.`
+    );
+  }
+
+  return roleIds;
 }
 
 async function getSeedProducts(conn) {

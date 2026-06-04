@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   AFFILIATION_HIERARCHY_FIXTURE,
@@ -35,4 +37,19 @@ test('flattened hierarchy accounts preserve parent references for city and mobil
   for (const mobile of mobileAccounts) {
     assert.ok(mobile.parentEmail, `Mobile ${mobile.email} should preserve its city parent email`);
   }
+});
+
+test('production hierarchy seed has a role bootstrap migration preflight', () => {
+  const packageJson = require('../package.json');
+  const seedSource = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'seedAffiliationHierarchy.js'),
+    'utf8'
+  );
+
+  assert.equal(
+    packageJson.scripts['migrate:city-mobile-logins:prod'],
+    'node --env-file=.env.prod scripts/runSqlFile.js sql/add_city_and_mobile_logins_2026_05_07.sql'
+  );
+  assert.match(seedSource, /Missing required Stockist roles/);
+  assert.match(seedSource, /migrate:city-mobile-logins:prod/);
 });

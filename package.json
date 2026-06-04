@@ -13,6 +13,8 @@
     "migrate:finalize:prod": "node --env-file=.env.prod scripts/runSqlFile.js sql/finalize_schema_2026_04_14.sql",
     "migrate:repair": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_core_operational_schema_2026_05_07.sql",
     "migrate:repair:prod": "node --env-file=.env.prod scripts/runSqlFile.js sql/repair_core_operational_schema_2026_05_07.sql",
+    "migrate:city-mobile-logins": "node --env-file=.env.dev scripts/runSqlFile.js sql/add_city_and_mobile_logins_2026_05_07.sql",
+    "migrate:city-mobile-logins:prod": "node --env-file=.env.prod scripts/runSqlFile.js sql/add_city_and_mobile_logins_2026_05_07.sql",
     "migrate:affiliations": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_role_affiliations_2026_05_17.sql",
     "migrate:affiliations:prod": "node --env-file=.env.prod scripts/runSqlFile.js sql/repair_role_affiliations_2026_05_17.sql",
     "migrate:stock-movements": "node --env-file=.env.dev scripts/runSqlFile.js sql/repair_stock_movement_types_2026_05_17.sql",
