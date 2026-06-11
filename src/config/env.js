@@ -25,6 +25,7 @@ const env = {
 
   // CORS
   ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173',
+  CORS_ALLOW_ALL: (process.env.CORS_ALLOW_ALL || 'false').toLowerCase() === 'true',
 
   // Brevo (transactional email — replaces SMS)
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',

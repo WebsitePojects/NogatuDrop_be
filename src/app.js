@@ -33,6 +33,10 @@ function isAllowedCorsOrigin(origin) {
     return true;
   }
 
+  if (env.CORS_ALLOW_ALL) {
+    return true;
+  }
+
   if (allowedOrigins.includes(origin)) {
     return true;
   }

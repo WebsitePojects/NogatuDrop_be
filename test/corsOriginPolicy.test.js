@@ -12,6 +12,11 @@ test('backend CORS accepts comma-delimited origins and loopback dev hosts', () =
   assert.equal(appSource.includes('Origin ${origin} is not allowed by CORS'), true);
 });
 
+test('backend CORS can be temporarily opened by environment flag', () => {
+  assert.equal(envSource.includes('CORS_ALLOW_ALL'), true);
+  assert.equal(appSource.includes('env.CORS_ALLOW_ALL'), true);
+});
+
 test('backend default allowed origins cover local public storefront hosts', () => {
   assert.equal(envSource.includes('http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173'), true);
 });
