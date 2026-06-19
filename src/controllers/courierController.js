@@ -12,14 +12,14 @@ const getCouriers = asyncHandler(async (req, res) => {
 
   try {
     const where = 'WHERE is_deleted = 0';
-    const baseQuery = `SELECT * FROM couriers ${where} ORDER BY name ASC`;
+    const baseQuery = `SELECT * FROM couriers ${where} ORDER BY CASE WHEN LOWER(name) LIKE 'j&t%' OR LOWER(name) LIKE 'jt%' THEN 0 ELSE 1 END, name ASC`;
     const countQuery = `SELECT COUNT(*) AS total FROM couriers ${where}`;
     const result = await paginate(baseQuery, countQuery, params, page, limit);
     res.json({ success: true, ...result });
   } catch (err) {
     if (!isMissingColumnError(err)) throw err;
 
-    const baseQuery = 'SELECT * FROM couriers ORDER BY name ASC';
+    const baseQuery = "SELECT * FROM couriers ORDER BY CASE WHEN LOWER(name) LIKE 'j&t%' OR LOWER(name) LIKE 'jt%' THEN 0 ELSE 1 END, name ASC";
     const countQuery = 'SELECT COUNT(*) AS total FROM couriers';
     const result = await paginate(baseQuery, countQuery, params, page, limit);
     res.json({ success: true, ...result });

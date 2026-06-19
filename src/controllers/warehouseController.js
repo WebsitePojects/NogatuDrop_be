@@ -70,12 +70,39 @@ const getWarehouse = asyncHandler(async (req, res) => {
 
 // POST /api/v1/warehouses
 const createWarehouse = asyncHandler(async (req, res) => {
-  const { name, type, location, capacity_total, manager_name, manager_email, manager_phone, lat, lng } = req.body;
+  const {
+    name,
+    type,
+    location,
+    address,
+    city,
+    province,
+    region,
+    capacity_total,
+    capacity,
+    manager_name,
+    manager_email,
+    manager_phone,
+    lat,
+    lng,
+  } = req.body;
+  const normalizedLocation = location || [address, city, province, region].filter(Boolean).join(', ') || null;
+  const normalizedCapacity = capacity_total ?? capacity ?? 100000;
 
   const [result] = await pool.execute(
     `INSERT INTO warehouses (name, type, location, capacity_total, manager_name, manager_email, manager_phone, lat, lng)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, type || 'region', location, capacity_total || 100000, manager_name, manager_email || null, manager_phone || null, lat || null, lng || null]
+    [
+      name,
+      type || 'region',
+      normalizedLocation,
+      normalizedCapacity,
+      manager_name,
+      manager_email || null,
+      manager_phone || null,
+      lat || null,
+      lng || null,
+    ]
   );
 
   const [created] = await pool.execute('SELECT * FROM warehouses WHERE id = ?', [result.insertId]);
@@ -85,7 +112,25 @@ const createWarehouse = asyncHandler(async (req, res) => {
 // PUT /api/v1/warehouses/:id
 const updateWarehouse = asyncHandler(async (req, res) => {
   const warehouseId = req.params.id;
-  const { name, type, location, capacity_total, capacity_used, manager_name, manager_email, manager_phone, lat, lng, is_active } = req.body;
+  const {
+    name,
+    type,
+    location,
+    address,
+    city,
+    province,
+    region,
+    capacity_total,
+    capacity,
+    capacity_used,
+    manager_name,
+    manager_email,
+    manager_phone,
+    lat,
+    lng,
+    is_active,
+  } = req.body;
+  const normalizedLocation = location || [address, city, province, region].filter(Boolean).join(', ');
 
   const [existing] = await pool.execute('SELECT id FROM warehouses WHERE id = ? AND is_deleted = 0', [warehouseId]);
   if (existing.length === 0) throw ApiError.notFound('Warehouse not found');
@@ -95,8 +140,11 @@ const updateWarehouse = asyncHandler(async (req, res) => {
 
   if (name) { fields.push('name = ?'); values.push(name); }
   if (type) { fields.push('type = ?'); values.push(type); }
-  if (location) { fields.push('location = ?'); values.push(location); }
-  if (capacity_total !== undefined) { fields.push('capacity_total = ?'); values.push(capacity_total); }
+  if (normalizedLocation) { fields.push('location = ?'); values.push(normalizedLocation); }
+  if (capacity_total !== undefined || capacity !== undefined) {
+    fields.push('capacity_total = ?');
+    values.push(capacity_total ?? capacity);
+  }
   if (capacity_used !== undefined) { fields.push('capacity_used = ?'); values.push(capacity_used); }
   if (manager_name) { fields.push('manager_name = ?'); values.push(manager_name); }
   if (manager_email !== undefined) { fields.push('manager_email = ?'); values.push(manager_email || null); }

@@ -3,7 +3,13 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
-const { getPurchaseOrders, getPurchaseOrder, createPurchaseOrder, approvePurchaseOrder } = require('../controllers/purchaseOrderController');
+const {
+  getPurchaseOrders,
+  getPurchaseOrder,
+  createPurchaseOrder,
+  approvePurchaseOrder,
+  rejectPurchaseOrder,
+} = require('../controllers/purchaseOrderController');
 
 const router = Router();
 
@@ -30,5 +36,12 @@ router.post(
 );
 
 router.patch('/:id/approve', roleGuard('super_admin'), param('id').isInt(), validate, approvePurchaseOrder);
+router.patch(
+  '/:id/reject',
+  roleGuard('super_admin'),
+  [param('id').isInt(), body('reason').optional().trim()],
+  validate,
+  rejectPurchaseOrder
+);
 
 module.exports = router;

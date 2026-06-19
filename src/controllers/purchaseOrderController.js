@@ -136,4 +136,36 @@ const approvePurchaseOrder = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Purchase order approved' });
 });
 
-module.exports = { getPurchaseOrders, getPurchaseOrder, createPurchaseOrder, approvePurchaseOrder };
+// PATCH /api/v1/purchase-orders/:id/reject
+const rejectPurchaseOrder = asyncHandler(async (req, res) => {
+  const poId = req.params.id;
+  const reason = (req.body.reason || '').trim();
+
+  const [pos] = await pool.execute(
+    'SELECT id, status FROM purchase_orders WHERE id = ? AND is_deleted = 0',
+    [poId]
+  );
+  if (pos.length === 0) throw ApiError.notFound('Purchase order not found');
+  if (pos[0].status !== 'pending') throw ApiError.badRequest('PO can only be rejected from pending status');
+
+  await pool.execute(
+    `UPDATE purchase_orders
+     SET status = ?, notes = CASE
+       WHEN ? = '' THEN notes
+       WHEN notes IS NULL OR notes = '' THEN ?
+       ELSE CONCAT(notes, '\nRejected: ', ?)
+     END
+     WHERE id = ?`,
+    ['rejected', reason, `Rejected: ${reason}`, reason, poId]
+  );
+
+  res.json({ success: true, message: 'Purchase order rejected' });
+});
+
+module.exports = {
+  getPurchaseOrders,
+  getPurchaseOrder,
+  createPurchaseOrder,
+  approvePurchaseOrder,
+  rejectPurchaseOrder,
+};
