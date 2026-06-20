@@ -16,7 +16,18 @@ const router = Router();
 const { requirePermission } = role;
 
 // Public — no auth
-router.post('/public', createPublicOrder);
+router.post(
+  '/public',
+  [
+    body('customer_name').trim().notEmpty(),
+    body('customer_address').trim().notEmpty(),
+    body('payment_method').optional().isIn(['bank_transfer']),
+    body('shipping_zone').optional().isIn(['metro_manila', 'luzon', 'visayas_mindanao']),
+    body('items').isArray({ min: 1 }),
+  ],
+  validate,
+  createPublicOrder
+);
 router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadPublicPaymentProof);
 
 // Authenticated

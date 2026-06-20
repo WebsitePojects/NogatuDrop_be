@@ -323,7 +323,7 @@ const getProduct = asyncHandler(async (req, res) => {
 
 // POST /api/v1/products
 const createProduct = asyncHandler(async (req, res) => {
-  const { name, sku, category, retail_price, partner_price, unit, description } = req.body;
+  const { name, sku, category, retail_price, partner_price, unit, description, is_active } = req.body;
 
   const [existing] = await pool.execute(
     'SELECT id FROM products WHERE sku = ? AND is_deleted = 0 LIMIT 1', [sku]
@@ -333,9 +333,19 @@ const createProduct = asyncHandler(async (req, res) => {
   const image_url = req.file ? req.file.path : null;
 
   const [result] = await pool.execute(
-    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url]
+    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      name,
+      sku,
+      category || 'Drink Mixes',
+      retail_price,
+      partner_price,
+      unit || '420g Boxes',
+      description || null,
+      image_url,
+      is_active === undefined ? 1 : Number(is_active === true || is_active === 'true' || is_active === 1 || is_active === '1'),
+    ]
   );
 
   const [created] = await pool.execute('SELECT * FROM products WHERE id = ?', [result.insertId]);
@@ -347,7 +357,7 @@ const createProduct = asyncHandler(async (req, res) => {
 // PUT /api/v1/products/:id
 const updateProduct = asyncHandler(async (req, res) => {
   const productId = req.params.id;
-  const { name, sku, category, retail_price, partner_price, unit, description } = req.body;
+  const { name, sku, category, retail_price, partner_price, unit, description, is_active } = req.body;
 
   const [existing] = await pool.execute(
     'SELECT id FROM products WHERE id = ? AND is_deleted = 0 LIMIT 1', [productId]
@@ -371,6 +381,10 @@ const updateProduct = asyncHandler(async (req, res) => {
   if (partner_price !== undefined) { fields.push('partner_price = ?'); values.push(partner_price); }
   if (unit) { fields.push('unit = ?'); values.push(unit); }
   if (description !== undefined) { fields.push('description = ?'); values.push(description || null); }
+  if (is_active !== undefined) {
+    fields.push('is_active = ?');
+    values.push(Number(is_active === true || is_active === 'true' || is_active === 1 || is_active === '1'));
+  }
 
   if (req.file) {
     fields.push('image_url = ?');

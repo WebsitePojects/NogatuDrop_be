@@ -20,7 +20,18 @@ router.post(
   [
     body('name').trim().notEmpty().withMessage('Warehouse name is required'),
     body('type').optional().isIn(['manufacturer', 'region', 'city']),
-    body('location').trim().notEmpty().withMessage('Location is required'),
+    body('location')
+      .optional({ checkFalsy: true })
+      .trim(),
+    body().custom((value) => {
+      const hasLocation = Boolean(String(value.location || '').trim());
+      const hasAddressParts = [value.address, value.city, value.province, value.region]
+        .some((part) => Boolean(String(part || '').trim()));
+      if (!hasLocation && !hasAddressParts) {
+        throw new Error('Location is required');
+      }
+      return true;
+    }),
     body('manager_name').trim().notEmpty().withMessage('Manager name is required'),
     body('capacity_total').optional().isInt({ min: 1 }),
     body('manager_email').optional().isEmail(),
@@ -37,7 +48,7 @@ router.put(
   [
     body('name').optional().trim().notEmpty(),
     body('type').optional().isIn(['manufacturer', 'region', 'city']),
-    body('location').optional().trim().notEmpty(),
+    body('location').optional({ checkFalsy: true }).trim(),
     body('manager_name').optional().trim().notEmpty(),
     body('is_active').optional().isBoolean(),
   ],
