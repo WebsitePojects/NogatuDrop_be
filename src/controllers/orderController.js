@@ -766,7 +766,16 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
 const createPublicOrder = asyncHandler(async (req, res) => {
-  const { customer_name, customer_phone, customer_email, customer_address, items, notes, payment_method } = req.body;
+  const {
+    customer_name,
+    customer_phone,
+    customer_email,
+    customer_address,
+    items,
+    notes,
+    payment_method,
+    shipping_zone,
+  } = req.body;
 
   if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
@@ -797,7 +806,9 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       merchandiseSubtotal += quantity * price;
     }
 
-    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal);
+    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal, {
+      shippingZone: shipping_zone,
+    });
     const totalAmount = pricingTotals.totalDue;
 
     const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems);
