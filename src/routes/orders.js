@@ -10,6 +10,7 @@ const {
   uploadPublicPaymentProof,
   approveOrder, rejectOrder, cancelOrder,
   uploadPaymentProof, verifyPayment,
+  archiveOrder, unarchiveOrder,
 } = require('../controllers/orderController');
 
 const router = Router();
@@ -45,5 +46,9 @@ router.post('/:id/payment-proof', requirePermission(PERMISSIONS.ORDERS_UPLOAD_PA
 
 // Super admin verifies payment proof
 router.patch('/:id/verify-payment', requirePermission(PERMISSIONS.ORDERS_VERIFY_PAYMENT), verifyPayment);
+
+// Order Archive — 'delete' archives the order (record + revenue kept forever); unarchive restores it.
+router.patch('/:id/archive', requirePermission(PERMISSIONS.ORDERS_CANCEL), param('id').isInt(), validate, archiveOrder);
+router.patch('/:id/unarchive', requirePermission(PERMISSIONS.ORDERS_CANCEL), param('id').isInt(), validate, unarchiveOrder);
 
 module.exports = router;

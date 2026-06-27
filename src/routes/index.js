@@ -25,6 +25,7 @@ const cycleCountRoutes = require('./cycleCounts');
 const settlementRoutes = require('./settlements');
 const exportRoutes = require('./exports');
 const allianceRoutes = require('./alliance');
+const mobileInventoryRoutes = require('./mobileInventory');
 
 const router = Router();
 
@@ -53,5 +54,6 @@ router.use('/cycle-counts', cycleCountRoutes);
 router.use('/settlements', settlementRoutes);
 router.use('/exports', exportRoutes);
 router.use('/alliance', allianceRoutes);
+router.use('/mobile-inventory', mobileInventoryRoutes);
 
 module.exports = router;

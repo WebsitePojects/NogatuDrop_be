@@ -64,10 +64,41 @@ const getRevenueReport = asyncHandler(async (req, res) => {
         ${totalFilter}
     `, totalParams);
 
+    // Revenue by source warehouse (powers the "Revenue by Warehouse" bar chart)
+    const [byWarehouse] = await pool.execute(`
+      SELECT w.name AS warehouse_name,
+             COALESCE(SUM(o.total_amount), 0) AS revenue,
+             COUNT(*) AS order_count
+      FROM orders o
+      JOIN warehouses w ON w.id = o.source_warehouse_id
+      WHERE o.status = 'delivered' AND o.payment_status = 'paid'
+        AND o.is_deleted = 0 ${dateFilter}
+        ${partnerFilter}
+      GROUP BY w.id, w.name
+      ORDER BY revenue DESC
+    `, params);
+
+    // Revenue by stockist (public orders have no partner and are excluded here)
+    const [byStockist] = await pool.execute(`
+      SELECT p.business_name AS stockist_name,
+             COUNT(*) AS total_orders,
+             COALESCE(SUM(o.total_amount), 0) AS total_revenue,
+             COALESCE(AVG(o.total_amount), 0) AS avg_order_value
+      FROM orders o
+      JOIN partners p ON p.id = o.partner_id
+      WHERE o.status = 'delivered' AND o.payment_status = 'paid'
+        AND o.is_deleted = 0 ${dateFilter}
+        ${partnerFilter}
+      GROUP BY p.id, p.business_name
+      ORDER BY total_revenue DESC
+    `, params);
+
     return {
       weekly_trend: weekly,
       total_revenue: total[0].total_revenue,
       total_orders: total[0].total_orders,
+      by_warehouse: byWarehouse,
+      by_stockist: byStockist,
     };
   });
 

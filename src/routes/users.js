@@ -4,7 +4,7 @@ const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
-const { getUsers, getUser, createUser, updateUser, deleteUser } = require('../controllers/userController');
+const { getUsers, getUser, createUser, updateUser, deleteUser, resetUserPassword } = require('../controllers/userController');
 
 const router = Router();
 const { requirePermission } = roleGuard;
@@ -69,5 +69,7 @@ router.put(
 );
 
 router.delete('/:id', requirePermission(PERMISSIONS.USERS_MANAGE), param('id').isInt(), validate, deleteUser);
+
+router.post('/:id/reset-password', requirePermission(PERMISSIONS.USERS_MANAGE), param('id').isInt(), validate, resetUserPassword);
 
 module.exports = router;

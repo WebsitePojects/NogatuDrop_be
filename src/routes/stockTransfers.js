@@ -4,7 +4,7 @@ const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
-const { getTransfers, getTransfer, createTransfer, completeTransfer } = require('../controllers/stockTransferController');
+const { getTransfers, getTransfer, createTransfer, transitTransfer, cancelTransfer, completeTransfer } = require('../controllers/stockTransferController');
 
 const router = Router();
 
@@ -32,6 +32,22 @@ router.post(
   ],
   validate,
   createTransfer
+);
+
+router.patch(
+  '/:id/transit',
+  roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_COMPLETE),
+  param('id').isInt(),
+  validate,
+  transitTransfer
+);
+
+router.patch(
+  '/:id/cancel',
+  roleGuard.requirePermission(PERMISSIONS.STOCK_TRANSFERS_CREATE),
+  param('id').isInt(),
+  validate,
+  cancelTransfer
 );
 
 router.patch(

@@ -4,6 +4,7 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 
 const isMissingColumnError = (err) => err && err.code === 'ER_BAD_FIELD_ERROR';
+const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
 
 // GET /api/v1/couriers
 const getCouriers = asyncHandler(async (req, res) => {
@@ -50,6 +51,7 @@ const createCourier = asyncHandler(async (req, res) => {
       [name, code, trackingUrlTemplate, contactPerson, contactPhone, contactEmail, isActive]
     );
   } catch (err) {
+    if (isDupEntryError(err)) throw ApiError.badRequest('A courier with this code already exists');
     if (!isMissingColumnError(err)) throw err;
     [result] = await pool.execute(
       `INSERT INTO couriers (name, website_url, tracking_url_template, notes)
@@ -93,6 +95,7 @@ const updateCourier = asyncHandler(async (req, res) => {
       [name, code, trackingUrlTemplate, contactPerson, contactPhone, contactEmail, isActive, id]
     );
   } catch (err) {
+    if (isDupEntryError(err)) throw ApiError.badRequest('A courier with this code already exists');
     if (!isMissingColumnError(err)) throw err;
     await pool.execute(
       `UPDATE couriers SET name = COALESCE(?, name), website_url = COALESCE(?, website_url),

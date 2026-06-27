@@ -62,7 +62,7 @@ const getSettlements = asyncHandler(async (req, res) => {
            s.created_at, ru.name AS reconciled_by_name
     FROM settlements s
     JOIN orders o ON o.id = s.order_id
-    JOIN partners p ON p.id = s.partner_id
+    LEFT JOIN partners p ON p.id = s.partner_id
     LEFT JOIN users ru ON ru.id = s.reconciled_by
     ${where}
     ORDER BY s.created_at DESC`;

@@ -13,7 +13,14 @@ const {
   getBankAccountForWarehouseOrDefault,
   assertBankAccountAvailable,
 } = require('../services/bankAccountResolver');
-const { getPublicOrderPricingTotals } = require('../services/publicCheckoutPricing');
+const {
+  PUBLIC_ORDER_SHIPPING_FEE,
+  getPublicOrderPricingTotals,
+  reconcilePublicOrderPricing,
+} = require('../services/publicCheckoutPricing');
+const { getPaymentVerificationDecision } = require('../services/paymentVerification');
+const { lookupMlmMember } = require('../services/mlmBridge');
+const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
@@ -233,14 +240,14 @@ async function listPublicFulfillmentCandidates(db) {
   try {
     const [rows] = await executeSoftDeleteAware(
       db,
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
+      `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
        FROM partners p
        JOIN warehouses w ON w.partner_id = p.id
        WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0
+          AND p.is_deleted = 0 AND w.is_deleted = 0 AND w.is_active = 1
        ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`,
       [],
-      `SELECT p.id AS partner_id, w.id AS warehouse_id
+      `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
        FROM partners p
        JOIN warehouses w ON w.partner_id = p.id
        WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
@@ -255,21 +262,21 @@ async function listPublicFulfillmentCandidates(db) {
 
   const [rows] = await executeSoftDeleteAware(
     db,
-    `SELECT p.id AS partner_id, i.warehouse_id
+    `SELECT p.id AS partner_id, i.warehouse_id, w.lat, w.lng
      FROM partners p
      JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
      JOIN warehouses w ON w.id = i.warehouse_id
      WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
        AND p.is_deleted = 0 AND w.is_deleted = 0
-     GROUP BY p.id, i.warehouse_id
+     GROUP BY p.id, i.warehouse_id, w.lat, w.lng
      ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`,
     [],
-    `SELECT p.id AS partner_id, i.warehouse_id
+    `SELECT p.id AS partner_id, i.warehouse_id, w.lat, w.lng
      FROM partners p
      JOIN inventories i ON i.partner_id = p.id
      JOIN warehouses w ON w.id = i.warehouse_id
      WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-     GROUP BY p.id, i.warehouse_id
+     GROUP BY p.id, i.warehouse_id, w.lat, w.lng
      ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`
   );
   return rows;
@@ -306,8 +313,41 @@ async function canWarehouseFulfillItems(db, warehouseId, items) {
   return { ok: true };
 }
 
-async function resolvePublicFulfillmentRoute(db, items) {
-  const candidates = await listPublicFulfillmentCandidates(db);
+function haversineDistanceKm(originLat, originLng, targetLat, targetLng) {
+  const toRadians = (value) => Number(value) * Math.PI / 180;
+  const lat1 = toRadians(originLat);
+  const lat2 = toRadians(targetLat);
+  const deltaLat = toRadians(Number(targetLat) - Number(originLat));
+  const deltaLng = toRadians(Number(targetLng) - Number(originLng));
+  const a = Math.sin(deltaLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function rankPublicFulfillmentCandidates(candidates, { customerLat, customerLng } = {}) {
+  const hasCustomerLocation = customerLat != null && customerLng != null
+    && Number.isFinite(Number(customerLat)) && Number.isFinite(Number(customerLng));
+  return [...candidates]
+    .map((candidate, index) => {
+      const hasWarehouseLocation = candidate.lat != null && candidate.lng != null
+        && Number.isFinite(Number(candidate.lat)) && Number.isFinite(Number(candidate.lng));
+      return {
+        ...candidate,
+        _rankIndex: index,
+        _distanceKm: hasCustomerLocation && hasWarehouseLocation
+          ? haversineDistanceKm(customerLat, customerLng, candidate.lat, candidate.lng)
+          : Number.POSITIVE_INFINITY,
+      };
+    })
+    .sort((left, right) => left._distanceKm - right._distanceKm || left._rankIndex - right._rankIndex)
+    .map(({ _distanceKm, _rankIndex, ...candidate }) => candidate);
+}
+
+async function resolvePublicFulfillmentRoute(db, items, location = {}) {
+  const candidates = rankPublicFulfillmentCandidates(
+    await listPublicFulfillmentCandidates(db),
+    location
+  );
   if (candidates.length === 0) {
     throw ApiError.serviceUnavailable('No available Stockist to handle this order');
   }
@@ -448,6 +488,7 @@ function buildPublicPaymentContext({
   orderNumber,
   totalAmount,
   merchandiseSubtotal = null,
+  memberDiscountAmount = null,
   shippingFee = null,
   systemFee = null,
   bankAccount,
@@ -459,6 +500,7 @@ function buildPublicPaymentContext({
     order_number: orderNumber,
     total_amount: Number(totalAmount || 0),
     merchandise_subtotal: merchandiseSubtotal == null ? null : Number(merchandiseSubtotal || 0),
+    member_discount_amount: memberDiscountAmount == null ? null : Number(memberDiscountAmount || 0),
     shipping_fee: shippingFee == null ? null : Number(shippingFee || 0),
     system_fee: systemFee == null ? null : Number(systemFee || 0),
     payment_status: paymentStatus || 'pending',
@@ -469,6 +511,42 @@ function buildPublicPaymentContext({
       account_name: bankAccount.account_name,
       account_number: bankAccount.account_number,
     } : null,
+  };
+}
+
+function buildOrderPricingBreakdown(order, items = []) {
+  const itemSubtotal = items.reduce(
+    (sum, item) => sum + Number(item.quantity || 0) * Number(item.unit_price || 0),
+    0
+  );
+  const totalAmount = Number(order?.total_amount || 0);
+  const merchandiseSubtotal = order?.merchandise_subtotal == null
+    ? itemSubtotal
+    : Number(order.merchandise_subtotal);
+  const isPublic = order?.placed_by_type === 'public' || Boolean(order?.is_public);
+  const shippingFee = order?.shipping_fee == null
+    ? (isPublic && totalAmount - merchandiseSubtotal >= PUBLIC_ORDER_SHIPPING_FEE
+      ? PUBLIC_ORDER_SHIPPING_FEE
+      : 0)
+    : Number(order.shipping_fee);
+  const systemFee = order?.system_fee == null
+    ? Math.max(totalAmount - merchandiseSubtotal - shippingFee, 0)
+    : Number(order.system_fee);
+  const reconciled = reconcilePublicOrderPricing({
+    merchandiseSubtotal,
+    memberDiscountAmount: order?.member_discount_amount || 0,
+    shippingFee,
+    systemFee,
+    totalAmount,
+  });
+
+  return {
+    merchandise_subtotal: reconciled.merchandiseSubtotal,
+    member_discount_amount: reconciled.memberDiscountAmount,
+    shipping_fee: reconciled.shippingFee,
+    system_fee: reconciled.systemFee,
+    adjustment_amount: reconciled.adjustmentAmount,
+    total_amount: reconciled.totalDue,
   };
 }
 
@@ -491,6 +569,13 @@ const getOrders = asyncHandler(async (req, res) => {
     params.push(`%${search}%`, `%${search}%`);
   }
 
+  // Order Archive: by default the active list hides archived orders. Pass
+  // ?archived=true to view the archive. Archived orders KEEP their record and
+  // still count in reports/calculations — this is only a list filter, never a
+  // data deletion.
+  const showArchived = req.query.archived === 'true' || req.query.archived === '1';
+  where += showArchived ? ' AND o.is_archived = 1' : ' AND o.is_archived = 0';
+
   const baseQuery = `
     SELECT o.id, o.order_number, o.partner_id, pt.business_name AS partner_name,
            o.placed_by, u.name AS placed_by_name, u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
@@ -503,10 +588,11 @@ const getOrders = asyncHandler(async (req, res) => {
                AND dt.is_used = 0
                AND dt.expires_at > NOW()
            ) AS has_active_delivery_link,
-           o.placed_by_type, o.customer_name,
+           o.placed_by_type, o.customer_name, o.customer_phone, o.customer_email, o.customer_address,
+           (o.placed_by_type = 'public' OR (o.placed_by IS NULL AND o.customer_name IS NOT NULL)) AS is_public,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
-    JOIN partners pt ON pt.id = o.partner_id
+    LEFT JOIN partners pt ON pt.id = o.partner_id
     LEFT JOIN users u ON u.id = o.placed_by
     LEFT JOIN roles ur ON ur.id = u.role_id
     ${where}
@@ -515,7 +601,7 @@ const getOrders = asyncHandler(async (req, res) => {
   const countQuery = `
     SELECT COUNT(*) AS total
     FROM orders o
-    JOIN partners pt ON pt.id = o.partner_id
+    LEFT JOIN partners pt ON pt.id = o.partner_id
     LEFT JOIN users u ON u.id = o.placed_by
     LEFT JOIN roles ur ON ur.id = u.role_id
     ${where}`;
@@ -537,6 +623,29 @@ const getOrders = asyncHandler(async (req, res) => {
   res.json({ success: true, ...result });
 });
 
+// PATCH /api/v1/orders/:id/archive — move to the Order Archive. This is the
+// "delete" action in the UI: it NEVER removes the record (revenue and history
+// stay intact for accurate lifetime calculations), it only hides the order from
+// the active list.
+const archiveOrder = asyncHandler(async (req, res) => {
+  const [r] = await pool.execute(
+    'UPDATE orders SET is_archived = 1, archived_at = NOW() WHERE id = ? AND is_deleted = 0',
+    [req.params.id]
+  );
+  if (r.affectedRows === 0) throw ApiError.notFound('Order not found');
+  res.json({ success: true, message: 'Order archived' });
+});
+
+// PATCH /api/v1/orders/:id/unarchive — restore an order to the active list.
+const unarchiveOrder = asyncHandler(async (req, res) => {
+  const [r] = await pool.execute(
+    'UPDATE orders SET is_archived = 0, archived_at = NULL WHERE id = ? AND is_deleted = 0',
+    [req.params.id]
+  );
+  if (r.affectedRows === 0) throw ApiError.notFound('Order not found');
+  res.json({ success: true, message: 'Order restored' });
+});
+
 // GET /api/v1/orders/:id
 const getOrder = asyncHandler(async (req, res) => {
   const affiliationContext = await resolveAffiliationContext(pool, req.user);
@@ -547,9 +656,10 @@ const getOrder = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT o.*, pt.business_name AS partner_name, u.name AS placed_by_name,
             u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
-            a.name AS approved_by_name, verifier.name AS payment_verified_by_name
+            a.name AS approved_by_name, verifier.name AS payment_verified_by_name,
+            (o.placed_by_type = 'public' OR (o.placed_by IS NULL AND o.customer_name IS NOT NULL)) AS is_public
      FROM orders o
-     JOIN partners pt ON pt.id = o.partner_id
+     LEFT JOIN partners pt ON pt.id = o.partner_id
      LEFT JOIN users u ON u.id = o.placed_by
      LEFT JOIN roles ur ON ur.id = u.role_id
      LEFT JOIN users a ON a.id = o.approved_by
@@ -570,6 +680,7 @@ const getOrder = asyncHandler(async (req, res) => {
     [order.id]
   );
   order.items = items;
+  order.pricing_breakdown = buildOrderPricingBreakdown(order, items);
 
   res.json({ success: true, data: order });
 });
@@ -600,6 +711,11 @@ const createOrder = asyncHandler(async (req, res) => {
     // City stockist → order from parent provincial warehouse
     // Provincial stockist → order from Goldenstar (type = 'manufacturer')
     const sourceWarehouseId = await resolveSourceWarehouseIdForPartner(conn, partnerId);
+    if (!sourceWarehouseId) {
+      // Refuse to deduct stock from a vague/unknown source. A warehouse must be
+      // assigned before any order can reserve inventory.
+      throw ApiError.badRequest('No source warehouse is assigned for this account. Please assign a warehouse/storage before placing orders.');
+    }
 
     const [cartItems] = await executeSoftDeleteAware(
       conn,
@@ -618,9 +734,14 @@ const createOrder = asyncHandler(async (req, res) => {
 
     if (cartItems.length === 0) throw ApiError.badRequest('Cart is empty');
 
-    // Compute prices with discount locked at order time
+    // Compute prices with discount locked at order time.
+    // Fixed role-based discount off partner_price (per business rule):
+    //   Provincial 45% · City 40% · Mobile 35%. Falls back to the legacy
+    //   per-partner discount_pct only when the stockist has no level set.
     let totalAmount = 0;
-    const discountPct = partnerData.discount_pct || 0;
+    const ROLE_DISCOUNT_PCT = { provincial_stockist: 45, city_stockist: 40, mobile_stockist: 35 };
+    const fixedPct = ROLE_DISCOUNT_PCT[partnerData.stockist_level];
+    const discountPct = fixedPct != null ? fixedPct : (partnerData.discount_pct || 0);
 
     for (const item of cartItems) {
       const unitPrice = parseFloat(item.partner_price) * (1 - discountPct / 100);
@@ -766,10 +887,17 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
 const createPublicOrder = asyncHandler(async (req, res) => {
-  const { customer_name, customer_phone, customer_email, customer_address, items, notes, payment_method } = req.body;
+  const { customer_name, customer_phone, customer_email, customer_address, customer_lat, customer_lng, items, notes, payment_method } = req.body;
 
   if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
+
+  // Optional pinned delivery coordinates (consent-gated on the client). Stored
+  // as sensitive data — never returned by the public tracking endpoint.
+  const parsedLat = Number(customer_lat);
+  const parsedLng = Number(customer_lng);
+  const custLat = Number.isFinite(parsedLat) && parsedLat >= 4 && parsedLat <= 22 ? parsedLat : null;
+  const custLng = Number.isFinite(parsedLng) && parsedLng >= 115 && parsedLng <= 128 ? parsedLng : null;
 
   const conn = await pool.getConnection();
   try {
@@ -777,6 +905,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
     let merchandiseSubtotal = 0;
+    let preDiscountSubtotal = 0;
     const resolvedItems = [];
 
     for (const item of items) {
@@ -795,12 +924,33 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       const price = getPublicOrderUnitPrice(products[0]);
       resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
       merchandiseSubtotal += quantity * price;
+      preDiscountSubtotal += quantity * price;
     }
 
-    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal);
+    // Member discount: a valid ACTIVE Nogatu MLM member gets MEMBER_DISCOUNT_PCT
+    // off. Verified live against the MLM bridge; falls back to no discount when
+    // the bridge isn't configured/reachable, so checkout never breaks.
+    const memberUsername = String(req.body.member_username || '').trim();
+    let memberDiscountPct = 0;
+    if (memberUsername) {
+      const member = await lookupMlmMember(memberUsername);
+      if (member && String(member.account_status || '').toLowerCase() === 'active') {
+        memberDiscountPct = MEMBER_DISCOUNT_PCT;
+        merchandiseSubtotal = 0;
+        for (const it of resolvedItems) {
+          it.unit_price = Math.round(it.unit_price * (1 - memberDiscountPct / 100) * 100) / 100;
+          merchandiseSubtotal += it.quantity * it.unit_price;
+        }
+      }
+    }
+
+    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal, { preDiscountSubtotal });
     const totalAmount = pricingTotals.totalDue;
 
-    const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems);
+    const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems, {
+      customerLat: custLat,
+      customerLng: custLng,
+    });
     const partnerId = fulfillmentRoute.partner_id;
     const sourceWarehouseId = fulfillmentRoute.warehouse_id;
 
@@ -815,11 +965,12 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     try {
       [orderResult] = await conn.execute(
         `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
-                             customer_name, customer_phone, customer_email, customer_address, cod_amount,
+                             customer_name, customer_phone, customer_email, customer_address,
+                             customer_lat, customer_lng, cod_amount,
                              total_amount, notes)
-         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
-         customer_email || null, customer_address, codAmount, totalAmount, notes || null]
+         customer_email || null, customer_address, custLat, custLng, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
       // Some DBs are partially migrated and only miss source_warehouse_id.
@@ -878,6 +1029,35 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       }
     }
     const orderId = orderResult.insertId;
+
+    try {
+      await conn.execute(
+        `UPDATE orders
+         SET merchandise_subtotal = ?, member_discount_amount = ?, shipping_fee = ?, system_fee = ?
+         WHERE id = ?`,
+        [
+          pricingTotals.merchandiseSubtotal,
+          pricingTotals.memberDiscountAmount,
+          pricingTotals.shippingFee,
+          pricingTotals.systemFee,
+          orderId,
+        ]
+      );
+    } catch (err) {
+      const pricingColumns = ['merchandise_subtotal', 'member_discount_amount', 'shipping_fee', 'system_fee'];
+      if (!pricingColumns.some((column) => isMissingColumn(err, column))) throw err;
+    }
+
+    if (memberUsername) {
+      try {
+        await conn.execute(
+          'UPDATE orders SET member_username = ?, member_discount_pct = ? WHERE id = ?',
+          [memberUsername, memberDiscountPct, orderId]
+        );
+      } catch (err) {
+        if (!isMissingColumn(err, 'member_username') && !isMissingColumn(err, 'member_discount_pct')) throw err;
+      }
+    }
 
     for (const item of resolvedItems) {
       try {
@@ -956,6 +1136,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
           orderNumber,
           totalAmount,
           merchandiseSubtotal: pricingTotals.merchandiseSubtotal,
+          memberDiscountAmount: pricingTotals.memberDiscountAmount,
           shippingFee: pricingTotals.shippingFee,
           systemFee: pricingTotals.systemFee,
           bankAccount,
@@ -1323,27 +1504,32 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
 const verifyPayment = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
-  const [orders] = await pool.execute(
-    `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_proof_url, o.total_amount,
-            r.slug AS placed_by_role_slug
-     FROM orders o
-     LEFT JOIN users u ON u.id = o.placed_by
-     LEFT JOIN roles r ON r.id = u.role_id
-     WHERE o.id = ? AND o.is_deleted = 0`,
-    [orderId]
-  );
-  if (orders.length === 0) throw ApiError.notFound('Order not found');
-  if (orders[0].status !== 'approved') throw ApiError.badRequest('Order must be in approved status');
-  if (!orders[0].payment_proof_url) throw ApiError.badRequest('No payment proof has been uploaded');
-
-  const affiliationContext = await resolveAffiliationContext(pool, req.user);
-  if (req.user.role_slug !== 'super_admin' && !canVerifyPaymentFromContext(affiliationContext, orders[0])) {
-    throw ApiError.forbidden('You do not have permission to verify payment for this order');
-  }
-
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const [orders] = await conn.execute(
+      `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status,
+              o.payment_proof_url, o.total_amount, r.slug AS placed_by_role_slug
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.placed_by
+       LEFT JOIN roles r ON r.id = u.role_id
+       WHERE o.id = ? AND o.is_deleted = 0
+       FOR UPDATE`,
+      [orderId]
+    );
+    if (orders.length === 0) throw ApiError.notFound('Order not found');
+
+    const affiliationContext = await resolveAffiliationContext(conn, req.user);
+    if (req.user.role_slug !== 'super_admin' && !canVerifyPaymentFromContext(affiliationContext, orders[0])) {
+      throw ApiError.forbidden('You do not have permission to verify payment for this order');
+    }
+
+    const decision = getPaymentVerificationDecision(orders[0]);
+    if (decision.alreadyPaid) {
+      await conn.commit();
+      return res.json({ success: true, message: 'Payment already verified', data: { already_paid: true } });
+    }
+
     await conn.execute(
       `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW() WHERE id = ?`,
       [req.user.id, orderId]
@@ -1388,10 +1574,16 @@ module.exports = {
   cancelOrder,
   uploadPaymentProof,
   verifyPayment,
+  archiveOrder,
+  unarchiveOrder,
   __testables: {
     buildOrderScope,
     getPublicOrderPlacedByUserId,
     getPublicOrderUnitPrice,
     normalizeOrderPaymentMethod,
+    rankPublicFulfillmentCandidates,
+    resolvePublicFulfillmentRoute,
+    reconcilePublicOrderPricing,
+    buildOrderPricingBreakdown,
   },
 };
