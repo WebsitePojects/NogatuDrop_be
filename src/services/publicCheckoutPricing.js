@@ -12,30 +12,45 @@ function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function getPublicOrderPricingTotals(merchandiseSubtotal, options = {}) {
-  const {
-    shippingZone = 'metro_manila',
-    memberDiscountPct = 0,
-  } = options;
-
+function getPublicOrderPricingTotals(merchandiseSubtotal, { preDiscountSubtotal = merchandiseSubtotal } = {}) {
   const subtotal = roundCurrency(merchandiseSubtotal);
-  const discountAmount = subtotal > 0 ? roundCurrency(subtotal * (Number(memberDiscountPct || 0) / 100)) : 0;
-  const discountedSubtotal = roundCurrency(subtotal - discountAmount);
-  const shippingFee = discountedSubtotal > 0
-    ? (PUBLIC_ORDER_SHIPPING_ZONES[shippingZone] ?? PUBLIC_ORDER_SHIPPING_ZONES.metro_manila)
-    : 0;
-  const vatAmount = discountedSubtotal > 0 ? roundCurrency(discountedSubtotal * PUBLIC_ORDER_VAT_RATE) : 0;
-  const totalDue = roundCurrency(discountedSubtotal + shippingFee + vatAmount);
+  const originalSubtotal = Math.max(subtotal, roundCurrency(preDiscountSubtotal));
+  const memberDiscountAmount = roundCurrency(originalSubtotal - subtotal);
+  const shippingFee = subtotal > 0 ? PUBLIC_ORDER_SHIPPING_FEE : 0;
+  const systemFee = subtotal > 0 ? roundCurrency(subtotal * PUBLIC_ORDER_SYSTEM_FEE_RATE) : 0;
+  const totalDue = roundCurrency(subtotal + shippingFee + systemFee);
 
   return {
     merchandiseSubtotal: subtotal,
-    memberDiscountPct: Number(memberDiscountPct || 0),
-    discountAmount,
-    discountedSubtotal,
-    shippingZone,
+    memberDiscountAmount,
     shippingFee,
     vatAmount,
     systemFee: vatAmount,
+    totalDue,
+  };
+}
+
+function reconcilePublicOrderPricing({
+  merchandiseSubtotal,
+  memberDiscountAmount = 0,
+  shippingFee = 0,
+  systemFee = 0,
+  totalAmount,
+}) {
+  const normalized = {
+    merchandiseSubtotal: roundCurrency(merchandiseSubtotal),
+    memberDiscountAmount: roundCurrency(memberDiscountAmount),
+    shippingFee: roundCurrency(shippingFee),
+    systemFee: roundCurrency(systemFee),
+  };
+  const totalDue = roundCurrency(totalAmount);
+  const componentTotal = roundCurrency(
+    normalized.merchandiseSubtotal + normalized.shippingFee + normalized.systemFee
+  );
+
+  return {
+    ...normalized,
+    adjustmentAmount: roundCurrency(totalDue - componentTotal),
     totalDue,
   };
 }
@@ -44,4 +59,5 @@ module.exports = {
   PUBLIC_ORDER_SHIPPING_ZONES,
   PUBLIC_ORDER_VAT_RATE,
   getPublicOrderPricingTotals,
+  reconcilePublicOrderPricing,
 };

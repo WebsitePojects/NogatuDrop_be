@@ -12,6 +12,52 @@ const {
   canManageDeliveryLinkFromContext,
 } = require('../rbac/affiliationScopes');
 
+/**
+ * Resolve the frontend base URL dynamically.
+ * Priority order:
+ *   1. request Origin header (e.g. https://nogatu.store)
+ *   2. scheme + host derived from Referer header
+ *   3. env.PUBLIC_BASE_URL when it is a real, non-placeholder value
+ *   4. scheme + host inferred from the Express request object
+ *
+ * A "placeholder" value is anything containing "your-production-domain" or
+ * "example.com" (case-insensitive).
+ */
+function resolveFrontendBaseUrl(req) {
+  const placeholderPattern = /your-production-domain|example\.com/i;
+
+  const stripTrailingSlash = (url) => String(url || '').replace(/\/+$/, '');
+
+  // 1. Configured public base URL is AUTHORITATIVE. This forces the customer-facing
+  //    delivery link to the public storefront domain (https://nogatu.store in prod,
+  //    http://localhost:5173 in dev) so it never inherits a different admin domain
+  //    such as a .com. Set via PUBLIC_BASE_URL in .env.prod / .env.dev.
+  const envUrl = String(env.PUBLIC_BASE_URL || '').trim();
+  if (envUrl && !placeholderPattern.test(envUrl)) {
+    return stripTrailingSlash(envUrl);
+  }
+
+  // 2. Origin header (only used when no real PUBLIC_BASE_URL is configured)
+  const origin = req.get('Origin');
+  if (origin && origin.startsWith('http')) {
+    return stripTrailingSlash(origin);
+  }
+
+  // 3. Referer header — extract scheme + host only
+  const referer = req.get('Referer');
+  if (referer && referer.startsWith('http')) {
+    try {
+      const url = new URL(referer);
+      return stripTrailingSlash(`${url.protocol}//${url.host}`);
+    } catch {
+      // malformed Referer — fall through
+    }
+  }
+
+  // 4. Derive from the Express request itself
+  return stripTrailingSlash(`${req.protocol}://${req.get('host')}`);
+}
+
 const isMissingColumn = (err, columnName) => {
   if (!err || err.code !== 'ER_BAD_FIELD_ERROR') {
     return false;
@@ -241,7 +287,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
       );
     }
 
-    const existingMagicLink = `${env.PUBLIC_BASE_URL}/deliver/${existingToken.token}`;
+    const existingMagicLink = `${resolveFrontendBaseUrl(req)}/deliver/${existingToken.token}`;
     return res.status(200).json({
       success: true,
       message: 'Active delivery link already exists',
@@ -293,7 +339,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     await conn.commit();
 
-    const magicLink = `${env.PUBLIC_BASE_URL}/deliver/${token}`;
+    const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token}`;
 
     // Notify Stockist users that order is on its way
     const [partnerUsers] = await pool.execute(
@@ -363,7 +409,7 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
     return res.json({ success: true, data: null });
   }
 
-  const magicLink = `${env.PUBLIC_BASE_URL}/deliver/${token.token}`;
+  const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token.token}`;
   return res.json({
     success: true,
     data: {
@@ -429,7 +475,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               tw.location AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
-       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
        LEFT JOIN couriers c ON c.id = tr.courier_id
@@ -491,7 +537,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               NULL AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
-       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
        LEFT JOIN couriers c ON c.id = tr.courier_id
@@ -545,7 +591,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               tw.location AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
-       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
        LEFT JOIN couriers c ON c.id = tr.courier_id
        LEFT JOIN warehouses sw ON sw.id = o.source_warehouse_id
@@ -598,7 +644,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               NULL AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
-       JOIN partners pt ON pt.id = o.partner_id
+       LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN couriers c ON c.id = tr.courier_id
@@ -616,15 +662,32 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
 const getDeliveryInfo = asyncHandler(async (req, res) => {
   const { token } = req.params;
 
-  const [tokens] = await pool.execute(
-    `SELECT dt.*, o.order_number, o.customer_name, o.customer_address, o.customer_phone,
-            o.total_amount, o.partner_id, o.status AS order_status
-     FROM delivery_tokens dt
-     JOIN orders o ON o.id = dt.order_id
-     WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW()
-     LIMIT 1`,
-    [token]
-  );
+  let tokens;
+  try {
+    [tokens] = await pool.execute(
+      `SELECT dt.*, o.order_number, o.customer_name, o.customer_address, o.customer_phone,
+              o.customer_lat, o.customer_lng,
+              o.total_amount, o.partner_id, o.status AS order_status, o.source_warehouse_id
+       FROM delivery_tokens dt
+       JOIN orders o ON o.id = dt.order_id
+       WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW()
+       LIMIT 1`,
+      [token]
+    );
+  } catch (err) {
+    // source_warehouse_id may not exist in older migrations
+    if (!isMissingColumn(err, 'source_warehouse_id')) throw err;
+    [tokens] = await pool.execute(
+      `SELECT dt.*, o.order_number, o.customer_name, o.customer_address, o.customer_phone,
+              NULL AS customer_lat, NULL AS customer_lng,
+              o.total_amount, o.partner_id, o.status AS order_status, NULL AS source_warehouse_id
+       FROM delivery_tokens dt
+       JOIN orders o ON o.id = dt.order_id
+       WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW()
+       LIMIT 1`,
+      [token]
+    );
+  }
 
   if (tokens.length === 0) throw ApiError.notFound('Delivery link is invalid, expired, or already used');
 
@@ -636,6 +699,55 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
     [info.order_id]
   );
 
+  // Fetch source warehouse coordinates (origin point for the map)
+  let sourceWarehouse = null;
+  if (info.source_warehouse_id) {
+    try {
+      const [whRows] = await pool.execute(
+        `SELECT id, name, location, lat, lng FROM warehouses WHERE id = ? LIMIT 1`,
+        [info.source_warehouse_id]
+      );
+      if (whRows.length > 0) {
+        const wh = whRows[0];
+        sourceWarehouse = {
+          id: wh.id,
+          name: wh.name || null,
+          location: wh.location || null,
+          lat: wh.lat != null ? Number(wh.lat) : null,
+          lng: wh.lng != null ? Number(wh.lng) : null,
+        };
+      }
+    } catch {
+      // Warehouse lookup is best-effort; missing coords are handled by the frontend
+    }
+  }
+
+  // Fetch the latest GPS ping for this order (from delivery_tracking → gps_pings)
+  let latestGps = null;
+  try {
+    const [gpsRows] = await pool.execute(
+      `SELECT gp.lat AS latitude, gp.lng AS longitude, gp.speed_kmh, gp.accuracy_meters, gp.pinged_at
+       FROM gps_pings gp
+       JOIN delivery_tracking dt ON dt.id = gp.tracking_id
+       WHERE dt.order_id = ?
+       ORDER BY gp.pinged_at DESC
+       LIMIT 1`,
+      [info.order_id]
+    );
+    if (gpsRows.length > 0) {
+      const g = gpsRows[0];
+      latestGps = {
+        latitude: g.latitude != null ? Number(g.latitude) : null,
+        longitude: g.longitude != null ? Number(g.longitude) : null,
+        speed_kmh: g.speed_kmh != null ? Number(g.speed_kmh) : null,
+        accuracy_meters: g.accuracy_meters != null ? Number(g.accuracy_meters) : null,
+        pinged_at: g.pinged_at || null,
+      };
+    }
+  } catch {
+    // GPS data is best-effort; the delivery flow must work without it
+  }
+
   res.json({
     success: true,
     data: {
@@ -645,6 +757,16 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
       customer_phone: info.customer_phone,
       total_amount: info.total_amount,
       items,
+      source_warehouse: sourceWarehouse,
+      // Destination = the buyer's pinned coordinates (if they consented) so the
+      // rider map can draw the main-warehouse -> destination route. Only exposed
+      // here (token-authenticated rider view), never on public tracking.
+      destination: {
+        lat: info.customer_lat != null ? Number(info.customer_lat) : null,
+        lng: info.customer_lng != null ? Number(info.customer_lng) : null,
+        address: info.customer_address || null,
+      },
+      latest_gps: latestGps,
     },
   });
 });

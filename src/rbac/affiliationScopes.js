@@ -71,6 +71,7 @@ async function resolveAffiliationContext(db, user) {
       userId: Number(user?.id || 0) || null,
       partnerId: null,
       partnerLevel: null,
+      parentPartnerId: null,
       childCityPartnerIds: [],
     };
   }
@@ -81,6 +82,7 @@ async function resolveAffiliationContext(db, user) {
       userId: Number(user?.id || 0) || null,
       partnerId,
       partnerLevel: ROLES.CITY_STOCKIST,
+      parentPartnerId: null,
       childCityPartnerIds: [],
     };
   }
@@ -92,6 +94,7 @@ async function resolveAffiliationContext(db, user) {
     userId: Number(user?.id || 0) || null,
     partnerId,
     partnerLevel: partner?.stockist_level || null,
+    parentPartnerId: Number(partner?.parent_partner_id || 0) || null,
     childCityPartnerIds: partner?.stockist_level === ROLES.PROVINCIAL_STOCKIST
       ? await getDirectChildCityPartnerIds(db, partner.id)
       : [],

@@ -12,8 +12,16 @@ const pool = mysql.createPool({
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000,
-  timezone: '+00:00',
+  timezone: '+08:00',
   dateStrings: true,
+});
+
+// Force every pooled connection to Asia/Manila (+08:00) so NOW(),
+// CURRENT_TIMESTAMP, and DEFAULT timestamp columns store PH time regardless of
+// the VPS server's system timezone. Without this, a foreign-TZ host would write
+// non-Manila times. Mirrors the timezone handling used in the NogatuMLM system.
+pool.on('connection', (conn) => {
+  conn.query("SET time_zone = '+08:00'");
 });
 
 module.exports = pool;

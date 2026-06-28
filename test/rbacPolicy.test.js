@@ -19,11 +19,15 @@ test('rbac policy grants operational staff only documented operational capabilit
   assert.equal(hasPermission('staff', PERMISSIONS.USERS_MANAGE), false);
   assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_CREATE), false);
   assert.equal(hasPermission('staff', PERMISSIONS.PARTNERS_MANAGE), false);
+  assert.equal(hasPermission('staff', PERMISSIONS.WAREHOUSES_MANAGE), true);
+  assert.equal(hasPermission('staff', PERMISSIONS.PURCHASE_ORDERS_CREATE), true);
 });
 
 test('rbac policy keeps mobile stockists out of management and back-office capabilities', () => {
-  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.CART_USE), true);
-  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.ORDERS_CREATE), true);
+  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.CART_USE), false);
+  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.ORDERS_CREATE), false);
+  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.MOBILE_INVENTORY_VIEW), true);
+  assert.equal(hasPermission('mobile_stockist', PERMISSIONS.MOBILE_INVENTORY_ADJUST), true);
   assert.equal(hasPermission('mobile_stockist', PERMISSIONS.DASHBOARD_VIEW), false);
   assert.equal(hasPermission('mobile_stockist', PERMISSIONS.USERS_MANAGE), false);
   assert.equal(hasPermission('mobile_stockist', PERMISSIONS.REPORTS_VIEW), false);
@@ -37,10 +41,13 @@ test('rbac policy assigns daily operation capabilities by normal production role
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.USERS_MANAGE), true);
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.CART_USE), true);
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.ORDERS_APPROVE), true);
+  assert.equal(hasPermission('provincial_stockist', PERMISSIONS.WAREHOUSES_MANAGE), true);
+  assert.equal(hasPermission('provincial_stockist', PERMISSIONS.PURCHASE_ORDERS_APPROVE), true);
 
   assert.equal(hasPermission('city_stockist', PERMISSIONS.MOBILE_STOCKISTS_MANAGE), true);
   assert.equal(hasPermission('city_stockist', PERMISSIONS.ORDERS_APPROVE), true);
   assert.equal(hasPermission('city_stockist', PERMISSIONS.ORDERS_VERIFY_PAYMENT), true);
+  assert.equal(hasPermission('city_stockist', PERMISSIONS.WAREHOUSES_MANAGE), true);
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.ORDERS_VERIFY_PAYMENT), true);
 
   assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), true);

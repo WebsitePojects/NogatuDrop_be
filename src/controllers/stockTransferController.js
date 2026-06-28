@@ -204,6 +204,96 @@ const createTransfer = asyncHandler(async (req, res) => {
   }
 });
 
+// PATCH /api/v1/stock-transfers/:id/transit
+const transitTransfer = asyncHandler(async (req, res) => {
+  const transferId = req.params.id;
+  const scope = scopedTransferClause(req.user);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [transfers] = await conn.execute(
+      `SELECT st.id, st.status
+       FROM stock_transfers st
+       JOIN warehouses fw ON fw.id = st.from_warehouse_id
+       JOIN warehouses tw ON tw.id = st.to_warehouse_id
+       WHERE st.id = ? AND st.is_deleted = 0${scope.clause}
+       LIMIT 1
+       FOR UPDATE`,
+      [transferId, ...scope.params]
+    );
+    if (transfers.length === 0) throw ApiError.notFound('Stock transfer not found');
+    if (transfers[0].status === 'in_transit') throw ApiError.badRequest('Transfer is already in transit');
+    if (transfers[0].status === 'completed') throw ApiError.badRequest('Transfer is already completed');
+    if (transfers[0].status === 'cancelled') throw ApiError.badRequest('Transfer is cancelled');
+
+    const [result] = await conn.execute(
+      `UPDATE stock_transfers
+       SET status = 'in_transit'
+       WHERE id = ? AND status = 'pending'`,
+      [transferId]
+    );
+    if (result.affectedRows === 0) {
+      throw ApiError.badRequest('Transfer is no longer eligible to move to in transit');
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: 'Stock transfer marked as in transit' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// PATCH /api/v1/stock-transfers/:id/cancel
+const cancelTransfer = asyncHandler(async (req, res) => {
+  const transferId = req.params.id;
+  const scope = scopedTransferClause(req.user);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [transfers] = await conn.execute(
+      `SELECT st.id, st.status
+       FROM stock_transfers st
+       JOIN warehouses fw ON fw.id = st.from_warehouse_id
+       JOIN warehouses tw ON tw.id = st.to_warehouse_id
+       WHERE st.id = ? AND st.is_deleted = 0${scope.clause}
+       LIMIT 1
+       FOR UPDATE`,
+      [transferId, ...scope.params]
+    );
+    if (transfers.length === 0) throw ApiError.notFound('Stock transfer not found');
+    if (transfers[0].status === 'cancelled') throw ApiError.badRequest('Transfer is already cancelled');
+    if (transfers[0].status === 'completed') throw ApiError.badRequest('Cannot cancel a completed transfer');
+
+    // Stock transfers in this system only deduct/add inventory at completion time
+    // (see completeTransfer — no reserved_stock is touched on create or transit).
+    // Therefore no inventory release is needed for pending or in_transit transfers.
+    const [result] = await conn.execute(
+      `UPDATE stock_transfers
+       SET status = 'cancelled'
+       WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
+      [transferId]
+    );
+    if (result.affectedRows === 0) {
+      throw ApiError.badRequest('Transfer is no longer eligible for cancellation');
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: 'Stock transfer cancelled' });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 // PATCH /api/v1/stock-transfers/:id/complete
 const completeTransfer = asyncHandler(async (req, res) => {
   const transferId = req.params.id;
@@ -334,4 +424,4 @@ const completeTransfer = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { getTransfers, getTransfer, createTransfer, completeTransfer };
+module.exports = { getTransfers, getTransfer, createTransfer, transitTransfer, cancelTransfer, completeTransfer };

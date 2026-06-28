@@ -267,6 +267,41 @@ const updateUser = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'User updated', data: updated[0] });
 });
 
+// POST /api/v1/users/:id/reset-password
+const resetUserPassword = asyncHandler(async (req, res) => {
+  const userId = req.params.id;
+
+  const checkParams = [userId];
+  let checkWhere = 'WHERE id = ? AND is_deleted = 0';
+  if (req.user.role_slug !== 'super_admin' && req.user.partner_id) {
+    checkWhere += ' AND partner_id = ?';
+    checkParams.push(req.user.partner_id);
+  }
+
+  const [existing] = await pool.execute(
+    `SELECT id FROM users ${checkWhere} LIMIT 1`,
+    checkParams
+  );
+  if (existing.length === 0) throw ApiError.notFound('User not found');
+
+  // Generate a strong random temporary password (16 hex chars = 64 bits entropy)
+  const crypto = require('crypto');
+  const temporaryPassword = crypto.randomBytes(8).toString('hex');
+
+  const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
+
+  await pool.execute(
+    'UPDATE users SET password = ? WHERE id = ? AND is_deleted = 0',
+    [hashedPassword, userId]
+  );
+
+  res.json({
+    success: true,
+    data: { temporary_password: temporaryPassword },
+    message: 'Password reset',
+  });
+});
+
 // DELETE /api/v1/users/:id (soft delete)
 const deleteUser = asyncHandler(async (req, res) => {
   const userId = req.params.id;
@@ -291,4 +326,4 @@ const deleteUser = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'User deleted' });
 });
 
-module.exports = { getUsers, getUser, createUser, updateUser, deleteUser };
+module.exports = { getUsers, getUser, createUser, updateUser, deleteUser, resetUserPassword };

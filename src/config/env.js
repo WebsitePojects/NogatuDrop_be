@@ -43,6 +43,9 @@ const env = {
   // Alliance API bridge
   ALLIANCE_API_KEY: process.env.ALLIANCE_API_KEY || '',
 
+  MLM_API_URL: process.env.MLM_API_URL || '',
+  MLM_API_KEY: process.env.MLM_API_KEY || '',
+
   // Public base URL (for magic links)
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || 'http://localhost:5173',
 

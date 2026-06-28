@@ -195,7 +195,7 @@ const getProducts = asyncHandler(async (req, res) => {
     params.push(category);
   }
 
-  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
+  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, is_active, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
   const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
@@ -311,7 +311,7 @@ const getPublicProducts = asyncHandler(async (req, res) => {
 // GET /api/v1/products/:id
 const getProduct = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, created_at, updated_at
+    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, is_active, created_at, updated_at
      FROM products WHERE id = ? AND is_deleted = 0 LIMIT 1`,
     [req.params.id]
   );
@@ -323,12 +323,25 @@ const getProduct = asyncHandler(async (req, res) => {
 
 // POST /api/v1/products
 const createProduct = asyncHandler(async (req, res) => {
-  const { name, sku, category, retail_price, partner_price, unit, description, is_active } = req.body;
+  const { name, retail_price, partner_price, unit, description } = req.body;
+  let { sku, category } = req.body;
 
+  // SKU = Stock Keeping Unit: the product's unique code used for inventory tracking.
+  // If the user leaves it blank, auto-generate a unique one instead of erroring.
+  sku = String(sku || '').trim();
+  if (!sku) {
+    sku = `NOG-${Date.now().toString().slice(-8)}`;
+  }
+
+  // The sku column has a UNIQUE index across ALL rows (including soft-deleted),
+  // so check every row — not just is_deleted = 0 — to give a clear message
+  // instead of a raw DB duplicate-key 500.
   const [existing] = await pool.execute(
-    'SELECT id FROM products WHERE sku = ? AND is_deleted = 0 LIMIT 1', [sku]
+    'SELECT id FROM products WHERE sku = ? LIMIT 1', [sku]
   );
-  if (existing.length > 0) throw ApiError.conflict('SKU already exists');
+  if (existing.length > 0) {
+    throw ApiError.conflict(`SKU "${sku}" already exists — use a different SKU or leave it blank to auto-generate one.`);
+  }
 
   const image_url = req.file ? req.file.path : null;
 
@@ -359,6 +372,14 @@ const updateProduct = asyncHandler(async (req, res) => {
   const productId = req.params.id;
   const { name, sku, category, retail_price, partner_price, unit, description, is_active } = req.body;
 
+  // Coerce is_active from FormData string → DB tinyint.
+  // FormData sends booleans as "true"/"false"; also accept "1"/"0" and actual booleans.
+  let is_active;
+  if (req.body.is_active !== undefined) {
+    const raw = req.body.is_active;
+    is_active = (raw === true || raw === 1 || raw === '1' || raw === 'true') ? 1 : 0;
+  }
+
   const [existing] = await pool.execute(
     'SELECT id FROM products WHERE id = ? AND is_deleted = 0 LIMIT 1', [productId]
   );
@@ -381,10 +402,8 @@ const updateProduct = asyncHandler(async (req, res) => {
   if (partner_price !== undefined) { fields.push('partner_price = ?'); values.push(partner_price); }
   if (unit) { fields.push('unit = ?'); values.push(unit); }
   if (description !== undefined) { fields.push('description = ?'); values.push(description || null); }
-  if (is_active !== undefined) {
-    fields.push('is_active = ?');
-    values.push(Number(is_active === true || is_active === 'true' || is_active === 1 || is_active === '1'));
-  }
+  // Only update is_active when explicitly provided; never let undefined/null flip it.
+  if (is_active !== undefined) { fields.push('is_active = ?'); values.push(is_active); }
 
   if (req.file) {
     fields.push('image_url = ?');

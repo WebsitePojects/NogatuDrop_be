@@ -6,6 +6,10 @@ const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
 const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
 const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
 const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
+const {
+  PUBLIC_ORDER_SHIPPING_FEE,
+  reconcilePublicOrderPricing,
+} = require('../services/publicCheckoutPricing');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -29,6 +33,32 @@ async function getLatestPingByTrackingId(trackingId) {
   );
 
   return pings[0] || null;
+}
+
+function buildTrackingPricingBreakdown(row) {
+  const merchandiseSubtotal = Number(row.merchandise_subtotal ?? row.item_subtotal ?? 0);
+  const totalAmount = Number(row.total_amount || 0);
+  const shippingFee = row.shipping_fee == null
+    ? (totalAmount - merchandiseSubtotal >= PUBLIC_ORDER_SHIPPING_FEE ? PUBLIC_ORDER_SHIPPING_FEE : 0)
+    : Number(row.shipping_fee);
+  const systemFee = row.system_fee == null
+    ? Math.max(totalAmount - merchandiseSubtotal - shippingFee, 0)
+    : Number(row.system_fee);
+  const reconciled = reconcilePublicOrderPricing({
+    merchandiseSubtotal,
+    memberDiscountAmount: row.member_discount_amount || 0,
+    shippingFee,
+    systemFee,
+    totalAmount,
+  });
+  return {
+    merchandise_subtotal: reconciled.merchandiseSubtotal,
+    member_discount_amount: reconciled.memberDiscountAmount,
+    shipping_fee: reconciled.shippingFee,
+    system_fee: reconciled.systemFee,
+    adjustment_amount: reconciled.adjustmentAmount,
+    total_amount: reconciled.totalDue,
+  };
 }
 
 function normalizePublicStatus(orderStatus, trackingStatus) {
@@ -153,6 +183,11 @@ const getPublicTracking = asyncHandler(async (req, res) => {
             o.payment_status,
             o.payment_proof_uploaded_at,
             o.total_amount,
+            o.merchandise_subtotal,
+            o.member_discount_amount,
+            o.shipping_fee,
+            o.system_fee,
+            (SELECT ROUND(SUM(oi.subtotal), 2) FROM order_items oi WHERE oi.order_id = o.id) AS item_subtotal,
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status,
             dt.est_delivery_at,
@@ -182,6 +217,25 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       }
     : null;
 
+  // Fetch origin warehouse coordinates (safe to expose — no financial or personal data)
+  let sourceWarehouse = null;
+  if (row.source_warehouse_id) {
+    try {
+      const whRows = await fetchWarehouseRowsByIds([Number(row.source_warehouse_id)]);
+      if (whRows && whRows.length > 0) {
+        const wh = whRows[0];
+        sourceWarehouse = {
+          name: wh.name || null,
+          location: wh.location || null,
+          lat: wh.lat != null ? Number(wh.lat) : null,
+          lng: wh.lng != null ? Number(wh.lng) : null,
+        };
+      }
+    } catch {
+      // Warehouse coords are enhancement-only; do not fail the tracking request
+    }
+  }
+
   res.json({
     success: true,
     data: {
@@ -189,6 +243,7 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       payment_status: row.payment_status || 'pending',
       payment_proof_uploaded_at: row.payment_proof_uploaded_at || null,
       total_amount: Number(row.total_amount || 0),
+      pricing_breakdown: buildTrackingPricingBreakdown(row),
       bank_account: bankAccount ? {
         bank_name: bankAccount.bank_name,
         account_name: bankAccount.account_name,
@@ -196,6 +251,7 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       } : null,
       courier: row.courier_name || null,
       gps,
+      source_warehouse: sourceWarehouse,
       eta: row.est_delivery_at || null,
     },
   });
