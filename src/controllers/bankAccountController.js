@@ -15,12 +15,6 @@ const isMissingSoftDeleteColumn = (err) => (
   )
 );
 
-const isMissingColumnError = (err, columnName) => (
-  err &&
-  err.code === 'ER_BAD_FIELD_ERROR' &&
-  String(err.message || '').includes(`'${columnName}'`)
-);
-
 async function executeSoftDeleteAware(db, primarySql, params = [], fallbackSql = null) {
   try {
     return await db.execute(primarySql, params);
@@ -90,52 +84,23 @@ const getBankAccounts = asyncHandler(async (req, res) => {
 
 // POST /api/v1/bank-accounts
 const createBankAccount = asyncHandler(async (req, res) => {
-  const {
-    warehouse_id,
-    bank_name,
-    account_name,
-    account_number,
-    is_default,
-    is_active,
-    notes,
-  } = req.body;
+  const { warehouse_id, bank_name, account_name, account_number, is_default } = req.body;
   if (!bank_name || !account_name || !account_number) {
     throw ApiError.badRequest('bank_name, account_name, and account_number are required');
   }
 
-  let result;
-  try {
-    [result] = await pool.execute(
-      `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, is_default, is_active, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        warehouse_id || null,
-        bank_name,
-        account_name,
-        account_number,
-        is_default ? 1 : 0,
-        is_active === undefined ? 1 : Number(Boolean(is_active)),
-        notes || null,
-      ]
-    );
-  } catch (err) {
-    if (!isMissingColumnError(err, 'notes') && !isMissingColumnError(err, 'is_active')) {
-      throw err;
-    }
-
-    [result] = await pool.execute(
-      `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, is_default)
-       VALUES (?, ?, ?, ?, ?)`,
-      [warehouse_id || null, bank_name, account_name, account_number, is_default ? 1 : 0]
-    );
-  }
+  const [result] = await pool.execute(
+    `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, is_default)
+     VALUES (?, ?, ?, ?, ?)`,
+    [warehouse_id || null, bank_name, account_name, account_number, is_default ? 1 : 0]
+  );
   res.status(201).json({ success: true, message: 'Bank account created', data: { id: result.insertId } });
 });
 
 // PUT /api/v1/bank-accounts/:id
 const updateBankAccount = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { warehouse_id, bank_name, account_name, account_number, is_active, is_default, notes } = req.body;
+  const { bank_name, account_name, account_number, is_active, is_default } = req.body;
 
   const hasSoftDelete = await bankAccountsHasIsDeletedColumn();
   let existing;
@@ -148,51 +113,12 @@ const updateBankAccount = asyncHandler(async (req, res) => {
     throw ApiError.notFound('Bank account not found');
   }
 
-  try {
-    await pool.execute(
-      `UPDATE bank_accounts
-       SET warehouse_id = COALESCE(?, warehouse_id),
-           bank_name = COALESCE(?, bank_name),
-           account_name = COALESCE(?, account_name),
-           account_number = COALESCE(?, account_number),
-           is_active = COALESCE(?, is_active),
-           is_default = COALESCE(?, is_default),
-           notes = COALESCE(?, notes)
-       WHERE id = ?`,
-      [
-        warehouse_id !== undefined ? (warehouse_id || null) : null,
-        bank_name,
-        account_name,
-        account_number,
-        is_active !== undefined ? Number(Boolean(is_active)) : null,
-        is_default !== undefined ? Number(Boolean(is_default)) : null,
-        notes !== undefined ? (notes || null) : null,
-        id,
-      ]
-    );
-  } catch (err) {
-    if (!isMissingColumnError(err, 'notes') && !isMissingColumnError(err, 'warehouse_id')) {
-      throw err;
-    }
-
-    await pool.execute(
-      `UPDATE bank_accounts
-       SET bank_name = COALESCE(?, bank_name),
-           account_name = COALESCE(?, account_name),
-           account_number = COALESCE(?, account_number),
-           is_active = COALESCE(?, is_active),
-           is_default = COALESCE(?, is_default)
-       WHERE id = ?`,
-      [
-        bank_name,
-        account_name,
-        account_number,
-        is_active !== undefined ? Number(Boolean(is_active)) : null,
-        is_default !== undefined ? Number(Boolean(is_default)) : null,
-        id,
-      ]
-    );
-  }
+  await pool.execute(
+    `UPDATE bank_accounts SET bank_name = COALESCE(?, bank_name), account_name = COALESCE(?, account_name),
+     account_number = COALESCE(?, account_number), is_active = COALESCE(?, is_active),
+     is_default = COALESCE(?, is_default) WHERE id = ?`,
+    [bank_name, account_name, account_number, is_active !== undefined ? is_active : null, is_default !== undefined ? is_default : null, id]
+  );
   res.json({ success: true, message: 'Bank account updated' });
 });
 

@@ -1,12 +1,5 @@
-const PUBLIC_ORDER_SHIPPING_ZONES = {
-  metro_manila: 120,
-  luzon: 180,
-  visayas_mindanao: 250,
-};
-const PUBLIC_ORDER_VAT_RATE = 0.12;
-// TODO: awaiting data - confirm fixed zone rates for Metro Manila, Luzon, and Visayas/Mindanao.
-// TODO: awaiting data - confirm whether shipping should remain zone-based or use a distance-based courier API.
-// TODO: awaiting data - voucher/member discount interplay must be finalized before backend total calculation can auto-apply member pricing.
+const PUBLIC_ORDER_SHIPPING_FEE = 159;
+const PUBLIC_ORDER_SYSTEM_FEE_RATE = 0.12;
 
 function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
@@ -24,8 +17,7 @@ function getPublicOrderPricingTotals(merchandiseSubtotal, { preDiscountSubtotal 
     merchandiseSubtotal: subtotal,
     memberDiscountAmount,
     shippingFee,
-    vatAmount,
-    systemFee: vatAmount,
+    systemFee,
     totalDue,
   };
 }
@@ -56,8 +48,8 @@ function reconcilePublicOrderPricing({
 }
 
 module.exports = {
-  PUBLIC_ORDER_SHIPPING_ZONES,
-  PUBLIC_ORDER_VAT_RATE,
+  PUBLIC_ORDER_SHIPPING_FEE,
+  PUBLIC_ORDER_SYSTEM_FEE_RATE,
   getPublicOrderPricingTotals,
   reconcilePublicOrderPricing,
 };

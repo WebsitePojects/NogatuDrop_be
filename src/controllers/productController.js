@@ -346,19 +346,9 @@ const createProduct = asyncHandler(async (req, res) => {
   const image_url = req.file ? req.file.path : null;
 
   const [result] = await pool.execute(
-    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      name,
-      sku,
-      category || 'Drink Mixes',
-      retail_price,
-      partner_price,
-      unit || '420g Boxes',
-      description || null,
-      image_url,
-      is_active === undefined ? 1 : Number(is_active === true || is_active === 'true' || is_active === 1 || is_active === '1'),
-    ]
+    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url]
   );
 
   const [created] = await pool.execute('SELECT * FROM products WHERE id = ?', [result.insertId]);
@@ -370,7 +360,7 @@ const createProduct = asyncHandler(async (req, res) => {
 // PUT /api/v1/products/:id
 const updateProduct = asyncHandler(async (req, res) => {
   const productId = req.params.id;
-  const { name, sku, category, retail_price, partner_price, unit, description, is_active } = req.body;
+  const { name, sku, category, retail_price, partner_price, unit, description } = req.body;
 
   // Coerce is_active from FormData string → DB tinyint.
   // FormData sends booleans as "true"/"false"; also accept "1"/"0" and actual booleans.
