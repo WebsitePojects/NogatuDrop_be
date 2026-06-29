@@ -424,16 +424,29 @@ const completeGRN = asyncHandler(async (req, res) => {
           [item.received_qty, invRows[0].id]
         );
       } else {
-        await conn.execute(
-          `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, last_movement_at)
-           VALUES (?, ?, ?, ?, NOW())`,
-          [
-            item.product_id,
-            grn.warehouse_id,
-            isSuperAdmin(req.user) ? grn.warehouse_partner_id || null : req.user.partner_id,
-            item.received_qty,
-          ]
-        );
+        const invPartnerId = isSuperAdmin(req.user) ? grn.warehouse_partner_id || null : req.user.partner_id;
+        // Some schemas make inventories.batch_number NOT NULL with no default, so a
+        // bare insert 500s ("Field 'batch_number' doesn't have a default value").
+        // Carry the GRN line's batch (fallback to a deterministic ref); retry without
+        // the batch columns on older schemas that don't have them.
+        const batchNumber = item.batch_number || `GRN-${grnId}-${item.product_id}`;
+        try {
+          await conn.execute(
+            `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, batch_number, expiry_date, last_movement_at)
+             VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+            [item.product_id, grn.warehouse_id, invPartnerId, item.received_qty, batchNumber, item.expiry_date || null]
+          );
+        } catch (err) {
+          if (err && err.code === 'ER_BAD_FIELD_ERROR') {
+            await conn.execute(
+              `INSERT INTO inventories (product_id, warehouse_id, partner_id, current_stock, last_movement_at)
+               VALUES (?, ?, ?, ?, NOW())`,
+              [item.product_id, grn.warehouse_id, invPartnerId, item.received_qty]
+            );
+          } else {
+            throw err;
+          }
+        }
       }
 
       // Log stock movement
