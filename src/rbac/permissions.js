@@ -139,9 +139,12 @@ const ROLE_PERMISSIONS = Object.freeze({
   ]),
 
   [ROLES.STAFF]: Object.freeze([
+    // TODO: voucher transactions for staff are pending a voucher-system spec — not built yet.
     PERMISSIONS.DASHBOARD_VIEW,
     PERMISSIONS.REPORTS_VIEW,
     PERMISSIONS.ORDERS_VIEW,
+    PERMISSIONS.ORDERS_CREATE,
+    PERMISSIONS.ORDERS_APPROVE,
     PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF,
     PERMISSIONS.INVENTORY_VIEW,
     PERMISSIONS.GRN_VIEW,

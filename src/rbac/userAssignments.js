@@ -80,7 +80,16 @@ async function resolveUserAssignment({ actor, requested, getRoleBySlug, getPartn
       };
     }
 
-    if (STOCKIST_SCOPED_ROLES.has(roleSlug)) {
+    // Staff may be attached to a COMPANY-owned warehouse (e.g. the Goldenstar main
+    // warehouse, partner_id NULL) — that's company staff with no Stockist scope.
+    // Only a verified warehouse row with no owner unlocks this; every other
+    // stockist-scoped role still requires a partner (fail closed).
+    const isCompanyWarehouseStaff =
+      roleSlug === ROLES.STAFF &&
+      requested.warehouse &&
+      !requested.warehouse.partner_id;
+
+    if (STOCKIST_SCOPED_ROLES.has(roleSlug) && !isCompanyWarehouseStaff) {
       const partner = await getPartnerByIdOrThrow(requested.partner_id, getPartnerById);
       assertPartnerSupportsRole(roleSlug, partner);
     }

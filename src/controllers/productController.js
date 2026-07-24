@@ -182,9 +182,25 @@ async function scopeProductsForOrderingUser(db, user, products) {
 
 // GET /api/v1/products
 const getProducts = asyncHandler(async (req, res) => {
-  const { page, limit, search, category } = req.query;
+  const { page, limit, search, category, status } = req.query;
   const params = [];
-  let where = 'WHERE is_deleted = 0 AND is_active = 1';
+  const isSuperAdmin = canonicalRole(req.user?.role_slug) === ROLES.SUPER_ADMIN;
+
+  let where = 'WHERE is_deleted = 0';
+
+  if (isSuperAdmin) {
+    // Super admins manage the full catalog, including deactivated products (e.g. "Glow"),
+    // otherwise they'd be invisible in the admin UI while still holding their SKU.
+    // Optional ?status=active|inactive narrows the view; omitted shows both.
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    if (normalizedStatus === 'active') {
+      where += ' AND is_active = 1';
+    } else if (normalizedStatus === 'inactive') {
+      where += ' AND is_active = 0';
+    }
+  } else {
+    where += ' AND is_active = 1';
+  }
 
   if (search) {
     where += ' AND (name LIKE ? OR sku LIKE ?)';
@@ -333,17 +349,54 @@ const createProduct = asyncHandler(async (req, res) => {
     sku = `NOG-${Date.now().toString().slice(-8)}`;
   }
 
-  // The sku column has a UNIQUE index across ALL rows (including soft-deleted),
-  // so check every row — not just is_deleted = 0 — to give a clear message
-  // instead of a raw DB duplicate-key 500.
-  const [existing] = await pool.execute(
-    'SELECT id FROM products WHERE sku = ? LIMIT 1', [sku]
-  );
-  if (existing.length > 0) {
-    throw ApiError.conflict(`SKU "${sku}" already exists — use a different SKU or leave it blank to auto-generate one.`);
-  }
-
   const image_url = req.file ? req.file.path : null;
+
+  // The sku column has a UNIQUE index across ALL rows (including soft-deleted/deactivated),
+  // so check every row — not just is_deleted = 0 — instead of letting a raw DB
+  // duplicate-key error surface as a 500.
+  const [existing] = await pool.execute(
+    'SELECT id, name, is_deleted, is_active FROM products WHERE sku = ? LIMIT 1', [sku]
+  );
+
+  if (existing.length > 0) {
+    const holder = existing[0];
+
+    if (Number(holder.is_deleted) === 1) {
+      // The SKU belongs to a previously soft-deleted product (e.g. deactivated-then-deleted
+      // "Glow"). Restore that row with the newly submitted data instead of 409ing —
+      // re-creating a deleted SKU should just work.
+      const fields = [
+        'name = ?', 'category = ?', 'retail_price = ?', 'partner_price = ?',
+        'unit = ?', 'description = ?', 'is_deleted = 0', 'is_active = 1',
+      ];
+      const values = [
+        name, category || 'Drink Mixes', retail_price, partner_price,
+        unit || '420g Boxes', description || null,
+      ];
+      if (image_url) {
+        fields.push('image_url = ?');
+        values.push(image_url);
+      }
+      values.push(holder.id);
+
+      await pool.execute(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, values);
+
+      const [restored] = await pool.execute('SELECT * FROM products WHERE id = ?', [holder.id]);
+      await cache.delPattern('products:*');
+
+      res.status(200).json({
+        success: true,
+        message: 'Restored previously deleted product with this SKU.',
+        data: restored[0],
+      });
+      return;
+    }
+
+    const statusLabel = Number(holder.is_active) === 1 ? 'active' : 'deactivated';
+    throw ApiError.conflict(
+      `SKU "${sku}" is used by "${holder.name}" (currently ${statusLabel}). Edit that product instead, or use a different SKU.`
+    );
+  }
 
   const [result] = await pool.execute(
     `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url)

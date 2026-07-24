@@ -33,9 +33,9 @@ test('active tracking scope lets provincial stockists see own plus direct city-c
 
   assert.equal(
     scope.clause.replace(/\s+/g, ' ').trim(),
-    "AND ( ord.partner_id = ? OR ( ord.partner_id IN (?) AND ( SELECT r.slug FROM users placed_by_user JOIN roles r ON r.id = placed_by_user.role_id WHERE placed_by_user.id = ord.placed_by LIMIT 1 ) = ? ) )"
+    "AND ( ord.partner_id = ? OR ( ord.partner_id IN (?) AND ( SELECT r.slug FROM users placed_by_user JOIN roles r ON r.id = placed_by_user.role_id WHERE placed_by_user.id = ord.placed_by LIMIT 1 ) IN (?, ?) ) )"
   );
-  assert.deepEqual(scope.params, [42, 77, 'city_stockist']);
+  assert.deepEqual(scope.params, [42, 77, 'city_stockist', 'staff']);
 });
 
 test('active tracking scope restricts mobile stockists to their own orders', () => {

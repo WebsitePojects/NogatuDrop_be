@@ -4,6 +4,9 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
+
 // GET /api/v1/partners
 const getPartners = asyncHandler(async (req, res) => {
   const { page, limit, search, status, stockist_level } = req.query;
@@ -56,21 +59,48 @@ const createPartner = asyncHandler(async (req, res) => {
     admin_name, admin_email, admin_password,
   } = req.body;
 
-  if (!business_name || !email || !stockist_level) {
+  const normalizedBusinessName = typeof business_name === 'string' ? business_name.trim() : '';
+  const normalizedEmail = typeof email === 'string' ? email.trim() : '';
+
+  if (!normalizedBusinessName || !normalizedEmail || !stockist_level) {
     throw ApiError.badRequest('business_name, email, and stockist_level are required');
+  }
+  if (!EMAIL_RE.test(normalizedEmail)) {
+    throw ApiError.badRequest('Email must be a valid email address');
   }
   if (!['provincial_stockist', 'city_stockist'].includes(stockist_level)) {
     throw ApiError.badRequest('stockist_level must be provincial_stockist or city_stockist');
   }
+  if (admin_password && admin_password.length < 8) {
+    throw ApiError.badRequest('Password must be at least 8 characters');
+  }
 
+  const adminMail = (admin_email || normalizedEmail || '').trim();
+  if (!EMAIL_RE.test(adminMail)) {
+    throw ApiError.badRequest('admin_email must be a valid email address');
+  }
+
+  // Check duplicates across ALL rows (including soft-deleted) — the DB
+  // unique indexes on partners.email / users.email are not filtered by
+  // is_deleted, so a soft-deleted holder would otherwise surface as a raw
+  // ER_DUP_ENTRY 500 at INSERT time instead of a clean 409 here.
   const [dupPartner] = await pool.execute(
-    'SELECT id FROM partners WHERE email = ? AND is_deleted = 0', [email]
+    'SELECT id, is_deleted FROM partners WHERE email = ? LIMIT 1', [normalizedEmail]
   );
-  if (dupPartner.length > 0) throw ApiError.conflict('Stockist email already exists');
+  if (dupPartner.length > 0) {
+    if (dupPartner[0].is_deleted) {
+      throw ApiError.conflict('A deleted Stockist account holds this email. Restore it or use a different email.');
+    }
+    throw ApiError.conflict('Stockist email already exists');
+  }
 
-  const adminMail = admin_email || email;
-  const [dupUser] = await pool.execute('SELECT id FROM users WHERE email = ? AND is_deleted = 0', [adminMail]);
-  if (dupUser.length > 0) throw ApiError.conflict('User email already in use');
+  const [dupUser] = await pool.execute('SELECT id, is_deleted FROM users WHERE email = ? LIMIT 1', [adminMail]);
+  if (dupUser.length > 0) {
+    if (dupUser[0].is_deleted) {
+      throw ApiError.conflict('A deleted account holds this email. Restore it or use a different email.');
+    }
+    throw ApiError.conflict('User email already in use');
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -79,7 +109,7 @@ const createPartner = asyncHandler(async (req, res) => {
     const [partnerResult] = await conn.execute(
       `INSERT INTO partners (business_name, email, phone, address, stockist_level, parent_partner_id, discount_pct)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [business_name, email, phone || null, address || null, stockist_level,
+      [normalizedBusinessName, normalizedEmail, phone || null, address || null, stockist_level,
        parent_partner_id || null, discount_pct !== undefined ? discount_pct : 0]
     );
     const partnerId = partnerResult.insertId;
@@ -93,7 +123,7 @@ const createPartner = asyncHandler(async (req, res) => {
     await conn.execute(
       `INSERT INTO users (name, email, password, phone, role_id, partner_id)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [admin_name || business_name, adminMail, hashed, phone || null, roleRow[0].id, partnerId]
+      [admin_name || normalizedBusinessName, adminMail, hashed, phone || null, roleRow[0].id, partnerId]
     );
 
     await conn.commit();
@@ -108,6 +138,7 @@ const createPartner = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     await conn.rollback();
+    if (isDupEntryError(err)) throw ApiError.conflict('Email already in use');
     throw err;
   } finally {
     conn.release();

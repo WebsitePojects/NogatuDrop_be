@@ -17,7 +17,8 @@ test('rbac policy grants operational staff only documented operational capabilit
   assert.equal(hasPermission('staff', PERMISSIONS.DELIVERY_TOKENS_CREATE), true);
   assert.equal(hasPermission('staff', PERMISSIONS.CART_USE), false);
   assert.equal(hasPermission('staff', PERMISSIONS.USERS_MANAGE), false);
-  assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_CREATE), false);
+  // Management decision (2026-07): staff can now place orders on their employer's behalf.
+  assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_CREATE), true);
   assert.equal(hasPermission('staff', PERMISSIONS.PARTNERS_MANAGE), false);
   assert.equal(hasPermission('staff', PERMISSIONS.WAREHOUSES_MANAGE), true);
   assert.equal(hasPermission('staff', PERMISSIONS.PURCHASE_ORDERS_CREATE), true);
@@ -51,7 +52,10 @@ test('rbac policy assigns daily operation capabilities by normal production role
   assert.equal(hasPermission('provincial_stockist', PERMISSIONS.ORDERS_VERIFY_PAYMENT), true);
 
   assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), true);
-  assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_APPROVE), false);
+  // Management decision (2026-07): staff can approve orders from affiliated lower-tier
+  // stockists (e.g. city staff approving mobile-stockist orders); see affiliationScopes.js
+  // canApproveOrderFromContext for the scoping that still blocks self-partner approval.
+  assert.equal(hasPermission('staff', PERMISSIONS.ORDERS_APPROVE), true);
 });
 
 test('requirePermission denies users without the requested capability', async () => {

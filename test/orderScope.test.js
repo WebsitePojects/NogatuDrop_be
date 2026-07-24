@@ -92,9 +92,9 @@ test('order scope lets provincial stockists see own orders plus direct city-chil
 
   assert.equal(
     scope.clause.replace(/\s+/g, ' ').trim(),
-    "AND ( o.partner_id = ? OR ( o.partner_id IN (?, ?) AND ( SELECT r.slug FROM users placed_by_user JOIN roles r ON r.id = placed_by_user.role_id WHERE placed_by_user.id = o.placed_by LIMIT 1 ) = ? ) )"
+    "AND ( o.partner_id = ? OR ( o.partner_id IN (?, ?) AND ( SELECT r.slug FROM users placed_by_user JOIN roles r ON r.id = placed_by_user.role_id WHERE placed_by_user.id = o.placed_by LIMIT 1 ) IN (?, ?) ) )"
   );
-  assert.deepEqual(scope.params, [2, 4, 6, 'city_stockist']);
+  assert.deepEqual(scope.params, [2, 4, 6, 'city_stockist', 'staff']);
 });
 
 test('order payment method defaults to bank transfer', () => {

@@ -164,10 +164,13 @@ function buildOrderScopeFromContext(context, {
         ${orderRef}partner_id = ?
         OR (
           ${orderRef}partner_id IN (${childPlaceholders})
-          AND ${placedByRoleExpression} = ?
+          AND ${placedByRoleExpression} IN (?, ?)
         )
       )`,
-      params: [partnerId, ...childCityPartnerIds, ROLES.CITY_STOCKIST],
+      // A child City's upstream orders may be placed by the city owner OR its staff
+      // (staff share the city's partner_id). Both must be visible to the parent
+      // Provincial so it can approve them from the list — mirrors canApproveOrderFromContext.
+      params: [partnerId, ...childCityPartnerIds, ROLES.CITY_STOCKIST, ROLES.STAFF],
     };
   }
 
@@ -200,7 +203,12 @@ function canApproveOrderFromContext(context, order) {
   }
 
   if (partnerLevel === ROLES.PROVINCIAL_STOCKIST) {
-    return childCityPartnerIds.includes(orderPartnerId) && placedByRoleSlug === ROLES.CITY_STOCKIST;
+    // A City Stockist's own staff can now place orders on the city's behalf (partner_id is
+    // shared between a Stockist owner and its Staff), so the order's placed-by role may be
+    // either the city owner or city staff — both still require Provincial (parent) approval,
+    // never self-approval by the City itself.
+    return childCityPartnerIds.includes(orderPartnerId)
+      && (placedByRoleSlug === ROLES.CITY_STOCKIST || placedByRoleSlug === ROLES.STAFF);
   }
 
   return false;
