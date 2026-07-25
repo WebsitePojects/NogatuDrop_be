@@ -75,6 +75,7 @@ be created/restored and exactly what will be archived, table by table.
 | `SEED_SUPERADMIN_EMAIL` | no | `admin@nogatu.store` | Login email for the real super admin. |
 | `SEED_SUPERADMIN_PASSWORD` | **yes, for `--apply`** | — | Not hardcoded anywhere. Script refuses to `--apply` without it. Never printed. Hashed with bcrypt (12 rounds). |
 | `SEED_TEST_PASSWORD` | no | `NogatuTest#2026` | Shared password for all four `TEST — ` accounts below. Change it if you don't want the default documented here to be valid in production — it's printed in this file. |
+| `SEED_KEEP_EMAILS` | no | *(empty)* | Comma-separated emails (case-insensitive, whitespace trimmed) of real accounts to **never archive** — on top of the super admin and the four TEST accounts. If a kept email belongs to a partner, that partner's warehouse(s) and any `mobile_stockists` rows under that partner are preserved too. If a kept email belongs to a `mobile_stockists` row directly, that row is preserved even if its parent partner isn't kept. No effect when unset. |
 
 If `SEED_SUPERADMIN_EMAIL` matches an existing user (active **or**
 soft-deleted), that row is restored/updated in place instead of a duplicate
@@ -93,10 +94,10 @@ demo super admin's email.
 ## What gets archived
 
 On `--apply`, every user/partner/warehouse/mobile-stockist row that is NOT
-one of the accounts above (matched by email, or by name for warehouses) is
-soft-deleted (`is_deleted = 1`, `status = 'inactive'` where that column
-exists). This includes the old demo super admin. Nothing under `products` is
-ever touched.
+one of the accounts above (matched by email, or by name for warehouses), and
+NOT covered by `SEED_KEEP_EMAILS`, is soft-deleted (`is_deleted = 1`,
+`status = 'inactive'` where that column exists). This includes the old demo
+super admin. Nothing under `products` is ever touched.
 
 ## `--wipe-transactions` (optional, off by default)
 

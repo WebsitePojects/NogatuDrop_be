@@ -58,6 +58,16 @@ const SEED_SUPERADMIN_EMAIL = (process.env.SEED_SUPERADMIN_EMAIL || 'admin@nogat
 const SEED_SUPERADMIN_PASSWORD = process.env.SEED_SUPERADMIN_PASSWORD || '';
 const SEED_TEST_PASSWORD = process.env.SEED_TEST_PASSWORD || 'NogatuTest#2026';
 
+// Extra real accounts to preserve, on top of the super admin / TEST org tree
+// above. Comma-separated emails, case-insensitive, blanks dropped. Empty by
+// default — archive behavior is unchanged when unset.
+const SEED_KEEP_EMAILS = new Set(
+  (process.env.SEED_KEEP_EMAILS || '')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+
 // ---------------------------------------------------------------------------
 // Fixed identifiers for the TEST org tree. Matched on every run by email /
 // name — this is what makes --apply idempotent without needing to persist
@@ -182,6 +192,26 @@ async function execCascade(conn, attempts) {
     }
   }
   throw lastErr;
+}
+
+// Appends "AND LOWER(<column>) NOT IN (...)" against SEED_KEEP_EMAILS, or a
+// no-op clause if the allowlist is empty (query text unchanged in that case).
+function notInKeepEmailsClause(column) {
+  if (SEED_KEEP_EMAILS.size === 0) return { sql: '', params: [] };
+  const arr = [...SEED_KEEP_EMAILS];
+  return { sql: ` AND LOWER(${column}) NOT IN (${arr.map(() => '?').join(',')})`, params: arr };
+}
+
+// Appends "AND (<column> IS NULL OR <column> NOT IN (SELECT id FROM partners
+// WHERE LOWER(email) IN (...)))" so rows belonging to a kept partner
+// (warehouses, mobile_stockists) are preserved too. No-op when list is empty.
+function notInKeptPartnerIdsClause(column) {
+  if (SEED_KEEP_EMAILS.size === 0) return { sql: '', params: [] };
+  const arr = [...SEED_KEEP_EMAILS];
+  return {
+    sql: ` AND (${column} IS NULL OR ${column} NOT IN (SELECT id FROM partners WHERE LOWER(email) IN (${arr.map(() => '?').join(',')})))`,
+    params: arr,
+  };
 }
 
 function printTable(title, rows) {
@@ -408,41 +438,50 @@ async function runDryRun(conn) {
   ];
   printTable('ACCOUNTS TO CREATE / RESTORE', creationPlan);
 
+  if (SEED_KEEP_EMAILS.size > 0) {
+    console.log(`\nPreserving ${SEED_KEEP_EMAILS.size} account(s) via SEED_KEEP_EMAILS: ${[...SEED_KEEP_EMAILS].join(', ')}`);
+  }
+
   const preservedUserEmails = [SEED_SUPERADMIN_EMAIL, ...TEST_USER_EMAILS];
+  const keepUsersClause = notInKeepEmailsClause('u.email');
   const [usersToArchive] = await conn.execute(
     `SELECT u.id, u.name, u.email, r.slug AS role
      FROM users u JOIN roles r ON r.id = u.role_id
-     WHERE u.is_deleted = 0 AND u.email NOT IN (${preservedUserEmails.map(() => '?').join(',')})
+     WHERE u.is_deleted = 0 AND u.email NOT IN (${preservedUserEmails.map(() => '?').join(',')})${keepUsersClause.sql}
      ORDER BY u.id`,
-    preservedUserEmails
+    [...preservedUserEmails, ...keepUsersClause.params]
   );
   printTable('USERS TO ARCHIVE (is_deleted=1)', usersToArchive);
 
+  const keepPartnersClause = notInKeepEmailsClause('email');
   const [partnersToArchive] = await conn.execute(
     `SELECT id, business_name, email, stockist_level
      FROM partners
-     WHERE is_deleted = 0 AND email NOT IN (${TEST_PARTNER_EMAILS.map(() => '?').join(',')})
+     WHERE is_deleted = 0 AND email NOT IN (${TEST_PARTNER_EMAILS.map(() => '?').join(',')})${keepPartnersClause.sql}
      ORDER BY id`,
-    TEST_PARTNER_EMAILS
+    [...TEST_PARTNER_EMAILS, ...keepPartnersClause.params]
   );
   printTable('PARTNERS TO ARCHIVE (is_deleted=1)', partnersToArchive);
 
+  const keepWarehousePartnerClause = notInKeptPartnerIdsClause('partner_id');
   const [warehousesToArchive] = await conn.execute(
     `SELECT id, name, partner_id, type
      FROM warehouses
-     WHERE is_deleted = 0 AND partner_id IS NOT NULL AND name NOT IN (${TEST_WAREHOUSE_NAMES.map(() => '?').join(',')})
+     WHERE is_deleted = 0 AND partner_id IS NOT NULL AND name NOT IN (${TEST_WAREHOUSE_NAMES.map(() => '?').join(',')})${keepWarehousePartnerClause.sql}
      ORDER BY id`,
-    TEST_WAREHOUSE_NAMES
+    [...TEST_WAREHOUSE_NAMES, ...keepWarehousePartnerClause.params]
   );
   printTable('WAREHOUSES TO ARCHIVE (is_deleted=1; partner_id IS NULL warehouses are always preserved)', warehousesToArchive);
 
   if (hasMobileTable) {
+    const keepMobileEmailClause = notInKeepEmailsClause('email');
+    const keepMobilePartnerClause = notInKeptPartnerIdsClause('partner_id');
     const [mobileToArchive] = await conn.execute(
       `SELECT id, name, email, partner_id
        FROM mobile_stockists
-       WHERE is_deleted = 0 AND email NOT IN (?)
+       WHERE is_deleted = 0 AND email NOT IN (?)${keepMobileEmailClause.sql}${keepMobilePartnerClause.sql}
        ORDER BY id`,
-      [TEST_MOBILE_USER.email]
+      [TEST_MOBILE_USER.email, ...keepMobileEmailClause.params, ...keepMobilePartnerClause.params]
     );
     printTable('MOBILE STOCKIST ROWS TO ARCHIVE (is_deleted=1)', mobileToArchive);
   }
@@ -605,30 +644,35 @@ async function runApply(conn) {
 
     // --- c. Archive everything else -----------------------------------------
     const preservedUserEmails = [SEED_SUPERADMIN_EMAIL, ...TEST_USER_EMAILS];
+    const keepUsersClause = notInKeepEmailsClause('email');
     const [usersArchived] = await conn.execute(
       `UPDATE users SET is_deleted = 1, status = 'inactive'
-       WHERE is_deleted = 0 AND email NOT IN (${preservedUserEmails.map(() => '?').join(',')})`,
-      preservedUserEmails
+       WHERE is_deleted = 0 AND email NOT IN (${preservedUserEmails.map(() => '?').join(',')})${keepUsersClause.sql}`,
+      [...preservedUserEmails, ...keepUsersClause.params]
     );
 
+    const keepPartnersClause = notInKeepEmailsClause('email');
     const [partnersArchived] = await conn.execute(
       `UPDATE partners SET is_deleted = 1, status = 'inactive'
-       WHERE is_deleted = 0 AND email NOT IN (${TEST_PARTNER_EMAILS.map(() => '?').join(',')})`,
-      TEST_PARTNER_EMAILS
+       WHERE is_deleted = 0 AND email NOT IN (${TEST_PARTNER_EMAILS.map(() => '?').join(',')})${keepPartnersClause.sql}`,
+      [...TEST_PARTNER_EMAILS, ...keepPartnersClause.params]
     );
 
+    const keepWarehousePartnerClause = notInKeptPartnerIdsClause('partner_id');
     const [warehousesArchived] = await conn.execute(
       `UPDATE warehouses SET is_deleted = 1, is_active = 0
-       WHERE is_deleted = 0 AND partner_id IS NOT NULL AND name NOT IN (${TEST_WAREHOUSE_NAMES.map(() => '?').join(',')})`,
-      TEST_WAREHOUSE_NAMES
+       WHERE is_deleted = 0 AND partner_id IS NOT NULL AND name NOT IN (${TEST_WAREHOUSE_NAMES.map(() => '?').join(',')})${keepWarehousePartnerClause.sql}`,
+      [...TEST_WAREHOUSE_NAMES, ...keepWarehousePartnerClause.params]
     );
 
     let mobileArchivedCount = 0;
     if (await mobileStockistsTableExists(conn)) {
+      const keepMobileEmailClause = notInKeepEmailsClause('email');
+      const keepMobilePartnerClause = notInKeptPartnerIdsClause('partner_id');
       const [mobileArchived] = await conn.execute(
         `UPDATE mobile_stockists SET is_deleted = 1, status = 'inactive'
-         WHERE is_deleted = 0 AND email NOT IN (?)`,
-        [TEST_MOBILE_USER.email]
+         WHERE is_deleted = 0 AND email NOT IN (?)${keepMobileEmailClause.sql}${keepMobilePartnerClause.sql}`,
+        [TEST_MOBILE_USER.email, ...keepMobileEmailClause.params, ...keepMobilePartnerClause.params]
       );
       mobileArchivedCount = mobileArchived.affectedRows;
     }
