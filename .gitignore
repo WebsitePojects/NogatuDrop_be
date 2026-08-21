@@ -6,3 +6,5 @@ uploads/
 dist/
 *.log
 .DS_Store
+# All env variants (Layer 3b: glob, never a list)
+.env*
