@@ -56,8 +56,8 @@ const env = {
   RATE_LIMIT_ENABLED:
     (process.env.RATE_LIMIT_ENABLED || (process.env.NODE_ENV === 'production' ? 'true' : 'false')).toLowerCase() === 'true',
 
-  // File size limit (MB)
-  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 5,
+  // File size limit (MB) — 10MB covers modern phone camera photos (HEIC/JPEG).
+  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 10,
 
   // Cron schedules
   REPLENISH_CRON: process.env.REPLENISH_CRON || '*/15 * * * *',

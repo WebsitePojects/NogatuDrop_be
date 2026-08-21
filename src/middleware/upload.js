@@ -2,9 +2,12 @@ const multer = require('multer');
 const cloudinaryStoragePkg = require('multer-storage-cloudinary');
 const cloudinary = require('../config/cloudinary');
 const env = require('../config/env');
+const ApiError = require('../utils/ApiError');
 
-const MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
-const IMAGE_ONLY = ['image/jpeg', 'image/png', 'image/webp'];
+// HEIC/HEIF covers iPhone photos taken with the default camera format — Cloudinary
+// ingests and transcodes them, so we accept the mimetype and let Cloudinary convert.
+const MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'];
+const IMAGE_ONLY = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
 const hasCloudinaryConfig = Boolean(
   env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET
 );
@@ -40,7 +43,9 @@ function createUpload(folder, imageOnly = false, transformation = null) {
     cloudinary,
     params: {
       folder: `nogatu/${folder}`,
-      allowed_formats: imageOnly ? ['jpg', 'jpeg', 'png', 'webp'] : ['jpg', 'jpeg', 'png', 'webp', 'pdf'],
+      allowed_formats: imageOnly
+        ? ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']
+        : ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf'],
       ...(transformation && { transformation }),
     },
   });
@@ -62,7 +67,9 @@ function createUpload(folder, imageOnly = false, transformation = null) {
       if (allowed.includes(file.mimetype)) {
         cb(null, true);
       } else {
-        cb(new Error(`Invalid file type. Allowed: ${allowed.join(', ')}`), false);
+        const err = new Error(`Invalid file type. Allowed: ${allowed.join(', ')}`);
+        err.code = 'INVALID_FILE_TYPE';
+        cb(err, false);
       }
     },
   });
@@ -83,4 +90,30 @@ const podUpload = createUpload('pod', true, [
   { width: 1200, height: 1200, crop: 'limit', quality: 'auto' },
 ]);
 
-module.exports = { productUpload, paymentProofUpload, podUpload };
+// Route-scoped multer error translator. Wire this immediately after
+// `<upload>.single(field)` on any upload route so multer/fileFilter failures
+// become a clean 400/503 JSON error instead of falling through to the app's
+// catch-all handler as an opaque 500 (which is what iPhone users were hitting:
+// HEIC rejected by fileFilter -> generic 500 -> FE showed "Upload failed").
+// Unrecognized errors are passed through untouched (fail closed, not swallowed).
+function uploadErrorHandler(err, req, res, next) {
+  if (!err) {
+    return next();
+  }
+
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    return next(ApiError.badRequest(`File too large. Maximum ${env.MAX_FILE_SIZE_MB} MB.`));
+  }
+
+  if (err.code === 'INVALID_FILE_TYPE') {
+    return next(ApiError.badRequest('Unsupported file type. Please upload a JPG, PNG, HEIC, or PDF.'));
+  }
+
+  if (err.statusCode === 503) {
+    return next(ApiError.serviceUnavailable(err.message));
+  }
+
+  return next(err);
+}
+
+module.exports = { productUpload, paymentProofUpload, podUpload, uploadErrorHandler };

@@ -4,7 +4,7 @@ const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
-const { paymentProofUpload } = require('../middleware/upload');
+const { paymentProofUpload, uploadErrorHandler } = require('../middleware/upload');
 const {
   getOrders, getOrder, createOrder, createPublicOrder,
   uploadPublicPaymentProof,
@@ -18,7 +18,7 @@ const { requirePermission } = role;
 
 // Public — no auth
 router.post('/public', createPublicOrder);
-router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadPublicPaymentProof);
+router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadErrorHandler, uploadPublicPaymentProof);
 
 // Authenticated
 router.use(auth);
@@ -42,7 +42,7 @@ router.patch('/:id/reject', requirePermission(PERMISSIONS.ORDERS_REJECT), [body(
 router.patch('/:id/cancel', requirePermission(PERMISSIONS.ORDERS_CANCEL), cancelOrder);
 
 // Stockist uploads payment proof (Cloudinary)
-router.post('/:id/payment-proof', requirePermission(PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), paymentProofUpload.single('proof'), uploadPaymentProof);
+router.post('/:id/payment-proof', requirePermission(PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), paymentProofUpload.single('proof'), uploadErrorHandler, uploadPaymentProof);
 
 // Super admin verifies payment proof
 router.patch('/:id/verify-payment', requirePermission(PERMISSIONS.ORDERS_VERIFY_PAYMENT), verifyPayment);
