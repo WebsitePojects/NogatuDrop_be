@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS order_notification_outbox (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(80) NOT NULL,
+  order_number VARCHAR(80) NOT NULL,
+  status ENUM('pending','processing','retry','sent','failed') NOT NULL DEFAULT 'pending',
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  available_at DATETIME NOT NULL,
+  locked_at DATETIME NULL,
+  lease_token CHAR(36) NULL,
+  sent_at DATETIME NULL,
+  last_error VARCHAR(500) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_order_notification_recipient (order_id, user_id, event_type),
+  KEY idx_order_notification_claim (status, available_at, id),
+  CONSTRAINT fk_order_notification_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  CONSTRAINT fk_order_notification_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);

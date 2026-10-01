@@ -187,12 +187,18 @@ const getPublicTracking = asyncHandler(async (req, res) => {
             o.member_discount_amount,
             o.shipping_fee,
             o.system_fee,
+            o.payment_provider,
+            o.payment_account_id,
+            selected_payment.bank_name AS selected_bank_name,
+            selected_payment.account_name AS selected_account_name,
+            selected_payment.account_number AS selected_account_number,
             (SELECT ROUND(SUM(oi.subtotal), 2) FROM order_items oi WHERE oi.order_id = o.id) AS item_subtotal,
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status,
             dt.est_delivery_at,
             c.name AS courier_name
      FROM orders o
+     LEFT JOIN bank_accounts selected_payment ON selected_payment.id = o.payment_account_id
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
      LEFT JOIN couriers c ON c.id = dt.courier_id
      WHERE o.order_number = ? AND o.is_deleted = 0
@@ -205,7 +211,9 @@ const getPublicTracking = asyncHandler(async (req, res) => {
   const row = rows[0];
   const latestPing = row.tracking_id ? await getLatestPingByTrackingId(row.tracking_id) : null;
   const bankAccount = !['cancelled', 'rejected'].includes(row.order_status) && row.payment_status !== 'paid'
-    ? await getBankAccountForWarehouseOrDefault(pool, row.source_warehouse_id || null)
+    ? (row.payment_account_id && row.selected_bank_name
+      ? { bank_name: row.selected_bank_name, account_name: row.selected_account_name, account_number: row.selected_account_number }
+      : await getBankAccountForWarehouseOrDefault(pool, row.source_warehouse_id || null))
     : null;
   const gps = latestPing
     ? {

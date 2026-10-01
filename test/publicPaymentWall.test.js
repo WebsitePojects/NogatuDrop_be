@@ -85,7 +85,7 @@ test('order detail pricing breakdown uses persisted public fee components', () =
 });
 
 test('public order proof upload is exposed as a non-auth storefront route', () => {
-  assert.equal(orderRoutesSource.includes("router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadPublicPaymentProof);"), true);
+  assert.match(orderRoutesSource, /router\.post\('\/public\/payment-proof', paymentProofUpload\.single\('proof'\), uploadErrorHandler, uploadPublicPaymentProof\);/);
   assert.equal(orderControllerSource.includes('const uploadPublicPaymentProof = asyncHandler(async (req, res) => {'), true);
   assert.equal(orderControllerSource.includes("throw ApiError.badRequest('order_number and customer_phone are required');"), true);
   assert.equal(orderControllerSource.includes('normalizePhoneForLookup'), true);

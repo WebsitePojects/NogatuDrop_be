@@ -5,9 +5,11 @@ const { PERMISSIONS } = require('../rbac/permissions');
 const { getRevenueReport, getPurchaseReport, getProductReport, getMovementsReport } = require('../controllers/reportController');
 
 const router = Router();
+const { getInfluencerReport } = require('../controllers/reportController');
 const { requirePermission } = roleGuard;
 
 router.use(auth);
+router.get('/influencers', requirePermission(PERMISSIONS.REPORTS_VIEW), getInfluencerReport);
 router.use(requirePermission(PERMISSIONS.REPORTS_VIEW));
 
 router.get('/revenue', getRevenueReport);

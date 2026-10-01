@@ -84,4 +84,29 @@ function assertBankAccountAvailable(bankAccount) {
 module.exports = {
   getBankAccountForWarehouseOrDefault,
   assertBankAccountAvailable,
+  PUBLIC_PAYMENT_PROVIDERS: ['GCASH', 'BDO', 'PSBANK'],
+  normalizeProvider(bankName) {
+    const value = String(bankName || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    return ['GCASH', 'BDO', 'PSBANK'].find((provider) => value.includes(provider)) || null;
+  },
+  async getPublicPaymentAccounts(db, warehouseId) {
+    const [rows] = await executeSoftDeleteAware(db,
+      `SELECT id, warehouse_id, bank_name, account_name, account_number
+       FROM bank_accounts WHERE is_active = 1 AND is_deleted = 0
+       ORDER BY (warehouse_id = ?) DESC, is_default DESC, id ASC`,
+      [warehouseId],
+      `SELECT id, warehouse_id, bank_name, account_name, account_number
+       FROM bank_accounts WHERE is_active = 1
+       ORDER BY (warehouse_id = ?) DESC, is_default DESC, id ASC`,
+    );
+    return rows.map((row) => ({ ...row, provider: this.normalizeProvider(row.bank_name) })).filter((row) => row.provider);
+  },
+  selectPublicPaymentAccount(accounts, provider, warehouseId) {
+    const normalized = String(provider || '').toUpperCase();
+    if (!['GCASH', 'BDO', 'PSBANK'].includes(normalized)) throw ApiError.badRequest('Unsupported payment provider');
+    const candidates = accounts.filter((account) => account.provider === normalized);
+    const selected = candidates.find((account) => Number(account.warehouse_id) === Number(warehouseId)) || candidates.find((account) => account.warehouse_id == null);
+    if (!selected) throw ApiError.serviceUnavailable('No active payment account is configured for this provider and warehouse');
+    return selected;
+  },
 };

@@ -21,9 +21,10 @@ function getBrevoClient() {
   return brevoClient;
 }
 
-async function sendEmail({ to, toName, subject, html }) {
+async function sendEmail({ to, toName, subject, html, throwOnFailure = false }) {
   if (!hasUsableBrevoKey()) {
-    console.log(`[Email] Brevo key is not configured - skipping email to ${to}: ${subject}`);
+    if (throwOnFailure) throw new Error('Email transport is not configured');
+    console.log(`[Email] Brevo key is not configured - skipping email subject: ${subject}`);
     return;
   }
 
@@ -44,9 +45,11 @@ async function sendEmail({ to, toName, subject, html }) {
     const message = err?.message || String(err);
     if (env.NODE_ENV !== 'production') {
       console.warn('[Email] Failed to send (non-fatal in development):', message);
+      if (throwOnFailure) throw err;
       return;
     }
     console.error('[Email] Failed to send:', message);
+    if (throwOnFailure) throw err;
   }
 }
 

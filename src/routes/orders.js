@@ -5,6 +5,8 @@ const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
 const { paymentProofUpload, uploadErrorHandler } = require('../middleware/upload');
+const { body: bodyValidator } = require('express-validator');
+const { prepareInfluencerOrder, getPublicPaymentOptions, getInfluencerMetadata } = require('../controllers/influencerController');
 const {
   getOrders, getOrder, createOrder, createPublicOrder,
   uploadPublicPaymentProof,
@@ -16,8 +18,25 @@ const {
 const router = Router();
 const { requirePermission } = role;
 
+const publicOrderValidation = [
+  bodyValidator('customer_name').isString().trim().isLength({ min: 1, max: 150 }),
+  bodyValidator('customer_address').isString().trim().isLength({ min: 1, max: 1000 }),
+  bodyValidator('customer_phone').optional().isString().isLength({ max: 30 }),
+  bodyValidator('customer_email').optional({ values: 'null' }).isEmail().normalizeEmail(),
+  bodyValidator('items').isArray({ min: 1, max: 50 }),
+  bodyValidator('items.*.product_id').isInt({ min: 1 }),
+  bodyValidator('items.*.quantity').isInt({ min: 1 }),
+  bodyValidator('payment_method').optional().isIn(['bank_transfer']),
+  bodyValidator('payment_provider').optional().toUpperCase().isIn(['GCASH', 'BDO', 'PSBANK']),
+  bodyValidator('member_username').optional().isString().isLength({ max: 100 }),
+  validate,
+];
+
 // Public — no auth
-router.post('/public', createPublicOrder);
+router.get('/public/payment-options', getPublicPaymentOptions);
+router.get('/public/influencer/:slug', getInfluencerMetadata);
+router.post('/public/influencer/:slug', publicOrderValidation, prepareInfluencerOrder, createPublicOrder);
+router.post('/public', publicOrderValidation, createPublicOrder);
 router.post('/public/payment-proof', paymentProofUpload.single('proof'), uploadErrorHandler, uploadPublicPaymentProof);
 
 // Authenticated

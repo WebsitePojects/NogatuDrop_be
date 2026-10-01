@@ -91,7 +91,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Alliance-API-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Alliance-API-Key', 'Idempotency-Key'],
 }));
 
 app.use(attachRequestContext);

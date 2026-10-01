@@ -12,13 +12,17 @@ const { createPendingSettlementForOrder } = require('./settlementController');
 const {
   getBankAccountForWarehouseOrDefault,
   assertBankAccountAvailable,
+  getPublicPaymentAccounts,
+  selectPublicPaymentAccount,
 } = require('../services/bankAccountResolver');
+const { getIdempotencyKey, claimPublicOrderIntent, completePublicOrderIntent } = require('../services/publicOrderIdempotency');
 const {
   PUBLIC_ORDER_SHIPPING_FEE,
   getPublicOrderPricingTotals,
   reconcilePublicOrderPricing,
 } = require('../services/publicCheckoutPricing');
 const { getPaymentVerificationDecision } = require('../services/paymentVerification');
+const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
 const { lookupMlmMember } = require('../services/mlmBridge');
 const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
@@ -696,7 +700,6 @@ const createOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
     const [partner] = await executeSoftDeleteAware(
       conn,
       'SELECT id, business_name, parent_partner_id, stockist_level, discount_pct FROM partners WHERE id = ? AND is_deleted = 0',
@@ -866,7 +869,6 @@ const createOrder = asyncHandler(async (req, res) => {
       `New order #${orderNumber} from ${partnerData.business_name} worth ₱${totalAmount.toFixed(2)}`,
       orderId
     );
-
     await conn.commit();
     await cache.delPattern('dashboard:*');
 
@@ -902,6 +904,15 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const idempotency = await claimPublicOrderIntent(conn, {
+      scope: req.influencerContext ? `influencer:${req.influencerContext.slug}` : 'public-order',
+      key: getIdempotencyKey(req),
+      body: req.body,
+    });
+    if (idempotency.replay) {
+      await conn.rollback();
+      return res.status(201).json(idempotency.replay);
+    }
     const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
     let merchandiseSubtotal = 0;
@@ -958,7 +969,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     const codAmount = 0;
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
     const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
-    const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    let bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    if (req.body.payment_provider) {
+      const accounts = await getPublicPaymentAccounts(conn, sourceWarehouseId);
+      bankAccount = selectPublicPaymentAccount(accounts, req.body.payment_provider, sourceWarehouseId);
+    }
     assertBankAccountAvailable(bankAccount);
 
     let orderResult;
@@ -1030,6 +1045,17 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     }
     const orderId = orderResult.insertId;
 
+    if (req.body.payment_provider) {
+      try {
+        await conn.execute(
+          'UPDATE orders SET payment_provider = ?, payment_account_id = ? WHERE id = ?',
+          [String(req.body.payment_provider).toUpperCase(), bankAccount.id, orderId],
+        );
+      } catch (err) {
+        if (!isMissingColumn(err, 'payment_provider') && !isMissingColumn(err, 'payment_account_id')) throw err;
+      }
+    }
+
     try {
       await conn.execute(
         `UPDATE orders
@@ -1079,6 +1105,13 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       }
     }
 
+    if (req.influencerContext) {
+      await conn.execute(
+        `INSERT INTO order_attribution (order_id, channel, slug) VALUES (?, 'influencer', ?)`,
+        [orderId, req.influencerContext.slug],
+      );
+    }
+
     if (sourceWarehouseId) {
       for (const item of resolvedItems) {
         await reserveInventoryOrThrow(conn, {
@@ -1114,19 +1147,9 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       `Public storefront order #${orderNumber} is placed and awaiting review.`,
       orderId
     );
+    await enqueueOrderNotifications(conn, { orderId, orderNumber, users: [...partnerUsers, ...admins] });
 
-    await conn.commit();
-
-    for (const pu of partnerUsers) {
-      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
-      await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
-    }
-    for (const admin of admins) {
-      const tmpl = EMAIL.orderPlaced(orderNumber, customer_name);
-      await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
-    }
-
-    res.status(201).json({
+    const responseBody = {
       success: true,
       message: 'Order placed successfully. Complete your bank transfer and upload your payment proof.',
       data: {
@@ -1143,7 +1166,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
           paymentDeadline: paymentDeadline.toISOString(),
         }),
       },
-    });
+    };
+    await completePublicOrderIntent(conn, idempotency.id, orderId, responseBody);
+    await conn.commit();
+
+    res.status(201).json(responseBody);
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -1440,7 +1467,7 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
 
   const normalizedOrderNumber = String(order_number).trim().toUpperCase();
   const [orders] = await pool.execute(
-    `SELECT id, order_number, partner_id, status, payment_status, customer_name, customer_phone
+    `SELECT id, order_number, partner_id, status, payment_status, payment_proof_url, customer_name, customer_phone
      FROM orders
      WHERE order_number = ?
        AND placed_by_type = 'public'
@@ -1462,6 +1489,9 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   if (orders[0].payment_status === 'paid') {
     throw ApiError.badRequest('Payment has already been verified for this order');
   }
+  if (orders[0].payment_proof_url) {
+    throw ApiError.conflict('Payment proof has already been uploaded for this order');
+  }
 
   const proofUrl = req.file.path;
   const orderId = orders[0].id;
@@ -1469,10 +1499,11 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.execute(
-      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ?`,
+    const [proofUpdate] = await conn.execute(
+      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ? AND payment_proof_url IS NULL`,
       [proofUrl, orderId]
     );
+    if (proofUpdate.affectedRows !== 1) throw ApiError.conflict('Payment proof has already been uploaded for this order');
 
     const admins = await notifySuperAdmins(
       conn, 'payment_proof_uploaded',

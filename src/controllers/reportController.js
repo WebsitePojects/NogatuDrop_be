@@ -272,4 +272,31 @@ const getMovementsReport = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
-module.exports = { getRevenueReport, getPurchaseReport, getProductReport, getMovementsReport };
+const getInfluencerReport = asyncHandler(async (req, res) => {
+  if (req.user.role_slug !== 'super_admin') throw require('../utils/ApiError').forbidden('Only super admins can view influencer reports');
+  const params = [];
+  let dateFilter = '';
+  const from = req.query.from || req.query.date_from;
+  const to = req.query.to || req.query.date_to;
+  const validDate = (value) => {
+    const text = String(value);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
+    const date = new Date(`${text}T00:00:00Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === text;
+  };
+  if (from && !validDate(from)) throw require('../utils/ApiError').badRequest('Invalid report start date');
+  if (to && !validDate(to)) throw require('../utils/ApiError').badRequest('Invalid report end date');
+  if (from && to && String(from) > String(to)) throw require('../utils/ApiError').badRequest('Report start date must not be after end date');
+  if (from) { dateFilter += ' AND o.created_at >= ?'; params.push(String(from)); }
+  if (to) { dateFilter += ' AND o.created_at <= ?'; params.push(`${String(to)} 23:59:59`); }
+  const [rows] = await pool.execute(`
+    SELECT a.slug, COUNT(*) AS orders,
+      SUM(o.payment_status = 'paid') AS paid_orders,
+      SUM(o.status = 'delivered') AS delivered_orders,
+      COALESCE(SUM(CASE WHEN o.status = 'delivered' AND o.payment_status = 'paid' THEN o.total_amount ELSE 0 END), 0) AS delivered_revenue
+    FROM order_attribution a JOIN orders o ON o.id = a.order_id
+    WHERE o.is_deleted = 0 ${dateFilter} GROUP BY a.slug ORDER BY a.slug`, params);
+  res.json({ success: true, data: { semantics: 'Orders attributed at placement; revenue counts delivered and paid orders.', rows } });
+});
+
+module.exports = { getRevenueReport, getPurchaseReport, getProductReport, getMovementsReport, getInfluencerReport };

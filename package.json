@@ -37,7 +37,8 @@
     "readiness:restore-verify": "node --env-file=.env.dev scripts/verifyRestoreDrill.js",
     "readiness:load": "node --env-file=.env.dev scripts/loadPublicSurface.js",
     "post:migration": "node --env-file=.env.dev scripts/postMigration.js",
-    "post:migration:deep": "set RUN_DEEP_SMOKE=true&& node --env-file=.env.dev scripts/postMigration.js"
+    "post:migration:deep": "set RUN_DEEP_SMOKE=true&& node --env-file=.env.dev scripts/postMigration.js",
+    "notifications:outbox": "node scripts/processOrderNotificationOutbox.js"
   },
   "dependencies": {
     "@getbrevo/brevo": "^5.0.3",
