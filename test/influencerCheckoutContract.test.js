@@ -29,9 +29,13 @@ test('influencer checkout permits an omitted member username and rejects a suppl
   assert.match(source, /Influencer checkout requires exactly one item/);
 });
 
-test('influencer migration uses the storefront Berry NAD SKU', () => {
+// Regression: the migration used to INSERT ... ON DUPLICATE KEY UPDATE the kawoodee link with the
+// MLM SKU 'NKT-BND-001', which does not exist in NCDMS (Berry NAD+ is NOG-109), so re-running it
+// after the seed re-broke checkout. Link data belongs to the seed, which resolves the real SKU.
+test('influencer migration is schema-only and never seeds a hard-coded SKU', () => {
   const migration = fs.readFileSync(path.join(__dirname, '../sql/influencer_checkout_2026_09_10.sql'), 'utf8');
-  assert.match(migration, /VALUES \('kawoodee', 1, 'NKT-BND-001'\)/);
+  assert.doesNotMatch(migration, /INSERT\s+INTO\s+influencer_links/i);
+  assert.doesNotMatch(migration, /NKT-BND-001/);
 });
 
 test('payment provider selection cannot cross warehouse scope', () => {

@@ -12,9 +12,10 @@ CREATE TABLE IF NOT EXISTS influencer_links (
   KEY idx_influencer_links_enabled (enabled)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO influencer_links (slug, enabled, canonical_product_sku)
-VALUES ('kawoodee', 1, 'NKT-BND-001')
-ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), canonical_product_sku = VALUES(canonical_product_sku);
+-- Schema only. The kawoodee link is created by scripts/seedStoreRelaunch.js, which resolves the
+-- real Berry NAD+ SKU from products (NOG-109 in NCDMS). A hard-coded SKU here (the MLM catalogue
+-- code) pointed the link at a product that does not exist, and its ON DUPLICATE KEY
+-- UPDATE re-broke the link every time this file was re-run after the seed.
 
 CREATE TABLE IF NOT EXISTS order_attribution (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
