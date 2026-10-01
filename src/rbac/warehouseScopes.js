@@ -18,7 +18,8 @@ function buildWarehouseListScope(context, { view = 'owned' } = {}) {
     if (view === 'owned') {
       return {
         kind: 'warehouses',
-        clause: " AND w.partner_id IS NULL AND w.type = 'manufacturer'",
+        // Company-owned = the main manufacturer warehouse plus the fulfillment centers.
+        clause: " AND ((w.partner_id IS NULL AND w.type = 'manufacturer') OR w.type = 'center')",
         params: [],
       };
     }

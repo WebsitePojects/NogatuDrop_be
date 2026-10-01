@@ -211,6 +211,9 @@ function canApproveOrderFromContext(context, order) {
       && (placedByRoleSlug === ROLES.CITY_STOCKIST || placedByRoleSlug === ROLES.STAFF);
   }
 
+  // Any other level — notably a fulfillment 'center', which has no approval chain — is unknown
+  // here and fails closed: only Super Admin (handled above) approves or verifies its orders.
+  // Center staff still see their own orders through the plain partner_id list scope.
   return false;
 }
 

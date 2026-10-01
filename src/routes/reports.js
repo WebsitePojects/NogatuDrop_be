@@ -2,14 +2,25 @@ const { Router } = require('express');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
-const { getRevenueReport, getPurchaseReport, getProductReport, getMovementsReport } = require('../controllers/reportController');
+const {
+  getRevenueReport,
+  getPurchaseReport,
+  getProductReport,
+  getMovementsReport,
+  getInfluencerReport,
+  exportInfluencerReport,
+} = require('../controllers/reportController');
 
 const router = Router();
-const { getInfluencerReport } = require('../controllers/reportController');
 const { requirePermission } = roleGuard;
 
 router.use(auth);
-router.get('/influencers', requirePermission(PERMISSIONS.REPORTS_VIEW), getInfluencerReport);
+
+// Company-wide revenue and customer addresses: super_admin only. REPORTS_VIEW is also held by
+// stockists, so it must NOT gate these. Declared before the REPORTS_VIEW router.use below.
+router.get('/influencers', roleGuard('super_admin'), getInfluencerReport);
+router.get('/influencers/export', roleGuard('super_admin'), exportInfluencerReport);
+
 router.use(requirePermission(PERMISSIONS.REPORTS_VIEW));
 
 router.get('/revenue', getRevenueReport);

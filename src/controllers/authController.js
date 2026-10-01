@@ -29,9 +29,11 @@ const login = asyncHandler(async (req, res) => {
 
   const [users] = await pool.execute(
     `SELECT u.id, u.name, u.email, u.password, u.phone, u.partner_id, u.status,
-            r.id AS role_id, r.name AS role_name, r.slug AS role_slug
+            r.id AS role_id, r.name AS role_name, r.slug AS role_slug,
+            p.stockist_level AS partner_level, p.business_name AS partner_name
      FROM users u
      JOIN roles r ON r.id = u.role_id
+     LEFT JOIN partners p ON p.id = u.partner_id
      WHERE (
        LOWER(u.email) = ?
        OR LOWER(SUBSTRING_INDEX(u.email, '@', 1)) = ?
@@ -116,6 +118,8 @@ const login = asyncHandler(async (req, res) => {
         role: user.role_name,
         role_slug: normalizedRoleSlug,
         partner_id: user.partner_id,
+        partner_level: user.partner_level || null,
+        partner_name: user.partner_name || null,
       },
     },
   });
@@ -210,7 +214,7 @@ const me = asyncHandler(async (req, res) => {
     `SELECT u.id, u.name, u.email, u.phone, u.partner_id, u.level, u.location, u.status,
             u.last_login, u.created_at,
             r.name AS role_name, r.slug AS role_slug,
-            p.business_name AS partner_name
+            p.business_name AS partner_name, p.stockist_level AS partner_level
      FROM users u
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN partners p ON p.id = u.partner_id

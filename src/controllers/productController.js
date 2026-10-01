@@ -224,30 +224,18 @@ async function scopePublicProducts(db, products) {
     return products;
   }
 
-  // Get active candidate warehouses
-  let candidateWarehouseIds = [];
-  try {
-    const [rows] = await db.execute(
-      `SELECT w.id AS warehouse_id
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-         AND p.is_deleted = 0 AND w.is_deleted = 0`
-    );
-    candidateWarehouseIds = rows.map((r) => r.warehouse_id);
-  } catch (err) {
-    try {
-      const [rows] = await db.execute(
-        `SELECT w.id AS warehouse_id
-         FROM partners p
-         JOIN warehouses w ON w.partner_id = p.id
-         WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')`
-      );
-      candidateWarehouseIds = rows.map((r) => r.warehouse_id);
-    } catch (innerErr) {
-      return products.map(p => ({ ...p, available_qty: 999, is_orderable: true }));
-    }
-  }
+  // Storefront stock = the fulfillment centers that can actually take the order. Must stay in
+  // step with listPublicFulfillmentCandidates in orderController, or the catalog would advertise
+  // stock that checkout then refuses.
+  const [candidateRows] = await db.execute(
+    `SELECT w.id AS warehouse_id
+     FROM partners p
+     JOIN warehouses w ON w.partner_id = p.id
+     WHERE p.stockist_level = 'center'
+       AND p.status = 'active' AND p.is_deleted = 0
+       AND w.is_deleted = 0 AND w.is_active = 1`
+  );
+  const candidateWarehouseIds = candidateRows.map((r) => r.warehouse_id);
 
   if (candidateWarehouseIds.length === 0) {
     return products.map(p => ({ ...p, available_qty: 0, is_orderable: false }));
@@ -257,35 +245,31 @@ async function scopePublicProducts(db, products) {
   const placeholders = productIds.map(() => '?').join(', ');
   const warehousePlaceholders = candidateWarehouseIds.map(() => '?').join(', ');
 
-  let inventoryRows = [];
-  try {
-    [inventoryRows] = await db.execute(
-      `SELECT product_id, current_stock, reserved_stock
-       FROM inventories
-       WHERE warehouse_id IN (${warehousePlaceholders})
-         AND product_id IN (${placeholders})
-         AND is_deleted = 0`,
-      [...candidateWarehouseIds, ...productIds]
-    );
-  } catch (err) {
-    try {
-      [inventoryRows] = await db.execute(
-        `SELECT product_id, current_stock, reserved_stock
-         FROM inventories
-         WHERE warehouse_id IN (${warehousePlaceholders})
-           AND product_id IN (${placeholders})`,
-        [...candidateWarehouseIds, ...productIds]
-      );
-    } catch (innerErr) {
-      return products.map(p => ({ ...p, available_qty: 999, is_orderable: true }));
-    }
-  }
+  // Soft-delete-aware like the rest of this file: some deployments' inventories table has no
+  // is_deleted column, and a hard failure here 500s the whole public catalog.
+  const [inventoryRows] = await executeSoftDeleteAware(
+    db,
+    `SELECT product_id, warehouse_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
+     FROM inventories
+     WHERE warehouse_id IN (${warehousePlaceholders})
+       AND product_id IN (${placeholders})
+       AND is_deleted = 0
+     GROUP BY product_id, warehouse_id`,
+    [...candidateWarehouseIds, ...productIds],
+    `SELECT product_id, warehouse_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
+     FROM inventories
+     WHERE warehouse_id IN (${warehousePlaceholders})
+       AND product_id IN (${placeholders})
+     GROUP BY product_id, warehouse_id`
+  );
 
+  // One order is fulfilled by ONE center, so the most a customer can buy is the best single
+  // center's stock — summing across centers would advertise quantities checkout then refuses.
   const stockMap = new Map();
   for (const row of inventoryRows) {
     const pId = Number(row.product_id);
     const available = Math.max(0, Number(row.current_stock || 0) - Number(row.reserved_stock || 0));
-    stockMap.set(pId, (stockMap.get(pId) || 0) + available);
+    stockMap.set(pId, Math.max(stockMap.get(pId) || 0, available));
   }
 
   return products.map((product) => {

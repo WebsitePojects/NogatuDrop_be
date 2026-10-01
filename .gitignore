@@ -8,3 +8,6 @@ dist/
 .DS_Store
 # All env variants (Layer 3b: glob, never a list)
 .env*
+
+# Store relaunch seed config holds staff emails/phones/bank accounts (personal data). Example is committed instead.
+scripts/store-relaunch.config.json

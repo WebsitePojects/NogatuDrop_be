@@ -1,6 +1,16 @@
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const cache = require('../services/cacheService');
+const ApiError = require('../utils/ApiError');
+const { CSV_CONTENT_TYPE } = require('../utils/csvExport');
+const { normalizeSlug } = require('./influencerController');
+const {
+  parseReportMonth,
+  getInfluencerReportData,
+  reportRowsToCsv,
+  JSON_ROW_LIMIT,
+  EXPORT_ROW_LIMIT,
+} = require('../services/influencerReportService');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -272,31 +282,50 @@ const getMovementsReport = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
-const getInfluencerReport = asyncHandler(async (req, res) => {
-  if (req.user.role_slug !== 'super_admin') throw require('../utils/ApiError').forbidden('Only super admins can view influencer reports');
-  const params = [];
-  let dateFilter = '';
-  const from = req.query.from || req.query.date_from;
-  const to = req.query.to || req.query.date_to;
-  const validDate = (value) => {
-    const text = String(value);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
-    const date = new Date(`${text}T00:00:00Z`);
-    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === text;
+// Influencer endpoints share one filter parser. Authorization is enforced by the
+// route (super_admin only) because the data is company-wide revenue plus customer addresses.
+function parseInfluencerFilters(query) {
+  const rawSlug = query.slug;
+  if (rawSlug !== undefined && typeof rawSlug !== 'string') throw ApiError.badRequest('Invalid influencer link');
+  return {
+    window: parseReportMonth(query.month),
+    slug: rawSlug && rawSlug.trim() ? normalizeSlug(rawSlug) : null,
   };
-  if (from && !validDate(from)) throw require('../utils/ApiError').badRequest('Invalid report start date');
-  if (to && !validDate(to)) throw require('../utils/ApiError').badRequest('Invalid report end date');
-  if (from && to && String(from) > String(to)) throw require('../utils/ApiError').badRequest('Report start date must not be after end date');
-  if (from) { dateFilter += ' AND o.created_at >= ?'; params.push(String(from)); }
-  if (to) { dateFilter += ' AND o.created_at <= ?'; params.push(`${String(to)} 23:59:59`); }
-  const [rows] = await pool.execute(`
-    SELECT a.slug, COUNT(*) AS orders,
-      SUM(o.payment_status = 'paid') AS paid_orders,
-      SUM(o.status = 'delivered') AS delivered_orders,
-      COALESCE(SUM(CASE WHEN o.status = 'delivered' AND o.payment_status = 'paid' THEN o.total_amount ELSE 0 END), 0) AS delivered_revenue
-    FROM order_attribution a JOIN orders o ON o.id = a.order_id
-    WHERE o.is_deleted = 0 ${dateFilter} GROUP BY a.slug ORDER BY a.slug`, params);
-  res.json({ success: true, data: { semantics: 'Orders attributed at placement; revenue counts delivered and paid orders.', rows } });
+}
+
+// GET /api/v1/reports/influencers?month=YYYY-MM&slug=
+const getInfluencerReport = asyncHandler(async (req, res) => {
+  const { window, slug } = parseInfluencerFilters(req.query);
+  const data = await getInfluencerReportData(pool, { window, slug, rowLimit: JSON_ROW_LIMIT });
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true, data });
 });
 
-module.exports = { getRevenueReport, getPurchaseReport, getProductReport, getMovementsReport, getInfluencerReport };
+// GET /api/v1/reports/influencers/export?month=YYYY-MM&slug=&format=csv
+const exportInfluencerReport = asyncHandler(async (req, res) => {
+  const format = req.query.format === undefined ? 'csv' : req.query.format;
+  if (typeof format !== 'string' || format.toLowerCase() !== 'csv') {
+    throw ApiError.badRequest('Unsupported export format. Supported: csv');
+  }
+  const { window, slug } = parseInfluencerFilters(req.query);
+  const data = await getInfluencerReportData(pool, { window, slug, rowLimit: EXPORT_ROW_LIMIT });
+  if (data.truncated) {
+    throw ApiError.badRequest('Too many orders to export in one file. Filter by influencer slug.');
+  }
+  // Slug and month are already validated to [a-z0-9-] and YYYY-MM, so the filename is header-safe.
+  res.set({
+    'Content-Type': CSV_CONTENT_TYPE,
+    'Content-Disposition': `attachment; filename="influencer-${slug || 'all'}-${window.month}.csv"`,
+    'Cache-Control': 'no-store',
+  });
+  res.send(reportRowsToCsv(data.rows));
+});
+
+module.exports = {
+  getRevenueReport,
+  getPurchaseReport,
+  getProductReport,
+  getMovementsReport,
+  getInfluencerReport,
+  exportInfluencerReport,
+};

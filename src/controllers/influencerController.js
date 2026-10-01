@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
+const { normalizeProvider } = require('../services/bankAccountResolver');
 
 function normalizeSlug(value) {
   const slug = String(value || '').trim().toLowerCase();
@@ -44,15 +45,11 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
 
 const getPublicPaymentOptions = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT DISTINCT UPPER(REPLACE(REPLACE(bank_name, ' ', ''), '-', '')) AS provider
+    `SELECT DISTINCT bank_name
      FROM bank_accounts
      WHERE is_active = 1 AND is_deleted = 0 AND bank_name IS NOT NULL`
   );
-  const allowed = ['GCASH', 'BDO', 'PSBANK'];
-  const providers = rows
-    .map((row) => allowed.find((provider) => String(row.provider || '').includes(provider)))
-    .filter(Boolean)
-    .filter((provider, index, values) => values.indexOf(provider) === index);
+  const providers = [...new Set(rows.map((row) => normalizeProvider(row.bank_name)).filter(Boolean))];
   res.json({ success: true, data: { payment_method: 'bank_transfer', providers } });
 });
 

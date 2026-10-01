@@ -31,6 +31,7 @@ const {
   canApproveOrderFromContext,
   canVerifyPaymentFromContext,
 } = require('../rbac/affiliationScopes');
+const { PARTNER_LEVELS } = require('../rbac/roles');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -240,81 +241,66 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
+// Public (storefront + influencer) orders are fulfilled ONLY by company fulfillment centers.
+// A Stockist never fulfils them and there is deliberately no fallback to one: if no center can
+// serve the order the customer gets a clear 409 instead of the order leaking to a Stockist.
 async function listPublicFulfillmentCandidates(db) {
-  try {
-    const [rows] = await executeSoftDeleteAware(
-      db,
-      `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-          AND p.is_deleted = 0 AND w.is_deleted = 0 AND w.is_active = 1
-       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`,
-      [],
-      `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
-       FROM partners p
-       JOIN warehouses w ON w.partner_id = p.id
-       WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), p.id ASC, w.id ASC`
-    );
-    return rows;
-  } catch (err) {
-    if (!isMissingColumn(err, 'w.partner_id') && !isMissingColumn(err, 'partner_id')) {
-      throw err;
-    }
-  }
-
-  const [rows] = await executeSoftDeleteAware(
-    db,
-    `SELECT p.id AS partner_id, i.warehouse_id, w.lat, w.lng
+  const [rows] = await db.execute(
+    `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
      FROM partners p
-     JOIN inventories i ON i.partner_id = p.id AND i.is_active = 1
-     JOIN warehouses w ON w.id = i.warehouse_id
-     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-       AND p.is_deleted = 0 AND w.is_deleted = 0
-     GROUP BY p.id, i.warehouse_id, w.lat, w.lng
-     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`,
-    [],
-    `SELECT p.id AS partner_id, i.warehouse_id, w.lat, w.lng
-     FROM partners p
-     JOIN inventories i ON i.partner_id = p.id
-     JOIN warehouses w ON w.id = i.warehouse_id
-     WHERE p.stockist_level IN ('city_stockist', 'provincial_stockist')
-     GROUP BY p.id, i.warehouse_id, w.lat, w.lng
-     ORDER BY FIELD(p.stockist_level, 'city_stockist', 'provincial_stockist'), MIN(i.id), p.id ASC, i.warehouse_id ASC`
+     JOIN warehouses w ON w.partner_id = p.id
+     WHERE p.stockist_level = 'center'
+       AND p.status = 'active' AND p.is_deleted = 0
+       AND w.is_deleted = 0 AND w.is_active = 1
+     ORDER BY w.id ASC`
   );
   return rows;
 }
 
+// Checks every requested line against one warehouse with a single query. Returns
+// `totalAvailable` (sum of available units over the requested products) so callers can prefer
+// the center holding the most stock.
 async function canWarehouseFulfillItems(db, warehouseId, items) {
+  const requestedByProduct = new Map();
+  const nameByProduct = new Map();
   for (const item of items) {
-    const [inventoryRows] = await executeSoftDeleteAware(
-      db,
-      `SELECT current_stock, reserved_stock
-       FROM inventories
-       WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0
-       LIMIT 1`,
-      [item.product_id, warehouseId],
-      `SELECT current_stock, reserved_stock
-       FROM inventories
-       WHERE product_id = ? AND warehouse_id = ?
-       LIMIT 1`
-    );
-
-    const availableQty = inventoryRows.length > 0
-      ? Number(inventoryRows[0].current_stock || 0) - Number(inventoryRows[0].reserved_stock || 0)
-      : 0;
-
-    if (availableQty < item.quantity) {
-      return {
-        ok: false,
-        productName: item.name,
-        availableQty,
-      };
-    }
+    const productId = Number(item.product_id);
+    requestedByProduct.set(productId, (requestedByProduct.get(productId) || 0) + item.quantity);
+    nameByProduct.set(productId, item.name);
   }
 
-  return { ok: true };
+  const productIds = [...requestedByProduct.keys()];
+  const placeholders = productIds.map(() => '?').join(', ');
+  // Same soft-delete-aware shape as reserveInventoryOrThrow: some deployments' inventories table has
+  // no is_deleted column, and the availability check must count exactly the rows reservation locks.
+  const [inventoryRows] = await executeSoftDeleteAware(
+    db,
+    `SELECT product_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
+     FROM inventories
+     WHERE warehouse_id = ? AND product_id IN (${placeholders}) AND is_deleted = 0
+     GROUP BY product_id`,
+    [warehouseId, ...productIds],
+    `SELECT product_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
+     FROM inventories
+     WHERE warehouse_id = ? AND product_id IN (${placeholders})
+     GROUP BY product_id`
+  );
+
+  const availableByProduct = new Map(inventoryRows.map((row) => [
+    Number(row.product_id),
+    Number(row.current_stock || 0) - Number(row.reserved_stock || 0),
+  ]));
+
+  let totalAvailable = 0;
+  for (const [productId, requestedQty] of requestedByProduct) {
+    const availableQty = availableByProduct.get(productId) || 0;
+    if (availableQty < requestedQty) {
+      return { ok: false, productName: nameByProduct.get(productId), availableQty };
+    }
+    totalAvailable += availableQty;
+  }
+
+  return { ok: true, totalAvailable };
 }
 
 function haversineDistanceKm(originLat, originLng, targetLat, targetLng) {
@@ -328,54 +314,57 @@ function haversineDistanceKm(originLat, originLng, targetLat, targetLng) {
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+const hasCoordinates = (lat, lng) => lat != null && lng != null
+  && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng));
+
+// Orders capable centers best-first. With a customer pin: nearest first, centers without
+// coordinates last. Without one: most available stock first. Warehouse id is always the final
+// tie-break so the same inputs pick the same center on every request.
 function rankPublicFulfillmentCandidates(candidates, { customerLat, customerLng } = {}) {
-  const hasCustomerLocation = customerLat != null && customerLng != null
-    && Number.isFinite(Number(customerLat)) && Number.isFinite(Number(customerLng));
-  return [...candidates]
-    .map((candidate, index) => {
-      const hasWarehouseLocation = candidate.lat != null && candidate.lng != null
-        && Number.isFinite(Number(candidate.lat)) && Number.isFinite(Number(candidate.lng));
-      return {
-        ...candidate,
-        _rankIndex: index,
-        _distanceKm: hasCustomerLocation && hasWarehouseLocation
-          ? haversineDistanceKm(customerLat, customerLng, candidate.lat, candidate.lng)
-          : Number.POSITIVE_INFINITY,
-      };
+  const hasCustomerLocation = hasCoordinates(customerLat, customerLng);
+  const distanceKm = (candidate) => (
+    hasCustomerLocation && hasCoordinates(candidate.lat, candidate.lng)
+      ? haversineDistanceKm(customerLat, customerLng, candidate.lat, candidate.lng)
+      : Number.POSITIVE_INFINITY
+  );
+
+  return candidates
+    .map((candidate) => ({ candidate, distance: distanceKm(candidate) }))
+    .sort((left, right) => {
+      if (left.distance !== right.distance) return left.distance < right.distance ? -1 : 1;
+      const leftStock = Number(left.candidate.available_qty || 0);
+      const rightStock = Number(right.candidate.available_qty || 0);
+      if (!hasCustomerLocation && leftStock !== rightStock) return rightStock - leftStock;
+      return Number(left.candidate.warehouse_id) - Number(right.candidate.warehouse_id);
     })
-    .sort((left, right) => left._distanceKm - right._distanceKm || left._rankIndex - right._rankIndex)
-    .map(({ _distanceKm, _rankIndex, ...candidate }) => candidate);
+    .map(({ candidate }) => candidate);
 }
 
 async function resolvePublicFulfillmentRoute(db, items, location = {}) {
-  const candidates = rankPublicFulfillmentCandidates(
-    await listPublicFulfillmentCandidates(db),
-    location
-  );
+  const candidates = await listPublicFulfillmentCandidates(db);
   if (candidates.length === 0) {
-    throw ApiError.serviceUnavailable('No available Stockist to handle this order');
+    throw ApiError.serviceUnavailable('No fulfillment center is available to handle this order');
   }
 
+  const capable = [];
   let firstShortage = null;
 
   for (const candidate of candidates) {
     const fulfillmentCheck = await canWarehouseFulfillItems(db, candidate.warehouse_id, items);
     if (fulfillmentCheck.ok) {
-      return candidate;
-    }
-
-    if (!firstShortage) {
+      capable.push({ ...candidate, available_qty: fulfillmentCheck.totalAvailable });
+    } else if (!firstShortage) {
       firstShortage = fulfillmentCheck;
     }
   }
 
-  if (firstShortage) {
-    throw ApiError.badRequest(
-      `Insufficient stock for ${firstShortage.productName || 'product'} (available: ${firstShortage.availableQty || 0})`
+  if (capable.length === 0) {
+    throw ApiError.conflict(
+      `Not enough stock at our fulfillment centers for ${firstShortage.productName || 'this product'}`
     );
   }
 
-  throw ApiError.serviceUnavailable('No available Stockist can fulfill this order right now');
+  return rankPublicFulfillmentCandidates(capable, location)[0];
 }
 
 // ─── Helper: notify users of a partner ───────────────────────────────────────
@@ -709,6 +698,12 @@ const createOrder = asyncHandler(async (req, res) => {
     if (partner.length === 0) throw ApiError.badRequest('Partner account not found');
 
     const partnerData = partner[0];
+
+    // A center is the company's own fulfillment point, not a buyer: it has no upstream warehouse
+    // and no discount tier, so a stockist-style purchase from it must never be priced or routed.
+    if (partnerData.stockist_level === PARTNER_LEVELS.CENTER) {
+      throw ApiError.forbidden('Fulfillment centers cannot place stockist orders');
+    }
 
     // Determine source warehouse
     // City stockist → order from parent provincial warehouse

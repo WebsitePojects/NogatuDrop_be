@@ -7,6 +7,10 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const env = require('../config/env');
 const paginate = require('../utils/paginate');
+const { STOCKIST_LEVELS } = require('../rbac/roles');
+
+// Fulfillment centers are company-owned, not Stockists: they must never reach the Alliance feed.
+const STOCKIST_LEVEL_PLACEHOLDERS = STOCKIST_LEVELS.map(() => '?').join(', ');
 
 function allianceAuth(req, res, next) {
   const key = req.headers['x-alliance-api-key'];
@@ -19,21 +23,21 @@ function allianceAuth(req, res, next) {
 // GET /api/v1/alliance/stockists
 const getStockists = asyncHandler(async (req, res) => {
   const { page, limit } = req.query;
-  const where = 'WHERE p.is_deleted = 0';
+  const where = `WHERE p.is_deleted = 0 AND p.stockist_level IN (${STOCKIST_LEVEL_PLACEHOLDERS})`;
   const baseQuery = `
     SELECT p.id, p.business_name, p.email, p.phone, p.address,
            p.stockist_level, p.discount_pct, p.parent_partner_id, p.created_at
     FROM partners p ${where} ORDER BY p.created_at DESC`;
   const countQuery = `SELECT COUNT(*) AS total FROM partners p ${where}`;
-  const result = await paginate(baseQuery, countQuery, [], page, limit);
+  const result = await paginate(baseQuery, countQuery, [...STOCKIST_LEVELS], page, limit);
   res.json({ success: true, ...result });
 });
 
 // GET /api/v1/alliance/sales
 const getSales = asyncHandler(async (req, res) => {
   const { date_from, date_to } = req.query;
-  const params = [];
-  let where = 'WHERE o.status = \'delivered\' AND o.is_deleted = 0';
+  const params = [...STOCKIST_LEVELS];
+  let where = `WHERE o.status = 'delivered' AND o.is_deleted = 0 AND p.stockist_level IN (${STOCKIST_LEVEL_PLACEHOLDERS})`;
   if (date_from) { where += ' AND DATE(o.delivered_at) >= ?'; params.push(date_from); }
   if (date_to) { where += ' AND DATE(o.delivered_at) <= ?'; params.push(date_to); }
 

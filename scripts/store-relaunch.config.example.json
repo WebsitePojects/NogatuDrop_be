@@ -1,0 +1,59 @@
+{
+  "superAdmin": {
+    "name": "Example Super Admin",
+    "email": "super.admin@example.com",
+    "passwordEnv": "SEED_SUPERADMIN_PASSWORD"
+  },
+  "product": {
+    "nameMatch": "Berry NAD+"
+  },
+  "opening": {
+    "quantity": 10000,
+    "batch": "B01",
+    "expiry": "2027-07-23",
+    "supplier": "Example Packaging Supplier Co.",
+    "unit": "boxes"
+  },
+  "centers": [
+    {
+      "key": "CENTER_A",
+      "businessName": "Example Fulfillment Center A",
+      "address": "123 Placeholder Street, Example City",
+      "region": "Example Region",
+      "contactPerson": "Example Contact A",
+      "contactPhone": "+639000000001",
+      "operatingHours": "Mon-Sat 9:00-18:00",
+      "lat": 14.6,
+      "lng": 120.98,
+      "staff": [
+        { "name": "Example Staff One", "email": "staff.one@example.com", "passwordEnv": "SEED_STAFF_ONE_PASSWORD" },
+        { "name": "Example Staff Two", "email": "staff.two@example.com", "passwordEnv": "SEED_STAFF_TWO_PASSWORD" }
+      ],
+      "paymentAccounts": [
+        { "bankName": "GCASH", "accountName": "Example Account Holder", "accountNumber": "09000000001" },
+        { "bankName": "BDO", "accountName": "Example Account Holder", "accountNumber": "000000001234" },
+        { "bankName": "PSBANK", "accountName": "Example Account Holder", "accountNumber": "000000005678" }
+      ]
+    },
+    {
+      "key": "CENTER_B",
+      "businessName": "Example Fulfillment Center B",
+      "address": "456 Placeholder Avenue, Example Town",
+      "region": "Example Region",
+      "contactPerson": "Example Contact B",
+      "contactPhone": "+639000000002",
+      "staff": [
+        { "name": "Example Staff Three", "email": "staff.three@example.com", "passwordEnv": "SEED_STAFF_THREE_PASSWORD" }
+      ],
+      "paymentAccounts": [
+        { "bankName": "GCASH", "accountName": "Example Account Holder", "accountNumber": "09000000001" },
+        { "bankName": "BDO", "accountName": "Example Account Holder", "accountNumber": "000000001234" },
+        { "bankName": "PSBANK", "accountName": "Example Account Holder", "accountNumber": "000000005678" }
+      ]
+    }
+  ],
+  "influencer": {
+    "slug": "example-influencer",
+    "displayName": "EXAMPLE INFLUENCER"
+  }
+}

@@ -8,6 +8,21 @@ const ROLES = Object.freeze({
   MOBILE_STOCKIST: 'mobile_stockist',
 });
 
+// partners.stockist_level values. A 'center' is a company-owned fulfillment center (Caloocan, Tycoon):
+// it owns a warehouse and staff, but is NOT a Stockist — no discount, no parent, no MLM sync,
+// and it never appears in approval chains. Anything not listed here is unknown and must fail closed.
+const PARTNER_LEVELS = Object.freeze({
+  PROVINCIAL: 'provincial_stockist',
+  CITY: 'city_stockist',
+  CENTER: 'center',
+});
+
+const STOCKIST_LEVELS = Object.freeze([PARTNER_LEVELS.PROVINCIAL, PARTNER_LEVELS.CITY]);
+
+function isStockistLevel(level) {
+  return STOCKIST_LEVELS.includes(level);
+}
+
 const ROLE_SCOPES = Object.freeze({
   [ROLES.SUPER_ADMIN]: 'national',
   [ROLES.PROVINCIAL_STOCKIST]: 'partner',
@@ -26,6 +41,9 @@ function getRoleScope(roleSlug) {
 
 module.exports = {
   ROLES,
+  PARTNER_LEVELS,
+  STOCKIST_LEVELS,
+  isStockistLevel,
   ROLE_SCOPES,
   canonicalRole,
   getRoleScope,

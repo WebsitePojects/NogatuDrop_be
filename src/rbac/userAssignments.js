@@ -1,5 +1,5 @@
 const ApiError = require('../utils/ApiError');
-const { ROLES, canonicalRole } = require('./roles');
+const { ROLES, PARTNER_LEVELS, STOCKIST_LEVELS, canonicalRole } = require('./roles');
 
 const STOCKIST_SCOPED_ROLES = new Set([
   ROLES.PROVINCIAL_STOCKIST,
@@ -42,19 +42,22 @@ function assertPartnerSupportsRole(roleSlug, partner) {
     return;
   }
 
-  if (roleSlug === ROLES.PROVINCIAL_STOCKIST && partner.stockist_level !== ROLES.PROVINCIAL_STOCKIST) {
+  if (roleSlug === ROLES.PROVINCIAL_STOCKIST && partner.stockist_level !== PARTNER_LEVELS.PROVINCIAL) {
     throw ApiError.badRequest('Provincial Stockist users must belong to a provincial Stockist partner');
   }
 
-  if (roleSlug === ROLES.CITY_STOCKIST && partner.stockist_level !== ROLES.CITY_STOCKIST) {
+  if (roleSlug === ROLES.CITY_STOCKIST && partner.stockist_level !== PARTNER_LEVELS.CITY) {
     throw ApiError.badRequest('City Stockist users must belong to a city Stockist partner');
   }
 
-  if (
-    [ROLES.STAFF, ROLES.MOBILE_STOCKIST].includes(roleSlug) &&
-    ![ROLES.PROVINCIAL_STOCKIST, ROLES.CITY_STOCKIST].includes(partner.stockist_level)
-  ) {
-    throw ApiError.badRequest('Operational users must belong to an active provincial or city Stockist partner');
+  // Only company staff work inside a fulfillment center; a center is not a Stockist, so it can
+  // never host a Stockist owner or a Mobile Stockist.
+  if (roleSlug === ROLES.STAFF && ![...STOCKIST_LEVELS, PARTNER_LEVELS.CENTER].includes(partner.stockist_level)) {
+    throw ApiError.badRequest('Staff must belong to an active provincial Stockist, city Stockist, or fulfillment center');
+  }
+
+  if (roleSlug === ROLES.MOBILE_STOCKIST && !STOCKIST_LEVELS.includes(partner.stockist_level)) {
+    throw ApiError.badRequest('Mobile Stockists must belong to an active provincial or city Stockist partner');
   }
 }
 

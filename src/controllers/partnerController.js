@@ -3,9 +3,23 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
+const { PARTNER_LEVELS, STOCKIST_LEVELS } = require('../rbac/roles');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
+
+// Levels an admin may ask to list explicitly. 'center' is opt-in: fulfillment centers are not
+// Stockists, so every default listing (and every parent/discount picker built on it) omits them.
+const LISTABLE_LEVELS = [...STOCKIST_LEVELS, PARTNER_LEVELS.CENTER];
+
+// A parent must be a live provincial Stockist; a center (or any other level) can never be one.
+async function assertProvincialParent(parentPartnerId) {
+  const [rows] = await pool.execute(
+    'SELECT id FROM partners WHERE id = ? AND stockist_level = ? AND is_deleted = 0 LIMIT 1',
+    [parentPartnerId, PARTNER_LEVELS.PROVINCIAL]
+  );
+  if (rows.length === 0) throw ApiError.badRequest('Parent must be an existing provincial Stockist');
+}
 
 // GET /api/v1/partners
 const getPartners = asyncHandler(async (req, res) => {
@@ -18,7 +32,16 @@ const getPartners = asyncHandler(async (req, res) => {
     params.push(`%${search}%`, `%${search}%`);
   }
   if (status) { where += ' AND p.status = ?'; params.push(status); }
-  if (stockist_level) { where += ' AND p.stockist_level = ?'; params.push(stockist_level); }
+  if (stockist_level) {
+    if (!LISTABLE_LEVELS.includes(stockist_level)) {
+      throw ApiError.badRequest(`stockist_level must be one of: ${LISTABLE_LEVELS.join(', ')}`);
+    }
+    where += ' AND p.stockist_level = ?';
+    params.push(stockist_level);
+  } else {
+    where += ` AND p.stockist_level IN (${STOCKIST_LEVELS.map(() => '?').join(', ')})`;
+    params.push(...STOCKIST_LEVELS);
+  }
 
   const baseQuery = `
     SELECT p.id, p.business_name, p.email, p.phone, p.address,
@@ -74,6 +97,7 @@ const createPartner = asyncHandler(async (req, res) => {
   if (admin_password && admin_password.length < 8) {
     throw ApiError.badRequest('Password must be at least 8 characters');
   }
+  if (parent_partner_id) await assertProvincialParent(parent_partner_id);
 
   const adminMail = (admin_email || normalizedEmail || '').trim();
   if (!EMAIL_RE.test(adminMail)) {
@@ -150,8 +174,17 @@ const updatePartner = asyncHandler(async (req, res) => {
   const partnerId = req.params.id;
   const { business_name, email, phone, address, status, parent_partner_id } = req.body;
 
-  const [existing] = await pool.execute('SELECT id FROM partners WHERE id = ? AND is_deleted = 0', [partnerId]);
+  const [existing] = await pool.execute(
+    'SELECT id, stockist_level FROM partners WHERE id = ? AND is_deleted = 0', [partnerId]
+  );
   if (existing.length === 0) throw ApiError.notFound('Stockist not found');
+
+  if (parent_partner_id) {
+    if (existing[0].stockist_level === PARTNER_LEVELS.CENTER) {
+      throw ApiError.badRequest('A fulfillment center cannot have a parent');
+    }
+    await assertProvincialParent(parent_partner_id);
+  }
 
   if (email) {
     const [dup] = await pool.execute(
@@ -186,8 +219,13 @@ const updateDiscount = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('discount_pct must be between 0 and 100');
   }
 
-  const [existing] = await pool.execute('SELECT id FROM partners WHERE id = ? AND is_deleted = 0', [partnerId]);
+  const [existing] = await pool.execute(
+    'SELECT id, stockist_level FROM partners WHERE id = ? AND is_deleted = 0', [partnerId]
+  );
   if (existing.length === 0) throw ApiError.notFound('Stockist not found');
+  if (existing[0].stockist_level === PARTNER_LEVELS.CENTER) {
+    throw ApiError.badRequest('Fulfillment centers have no discount');
+  }
 
   await pool.execute('UPDATE partners SET discount_pct = ? WHERE id = ?', [discount_pct, partnerId]);
   res.json({ success: true, message: `Discount set to ${discount_pct}%` });

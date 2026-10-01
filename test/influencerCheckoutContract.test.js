@@ -6,7 +6,6 @@ const { selectPublicPaymentAccount } = require('../src/services/bankAccountResol
 
 const ordersSource = fs.readFileSync(path.join(__dirname, '../src/routes/orders.js'), 'utf8');
 const influencerSource = fs.readFileSync(path.join(__dirname, '../src/controllers/influencerController.js'), 'utf8');
-const reportSource = fs.readFileSync(path.join(__dirname, '../src/controllers/reportController.js'), 'utf8');
 const orderSource = fs.readFileSync(path.join(__dirname, '../src/controllers/orderController.js'), 'utf8');
 
 test('public and influencer routes require idempotency and enforce boundary fields', () => {
@@ -44,10 +43,4 @@ test('payment provider selection cannot cross warehouse scope', () => {
   assert.equal(selectPublicPaymentAccount(accounts, 'BDO', 11).id, 2);
   assert.throws(() => selectPublicPaymentAccount([], 'BDO', 10), /No active payment account/);
   assert.throws(() => selectPublicPaymentAccount(accounts, 'MAYA', 10), /Unsupported/);
-});
-
-test('influencer report is explicitly super-admin-only and aggregate-only', () => {
-  assert.match(reportSource, /Only super admins can view influencer reports/);
-  assert.match(reportSource, /delivered_revenue/);
-  assert.doesNotMatch(reportSource, /customer_phone|customer_email|customer_address/);
 });

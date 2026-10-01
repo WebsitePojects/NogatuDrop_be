@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -6,6 +7,11 @@ const generateOrderNum = require('../utils/generateOrderNum');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { ROLES, canonicalRole } = require('../rbac/roles');
+const {
+  resolveReceivingWarehouse,
+  insertGRNItem,
+  receiveStockOnce,
+} = require('../services/stockReceiving');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -129,47 +135,6 @@ async function getGRNItemsDetailed(db, grnId) {
       [grnId]
     );
     return rows;
-  }
-}
-
-async function insertGRNItem(db, grnId, item) {
-  const expectedQty = item.expected_qty || item.expected_quantity || 0;
-  const receivedQty = item.received_qty || item.received_quantity || 0;
-
-  try {
-    await db.execute(
-      `INSERT INTO grn_items (grn_id, product_id, expected_qty, received_qty, batch_number, expiry_date, unit_cost, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        grnId,
-        item.product_id,
-        expectedQty,
-        receivedQty,
-        item.batch_number || null,
-        item.expiry_date || null,
-        item.unit_cost || null,
-        item.notes || null,
-      ]
-    );
-  } catch (err) {
-    if (!isMissingColumn(err, 'expected_qty')) {
-      throw err;
-    }
-
-    await db.execute(
-      `INSERT INTO grn_items (grn_id, product_id, expected_quantity, received_quantity, batch_number, expiry_date, unit_cost, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        grnId,
-        item.product_id,
-        expectedQty,
-        receivedQty,
-        item.batch_number || null,
-        item.expiry_date || null,
-        item.unit_cost || null,
-        item.notes || null,
-      ]
-    );
   }
 }
 
@@ -490,4 +455,55 @@ const completeGRN = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { getGRNs, getGRN, createGRN, completeGRN };
+// Keyed by user so one user's Idempotency-Key can neither replay nor probe another user's receipt.
+// sha256 hex is exactly 64 chars, the width of goods_receipts.client_ref.
+const deriveClientRef = (userId, idempotencyKey) => (
+  crypto.createHash('sha256').update(`${userId}:${idempotencyKey}`).digest('hex')
+);
+
+async function getOwnedWarehouseIds(partnerId) {
+  if (!partnerId) return [];
+  const [rows] = await pool.execute(
+    'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 AND is_active = 1',
+    [partnerId]
+  );
+  return rows.map((row) => row.id);
+}
+
+// POST /api/v1/grn/quick-receive — one-step on-hand stock entry (completed GRN + stock movement).
+// Body is validated and normalised in routes/grn.js; only the fields below are ever read.
+const quickReceive = asyncHandler(async (req, res) => {
+  const { product_id, warehouse_id, quantity, batch_number, expiry_date, supplier, notes } = req.body;
+
+  const warehouseId = resolveReceivingWarehouse({
+    roleSlug: req.user.role_slug,
+    partnerId: req.user.partner_id,
+    requestedWarehouseId: warehouse_id,
+    ownedWarehouseIds: isSuperAdmin(req.user) ? [] : await getOwnedWarehouseIds(req.user.partner_id),
+  });
+
+  const { replayed, result } = await receiveStockOnce(pool, {
+    productId: product_id,
+    warehouseId,
+    quantity,
+    batchNumber: batch_number,
+    expiryDate: expiry_date,
+    supplier: supplier || null,
+    notes: notes || null,
+    createdBy: req.user.id,
+    clientRef: deriveClientRef(req.user.id, req.get('Idempotency-Key')),
+  });
+
+  res.status(replayed ? 200 : 201).json({
+    success: true,
+    data: {
+      grn_id: result.grnId,
+      inventory_id: result.inventoryId,
+      product_id: result.productId,
+      warehouse_id: result.warehouseId,
+      new_stock: result.newStock,
+    },
+  });
+});
+
+module.exports = { getGRNs, getGRN, createGRN, completeGRN, quickReceive };

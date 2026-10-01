@@ -4,6 +4,7 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const bcrypt = require('bcryptjs');
 const { sendEmail, EMAIL } = require('../services/emailService');
+const { isStockistLevel } = require('../rbac/roles');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -131,6 +132,11 @@ const approveApplication = asyncHandler(async (req, res) => {
   const app = normalizeApplication(rows[0]);
   const fullName = app.full_name;
   const stockistLevel = app.stockist_level;
+  // Applications can only become Stockists. A missing/unknown level — or 'center', which is
+  // provisioned by the company, never applied for — must not create a partner row.
+  if (!isStockistLevel(stockistLevel)) {
+    throw ApiError.badRequest('Application has no valid Stockist level (provincial_stockist or city_stockist)');
+  }
 
   // Generate a temporary password
   const tempPassword = Math.random().toString(36).slice(-8) + 'N1!';

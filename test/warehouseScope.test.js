@@ -6,10 +6,10 @@ const {
   canManageWarehouse,
 } = require('../src/rbac/warehouseScopes');
 
-test('super admin owned scope contains only main manufacturer warehouses', () => {
+test('super admin owned scope contains the main manufacturer warehouse and fulfillment centers', () => {
   assert.deepEqual(buildWarehouseListScope({ role: 'super_admin' }, { view: 'owned' }), {
     kind: 'warehouses',
-    clause: " AND w.partner_id IS NULL AND w.type = 'manufacturer'",
+    clause: " AND ((w.partner_id IS NULL AND w.type = 'manufacturer') OR w.type = 'center')",
     params: [],
   });
 });

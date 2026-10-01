@@ -82,33 +82,82 @@ const getBankAccounts = asyncHandler(async (req, res) => {
   res.json({ success: true, ...result });
 });
 
+// bank_accounts has no unique index, so two identical submits would insert two rows.
+// A per-warehouse advisory lock serializes the duplicate check + insert instead.
+const LOCK_WAIT_SECONDS = 5;
+
+async function withCreateLock(warehouseId, work) {
+  const conn = await pool.getConnection();
+  const lockName = `bank_account_create:${warehouseId == null ? 'company' : warehouseId}`;
+  let lockHeld = false;
+  try {
+    const [[lock]] = await conn.execute('SELECT GET_LOCK(?, ?) AS acquired', [lockName, LOCK_WAIT_SECONDS]);
+    if (Number(lock.acquired) !== 1) {
+      throw ApiError.conflict('Another payment account change is in progress. Please retry.');
+    }
+    lockHeld = true;
+    return await work(conn);
+  } finally {
+    try {
+      if (lockHeld) await conn.execute('SELECT RELEASE_LOCK(?)', [lockName]);
+      conn.release();
+    } catch (releaseErr) {
+      // A connection that may still hold the lock must not return to the pool.
+      conn.destroy();
+      console.error('[bank-accounts] failed to release advisory lock:', releaseErr.message);
+    }
+  }
+}
+
 // POST /api/v1/bank-accounts
+// Any bank name is accepted (management adds banks beyond GCASH/BDO/PSBANK) and any
+// active warehouse, including type 'center'. Shape is validated by the route.
 const createBankAccount = asyncHandler(async (req, res) => {
   const { warehouse_id, bank_name, account_name, account_number, is_default } = req.body;
-  if (!bank_name || !account_name || !account_number) {
-    throw ApiError.badRequest('bank_name, account_name, and account_number are required');
-  }
+  const warehouseId = warehouse_id == null ? null : warehouse_id;
+  const hasSoftDelete = await bankAccountsHasIsDeletedColumn();
 
-  const [result] = await pool.execute(
-    `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, is_default)
-     VALUES (?, ?, ?, ?, ?)`,
-    [warehouse_id || null, bank_name, account_name, account_number, is_default ? 1 : 0]
-  );
-  res.status(201).json({ success: true, message: 'Bank account created', data: { id: result.insertId } });
+  const accountId = await withCreateLock(warehouseId, async (conn) => {
+    if (warehouseId !== null) {
+      const [warehouses] = await conn.execute(
+        'SELECT id FROM warehouses WHERE id = ? AND is_active = 1 AND is_deleted = 0 LIMIT 1',
+        [warehouseId]
+      );
+      if (warehouses.length === 0) throw ApiError.badRequest('Warehouse not found or inactive');
+    }
+
+    const [duplicates] = await conn.execute(
+      `SELECT id FROM bank_accounts
+       WHERE warehouse_id <=> ? AND bank_name = ? AND account_number = ?${hasSoftDelete ? ' AND is_deleted = 0' : ''}
+       LIMIT 1`,
+      [warehouseId, bank_name, account_number]
+    );
+    if (duplicates.length > 0) {
+      throw ApiError.conflict('This bank account is already registered for that warehouse');
+    }
+
+    const [result] = await conn.execute(
+      `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, is_default)
+       VALUES (?, ?, ?, ?, ?)`,
+      [warehouseId, bank_name, account_name, account_number, is_default ? 1 : 0]
+    );
+    return result.insertId;
+  });
+
+  res.status(201).json({ success: true, message: 'Bank account created', data: { id: accountId } });
 });
 
 // PUT /api/v1/bank-accounts/:id
+// Partial update; an omitted field keeps its stored value (COALESCE needs null, never undefined).
 const updateBankAccount = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { bank_name, account_name, account_number, is_active, is_default } = req.body;
 
   const hasSoftDelete = await bankAccountsHasIsDeletedColumn();
-  let existing;
-  if (hasSoftDelete) {
-    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ? AND is_deleted = 0', [id]);
-  } else {
-    [existing] = await pool.execute('SELECT id FROM bank_accounts WHERE id = ?', [id]);
-  }
+  const [existing] = await pool.execute(
+    `SELECT id FROM bank_accounts WHERE id = ?${hasSoftDelete ? ' AND is_deleted = 0' : ''}`,
+    [id]
+  );
   if (existing.length === 0) {
     throw ApiError.notFound('Bank account not found');
   }
@@ -117,7 +166,14 @@ const updateBankAccount = asyncHandler(async (req, res) => {
     `UPDATE bank_accounts SET bank_name = COALESCE(?, bank_name), account_name = COALESCE(?, account_name),
      account_number = COALESCE(?, account_number), is_active = COALESCE(?, is_active),
      is_default = COALESCE(?, is_default) WHERE id = ?`,
-    [bank_name, account_name, account_number, is_active !== undefined ? is_active : null, is_default !== undefined ? is_default : null, id]
+    [
+      bank_name ?? null,
+      account_name ?? null,
+      account_number ?? null,
+      is_active === undefined ? null : (is_active ? 1 : 0),
+      is_default === undefined ? null : (is_default ? 1 : 0),
+      id,
+    ]
   );
   res.json({ success: true, message: 'Bank account updated' });
 });
