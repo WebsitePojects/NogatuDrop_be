@@ -53,6 +53,11 @@ const env = {
   PAYMENT_DEADLINE_HOURS: parseInt(process.env.PAYMENT_DEADLINE_HOURS, 10) || 24,
 
   // Rate limiting
+  // Express `trust proxy`: which hops may set X-Forwarded-For. Production sits behind nginx on the
+  // same host, so 'loopback' yields the real client IP and ignores client-supplied forwarding headers.
+  // A number means a hop count (e.g. 2 behind a CDN + nginx).
+  TRUST_PROXY: /^\d+$/.test(process.env.TRUST_PROXY || '') ? Number(process.env.TRUST_PROXY) : (process.env.TRUST_PROXY || 'loopback'),
+
   RATE_LIMIT_ENABLED:
     (process.env.RATE_LIMIT_ENABLED || (process.env.NODE_ENV === 'production' ? 'true' : 'false')).toLowerCase() === 'true',
 

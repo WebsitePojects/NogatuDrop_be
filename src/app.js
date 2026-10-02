@@ -14,6 +14,10 @@ const { buildReadinessSnapshot } = require('./services/readinessService');
 
 const app = express();
 
+// Without this every request behind nginx has req.ip 127.0.0.1, so each rate limiter becomes one
+// bucket shared by all visitors and a few shoppers lock everyone out.
+app.set('trust proxy', env.TRUST_PROXY);
+
 const allowedOrigins = String(env.ALLOWED_ORIGIN || '')
   .split(',')
   .map((origin) => origin.trim())
@@ -139,7 +143,11 @@ if (env.RATE_LIMIT_ENABLED) {
     standardHeaders: true,
     legacyHeaders: false,
   }, 'rl:public-order:');
-  app.use('/api/v1/orders/public', publicOrderLimiter);
+  // Only order submissions spend this allowance. The influencer landing page and payment options are
+  // GETs under the same prefix; counting them would block shoppers for browsing.
+  app.use('/api/v1/orders/public', (req, res, next) => (
+    req.method === 'POST' ? publicOrderLimiter(req, res, next) : next()
+  ));
 
   const publicTrackingLimiter = createRateLimiter({
     windowMs: 15 * 60 * 1000,

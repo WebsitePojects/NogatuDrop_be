@@ -7,7 +7,8 @@ const appSource = readFileSync(join(__dirname, '../src/app.js'), 'utf8');
 
 test('public order creation has a tighter abuse limit than the shared API budget', () => {
   assert.equal(appSource.includes('Too many public order attempts, please try again later.'), true);
-  assert.equal(appSource.includes("app.use('/api/v1/orders/public', publicOrderLimiter);"), true);
+  // Submissions only; behaviour is exercised end-to-end in rateLimitBehindProxy.test.js.
+  assert.match(appSource, /app\.use\('\/api\/v1\/orders\/public', \(req, res, next\) => \(\s*req\.method === 'POST' \? publicOrderLimiter\(req, res, next\) : next\(\)/);
   assert.match(appSource, /const publicOrderLimiter = createRateLimiter\(\{[\s\S]*max:\s*10,/);
 });
 
