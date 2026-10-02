@@ -1,7 +1,21 @@
 const pool = require('../config/db');
+const env = require('../config/env');
 
-function buildCronLockName(lockKey) {
-  return `nogatu:cron:${lockKey}`;
+// MySQL/MariaDB reject GET_LOCK names longer than this.
+const MYSQL_LOCK_NAME_MAX_LENGTH = 64;
+
+/**
+ * GET_LOCK names are global to the MySQL server, not scoped to a database. Production (BLUE)
+ * and staging (GREEN) share one server and run the same schedules, so the name carries the
+ * database: without it, a staging cron holding the lock makes the matching production cron
+ * skip its run (e.g. expired orders stay reserved for another 5 minutes).
+ */
+function buildCronLockName(lockKey, databaseName = env.DB_NAME) {
+  const lockName = `nogatu:cron:${databaseName}:${lockKey}`;
+  if (lockName.length > MYSQL_LOCK_NAME_MAX_LENGTH) {
+    throw new Error(`Cron lock name "${lockName}" exceeds ${MYSQL_LOCK_NAME_MAX_LENGTH} characters; shorten the lock key`);
+  }
+  return lockName;
 }
 
 async function runWithCronLeaderLock({
