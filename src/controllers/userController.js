@@ -6,6 +6,7 @@ const paginate = require('../utils/paginate');
 const { resolveUserAssignment } = require('../rbac/userAssignments');
 const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 const { normalizeUsername, isValidUsername } = require('../utils/username');
+const { revokeAllSessions, SESSION_REVOKE_REASONS } = require('../services/sessionService');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isMissingColumnError = (err) => err && err.code === 'ER_BAD_FIELD_ERROR';
@@ -469,6 +470,10 @@ const updateUser = asyncHandler(async (req, res) => {
     }
   }
 
+  if (status && status !== 'active') {
+    await revokeAllSessions(pool, userId, SESSION_REVOKE_REASONS.ACCOUNT_DISABLED);
+  }
+
   const [updated] = await pool.execute(
     `SELECT u.id, u.name, u.email, u.phone, u.level, u.location, u.status, u.partner_id,
             r.name AS role_name, r.slug AS role_slug
@@ -506,6 +511,7 @@ const resetUserPassword = asyncHandler(async (req, res) => {
     'UPDATE users SET password = ? WHERE id = ? AND is_deleted = 0',
     [hashedPassword, userId]
   );
+  await revokeAllSessions(pool, userId, SESSION_REVOKE_REASONS.PASSWORD_RESET);
 
   res.json({
     success: true,
@@ -534,6 +540,7 @@ const deleteUser = asyncHandler(async (req, res) => {
   if (existing.length === 0) throw ApiError.notFound('User not found');
 
   await pool.execute('UPDATE users SET is_deleted = 1, status = ? WHERE id = ?', ['inactive', userId]);
+  await revokeAllSessions(pool, userId, SESSION_REVOKE_REASONS.ACCOUNT_DISABLED);
 
   res.json({ success: true, message: 'User deleted' });
 });

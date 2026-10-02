@@ -7,15 +7,12 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const { sendEmail, EMAIL } = require('../services/emailService');
 const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
-
-function parseExpiry(str) {
-  const match = str.match(/^(\d+)([smhd])$/);
-  if (!match) return 900;
-  const num = parseInt(match[1], 10);
-  const unit = match[2];
-  const multipliers = { s: 1, m: 60, h: 3600, d: 86400 };
-  return num * (multipliers[unit] || 60);
-}
+const {
+  SESSION_REVOKE_REASONS, createSession, touchSession, revokeSession, revokeAllSessions, sessionIdFromRefreshToken,
+} = require('../services/sessionService');
+const { countryForIp, manilaHour, evaluateLoginRisk } = require('../services/loginRisk');
+const { recordLoginEvent, loadRiskHistory, notifySuperAdminsInApp } = require('../services/loginSecurityService');
+const { createLoginChallenge, verifyLoginChallenge } = require('../services/loginChallengeService');
 
 function isBcryptHash(value = '') {
   return /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(value);
@@ -55,175 +52,220 @@ async function findUserForLogin(identifierLower, db = pool) {
   }
 }
 
-// POST /api/v1/auth/login
-const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-  const identifier = String(email || '').trim();
-  const identifierLower = identifier.toLowerCase();
+const REFRESH_COOKIE = 'refreshToken';
+const refreshCookieOptions = () => ({
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  path: '/',
+});
 
-  const user = await findUserForLogin(identifierLower);
-  if (!user) {
-    throw ApiError.unauthorized('Invalid email or password');
-  }
+// Plaintext passwords are no longer accepted: the old migrate-on-login branch compared with === (not
+// constant time) and no stored password should still be plaintext.
+function verifyPassword(user, password) {
+  if (!isBcryptHash(user.password)) return Promise.resolve(false);
+  return bcrypt.compare(String(password ?? ''), user.password);
+}
 
-  const normalizedRoleSlug = normalizeRoleSlug(user.role_slug);
-
-  if (user.status !== 'active') {
-    throw ApiError.unauthorized('Account is inactive or suspended');
-  }
-
-  let isMatch = false;
-
-  if (isBcryptHash(user.password)) {
-    isMatch = await bcrypt.compare(password, user.password);
-  } else {
-    // Legacy plaintext password support: allow once, then migrate to bcrypt.
-    isMatch = password === user.password;
-    if (isMatch) {
-      const migratedHash = await bcrypt.hash(password, 12);
-      await pool.execute('UPDATE users SET password = ? WHERE id = ?', [migratedHash, user.id]);
-    }
-  }
-
-  if (!isMatch) {
-    throw ApiError.unauthorized('Invalid email or password');
-  }
-
-  // Generate access token
-  const accessPayload = {
-    id: user.id,
-    email: user.email,
-    role: user.role_id,
-    role_slug: normalizedRoleSlug,
-    partner_id: user.partner_id,
+// The request facts every sign-in decision uses. req.ip is the client address (trust proxy is set).
+function signInContext(req) {
+  const ip = req.ip || null;
+  return {
+    ip,
+    country: countryForIp(ip),
+    hour: manilaHour(),
+    userAgent: req.get('user-agent') || null,
   };
-  const accessToken = jwt.sign(accessPayload, env.JWT_SECRET, {
-    expiresIn: env.JWT_EXPIRES_IN,
-  });
+}
 
-  // Generate refresh token
-  const refreshPayload = { id: user.id, type: 'refresh' };
-  const refreshToken = jwt.sign(refreshPayload, env.JWT_REFRESH_SECRET, {
-    expiresIn: env.JWT_REFRESH_EXPIRES_IN,
-  });
-
-  // Store refresh token hash in Redis
-  const refreshHash = await bcrypt.hash(refreshToken, 12);
-  const refreshTTL = parseExpiry(env.JWT_REFRESH_EXPIRES_IN);
-  await redis.setex(`refresh:${user.id}`, refreshTTL, refreshHash);
-
-  // Update last_login
-  await pool.execute('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
-
-  // Set httpOnly cookie with refresh token
-  res.cookie('refreshToken', refreshToken, {
-    httpOnly: true,
-    secure: env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: refreshTTL * 1000,
-    path: '/',
-  });
-
-  res.json({
-    success: true,
-    message: 'Login successful',
-    data: {
-      access_token: accessToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role_name,
-        role_slug: normalizedRoleSlug,
-        partner_id: user.partner_id,
-        partner_level: user.partner_level || null,
-        partner_name: user.partner_name || null,
-      },
-    },
-  });
-});
-
-// POST /api/v1/auth/logout
-const logout = asyncHandler(async (req, res) => {
-  const userId = req.user.id;
-
-  // Clear refresh token from Redis
-  await redis.del(`refresh:${userId}`);
-
-  // Clear cookie
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    secure: env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    path: '/',
-  });
-
-  res.json({ success: true, message: 'Logged out successfully' });
-});
-
-// POST /api/v1/auth/refresh
-const refresh = asyncHandler(async (req, res) => {
-  const refreshToken = req.cookies.refreshToken;
-
-  if (!refreshToken) {
-    throw ApiError.unauthorized('Refresh token is required');
-  }
-
-  let decoded;
-  try {
-    decoded = jwt.verify(refreshToken, env.JWT_REFRESH_SECRET);
-  } catch {
-    throw ApiError.unauthorized('Invalid or expired refresh token');
-  }
-
-  // Verify hash matches stored hash
-  const storedHash = await redis.get(`refresh:${decoded.id}`);
-
-  if (!storedHash) {
-    throw ApiError.unauthorized('Refresh token has been revoked');
-  }
-
-  const isValidRefresh = await bcrypt.compare(refreshToken, storedHash);
-  if (!isValidRefresh) {
-    throw ApiError.unauthorized('Refresh token has been revoked');
-  }
-
-  // Get user info
-  const [users] = await pool.execute(
-        `SELECT u.id, u.name, u.email, u.phone, u.partner_id, u.status,
-          r.id AS role_id, r.name AS role_name, r.slug AS role_slug
-     FROM users u
-     JOIN roles r ON r.id = u.role_id
-     WHERE u.id = ? AND u.is_deleted = 0
-     LIMIT 1`,
-    [decoded.id]
-  );
-
-  if (users.length === 0 || users[0].status !== 'active') {
-    throw ApiError.unauthorized('User not found or inactive');
-  }
-
-  const user = users[0];
-  const normalizedRoleSlug = normalizeRoleSlug(user.role_slug);
-
-  // Issue new access token
-  const accessToken = jwt.sign(
+function accessTokenFor(user, sessionId) {
+  return jwt.sign(
     {
       id: user.id,
+      sid: sessionId,
       email: user.email,
       role: user.role_id,
-      role_slug: normalizedRoleSlug,
+      role_slug: normalizeRoleSlug(user.role_slug),
       partner_id: user.partner_id,
     },
     env.JWT_SECRET,
     { expiresIn: env.JWT_EXPIRES_IN }
   );
+}
+
+function userPayload(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    role: user.role_name,
+    role_slug: normalizeRoleSlug(user.role_slug),
+    partner_id: user.partner_id,
+    partner_level: user.partner_level || null,
+    partner_name: user.partner_name || null,
+  };
+}
+
+/** Starts a session (row + cookie) and sends the signed-in response shared by login and code verification. */
+async function startSessionAndRespond(res, user, context) {
+  const session = await createSession(pool, {
+    userId: user.id, ip: context.ip, country: context.country, userAgent: context.userAgent,
+  });
+  await pool.execute('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
+  res.cookie(REFRESH_COOKIE, session.refreshToken, { ...refreshCookieOptions(), maxAge: session.maxAgeMs });
+  res.json({
+    success: true,
+    message: 'Login successful',
+    data: { access_token: accessTokenFor(user, session.sessionId), user: userPayload(user) },
+  });
+  return session.sessionId;
+}
+
+function maskEmail(email) {
+  const [local = '', domain = ''] = String(email).split('@');
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+// POST /api/v1/auth/login
+// A correct password signs in directly, unless the sign-in looks unusual (services/loginRisk.js):
+// then a 6-digit code is emailed to the account and the session starts only at /auth/login/verify.
+const login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  const identifierLower = String(email || '').trim().toLowerCase();
+
+  const user = await findUserForLogin(identifierLower);
+  if (!user) {
+    throw ApiError.unauthorized('Invalid email or password');
+  }
+  if (user.status !== 'active') {
+    throw ApiError.unauthorized('Account is inactive or suspended');
+  }
+
+  const context = signInContext(req);
+  if (!(await verifyPassword(user, password))) {
+    await recordLoginEvent(pool, { userId: user.id, outcome: 'bad_password', ...context });
+    throw ApiError.unauthorized('Invalid email or password');
+  }
+
+  const history = await loadRiskHistory(pool, user.id);
+  const flags = evaluateLoginRisk({ ...history, country: context.country, hour: context.hour });
+
+  if (flags.length === 0) {
+    const sessionId = await startSessionAndRespond(res, user, context);
+    await recordLoginEvent(pool, { userId: user.id, outcome: 'success', ...context, sessionId });
+    return;
+  }
+
+  // Flagged: the event, the Super Admin in-app alerts and the code challenge commit together; the
+  // alert email is delivered later from the same event row by the alert cron.
+  const conn = await pool.getConnection();
+  let challenge;
+  let loginEventId;
+  try {
+    await conn.beginTransaction();
+    loginEventId = await recordLoginEvent(conn, { userId: user.id, outcome: 'code_required', flags, ...context });
+    await notifySuperAdminsInApp(conn, { loginEventId, userName: user.name, country: context.country, flags });
+    challenge = await createLoginChallenge(conn, { userId: user.id, loginEventId });
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  try {
+    const template = EMAIL.loginCode(challenge.code, challenge.expiresInSeconds / 60);
+    await sendEmail({ to: user.email, toName: user.name, ...template, throwOnFailure: true });
+  } catch (err) {
+    // Fail closed: without the code nobody can finish this sign-in, so say so instead of hanging.
+    await pool.execute("UPDATE login_events SET outcome = 'code_unsent' WHERE id = ?", [loginEventId]);
+    console.error('[Auth] Sign-in code email failed:', err.message);
+    throw new ApiError(503, 'We could not send your sign-in code. Please try again in a few minutes.');
+  }
+
+  res.json({
+    success: true,
+    message: 'Enter the code we emailed you to finish signing in',
+    data: {
+      code_required: true,
+      challenge_id: challenge.challengeId,
+      email_hint: maskEmail(user.email),
+      expires_in_seconds: challenge.expiresInSeconds,
+    },
+  });
+});
+
+// POST /api/v1/auth/login/verify
+const verifyLogin = asyncHandler(async (req, res) => {
+  const { challenge_id: challengeId, code } = req.body;
+  const result = await verifyLoginChallenge(pool, { challengeId, code });
+  if (result.status === 'invalid') {
+    throw ApiError.unauthorized('That code is not correct. Check the email and try again.');
+  }
+  if (result.status !== 'ok') {
+    throw ApiError.unauthorized('This code has expired or was used too many times. Please sign in again.');
+  }
+
+  const [users] = await pool.execute(
+    `${LOGIN_USER_SELECT}
+     WHERE u.id = ? AND u.is_deleted = 0
+     LIMIT 1`,
+    [result.userId]
+  );
+  const user = users[0];
+  if (!user || user.status !== 'active') {
+    throw ApiError.unauthorized('Account is inactive or suspended');
+  }
+
+  const sessionId = await startSessionAndRespond(res, user, signInContext(req));
+  await pool.execute(
+    "UPDATE login_events SET outcome = 'code_passed', session_id = ? WHERE id = ?",
+    [sessionId, result.loginEventId]
+  );
+});
+
+// POST /api/v1/auth/logout — ends only this device's session (identified by its refresh cookie).
+const logout = asyncHandler(async (req, res) => {
+  const owner = sessionIdFromRefreshToken(req.cookies[REFRESH_COOKIE]);
+  if (owner) {
+    await revokeSession(pool, { sessionId: owner.sessionId, userId: owner.userId, reason: SESSION_REVOKE_REASONS.LOGOUT });
+  }
+  res.clearCookie(REFRESH_COOKIE, refreshCookieOptions());
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// POST /api/v1/auth/refresh
+const refresh = asyncHandler(async (req, res) => {
+  const refreshToken = req.cookies[REFRESH_COOKIE];
+  if (!refreshToken) {
+    throw ApiError.unauthorized('Refresh token is required');
+  }
+
+  const session = await touchSession(pool, refreshToken);
+  if (!session) {
+    res.clearCookie(REFRESH_COOKIE, refreshCookieOptions());
+    throw ApiError.unauthorized('Your session has ended. Please sign in again.');
+  }
+
+  const [users] = await pool.execute(
+    `SELECT u.id, u.email, u.partner_id, u.status, r.id AS role_id, r.slug AS role_slug
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = ? AND u.is_deleted = 0
+     LIMIT 1`,
+    [session.userId]
+  );
+  if (users.length === 0 || users[0].status !== 'active') {
+    await revokeSession(pool, { sessionId: session.sessionId, reason: SESSION_REVOKE_REASONS.ACCOUNT_DISABLED });
+    throw ApiError.unauthorized('User not found or inactive');
+  }
 
   res.json({
     success: true,
     message: 'Token refreshed',
-    data: { access_token: accessToken },
+    data: { access_token: accessTokenFor(users[0], session.sessionId) },
   });
 });
 
@@ -305,10 +347,10 @@ const resetPassword = asyncHandler(async (req, res) => {
   await pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashed, userId]);
   await redis.del(`otp:reset:${userId}`);
 
-  // Revoke all refresh tokens for this user
-  await redis.del(`refresh:${userId}`);
+  // A password change ends every signed-in device.
+  await revokeAllSessions(pool, userId, SESSION_REVOKE_REASONS.PASSWORD_RESET);
 
   res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
 });
 
-module.exports = { login, logout, refresh, me, forgotPassword, resetPassword, findUserForLogin };
+module.exports = { login, verifyLogin, logout, refresh, me, forgotPassword, resetPassword, findUserForLogin };

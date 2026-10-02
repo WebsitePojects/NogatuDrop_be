@@ -26,11 +26,13 @@ const settlementRoutes = require('./settlements');
 const exportRoutes = require('./exports');
 const allianceRoutes = require('./alliance');
 const mobileInventoryRoutes = require('./mobileInventory');
+const securityRoutes = require('./security');
 
 const router = Router();
 
 router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
+router.use('/security', securityRoutes);
 router.use('/products', productRoutes);
 router.use('/inventory', inventoryRoutes);
 router.use('/warehouses', warehouseRoutes);
