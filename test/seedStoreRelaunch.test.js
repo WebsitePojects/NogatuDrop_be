@@ -94,6 +94,15 @@ test('center field, coordinate and staff rules', () => {
   assert.deepEqual(problemsFor((c) => { c.centers[0].staff = []; c.centers[0].paymentAccounts = []; }), []);
 });
 
+test('usernames from the management form are validated and unique across the config', () => {
+  assert.deepEqual(problemsFor((c) => { c.superAdmin.username = '  DErfe '; }), [], 'trimmed and lowercased before checking');
+  assert.ok(problemsFor((c) => { c.centers[0].staff[0].username = 'ab'; }).some((p) => p.startsWith('centers[0].staff[0].username')));
+  assert.ok(problemsFor((c) => { c.centers[0].staff[0].username = 'has space'; }).some((p) => p.startsWith('centers[0].staff[0].username')));
+  assert.ok(problemsFor((c) => { c.centers[0].staff[0].username = 'x@y.com'; }).some((p) => p.startsWith('centers[0].staff[0].username')));
+  assert.ok(problemsFor((c) => { c.centers[1].staff[0].username = c.superAdmin.username.toUpperCase(); }).some((p) => /duplicates another username/.test(p)));
+  assert.deepEqual(problemsFor((c) => { delete c.centers[0].staff[0].username; }), [], 'username stays optional');
+});
+
 test('center key + batch must fit the 64-char client_ref column', () => {
   assert.ok(problemsFor((c) => { c.opening.batch = 'B'.repeat(50); c.centers[0].key = 'K'.repeat(20); }).some((p) => /client reference longer/.test(p)));
   assert.equal(openingClientRef('CALOOCAN', ' B01 '), 'seed-opening-CALOOCAN-B01');
@@ -105,6 +114,7 @@ test('schema preflight lists every missing prerequisite with the fix', () => {
   assert.match(problems, /influencer_checkout_2026_09_10\.sql/);
   assert.match(problems, /addGrnClientRef\.js/);
   assert.match(problems, /addUserWarehouse\.js/);
+  assert.match(problems, /addUsername\.js/);
 });
 
 test('schema preflight passes when the center enums and tables exist, and reports optional columns', () => {
@@ -113,6 +123,7 @@ test('schema preflight passes when the center enums and tables exist, and report
     { tableName: 'warehouses', columnName: 'type', columnType: "enum('manufacturer','region','city','center')" },
     { tableName: 'goods_receipts', columnName: 'client_ref', columnType: 'varchar(64)' },
     { tableName: 'users', columnName: 'warehouse_id', columnType: 'bigint(20) unsigned' },
+    { tableName: 'users', columnName: 'username', columnType: 'varchar(50)' },
     { tableName: 'influencer_links', columnName: 'slug', columnType: 'varchar(80)' },
   ];
   const result = evaluatePreflight(snapshot);

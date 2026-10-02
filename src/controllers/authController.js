@@ -21,32 +21,51 @@ function isBcryptHash(value = '') {
   return /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(value);
 }
 
+const LOGIN_USER_SELECT = `SELECT u.id, u.name, u.email, u.password, u.phone, u.partner_id, u.status,
+            r.id AS role_id, r.name AS role_name, r.slug AS role_slug,
+            p.stockist_level AS partner_level, p.business_name AS partner_name
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     LEFT JOIN partners p ON p.id = u.partner_id`;
+
+/**
+ * The account a login identifier names: its full email or its exact username. Both columns are
+ * unique and a username cannot contain "@", so at most one account matches. (Matching the email's
+ * local part, as before, picked an arbitrary account when two emails shared one.)
+ * Until scripts/addUsername.js has run there is no username column; then only the email matches.
+ */
+async function findUserForLogin(identifierLower, db = pool) {
+  try {
+    const [rows] = await db.execute(
+      `${LOGIN_USER_SELECT}
+     WHERE (LOWER(u.email) = ? OR u.username = ?) AND u.is_deleted = 0
+     LIMIT 1`,
+      [identifierLower, identifierLower]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    if (!err || err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+    const [rows] = await db.execute(
+      `${LOGIN_USER_SELECT}
+     WHERE LOWER(u.email) = ? AND u.is_deleted = 0
+     LIMIT 1`,
+      [identifierLower]
+    );
+    return rows[0] || null;
+  }
+}
+
 // POST /api/v1/auth/login
 const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
   const identifier = String(email || '').trim();
   const identifierLower = identifier.toLowerCase();
 
-  const [users] = await pool.execute(
-    `SELECT u.id, u.name, u.email, u.password, u.phone, u.partner_id, u.status,
-            r.id AS role_id, r.name AS role_name, r.slug AS role_slug,
-            p.stockist_level AS partner_level, p.business_name AS partner_name
-     FROM users u
-     JOIN roles r ON r.id = u.role_id
-     LEFT JOIN partners p ON p.id = u.partner_id
-     WHERE (
-       LOWER(u.email) = ?
-       OR LOWER(SUBSTRING_INDEX(u.email, '@', 1)) = ?
-     ) AND u.is_deleted = 0
-     LIMIT 1`,
-    [identifierLower, identifierLower]
-  );
-
-  if (users.length === 0) {
+  const user = await findUserForLogin(identifierLower);
+  if (!user) {
     throw ApiError.unauthorized('Invalid email or password');
   }
 
-  const user = users[0];
   const normalizedRoleSlug = normalizeRoleSlug(user.role_slug);
 
   if (user.status !== 'active') {
@@ -292,4 +311,4 @@ const resetPassword = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
 });
 
-module.exports = { login, logout, refresh, me, forgotPassword, resetPassword };
+module.exports = { login, logout, refresh, me, forgotPassword, resetPassword, findUserForLogin };

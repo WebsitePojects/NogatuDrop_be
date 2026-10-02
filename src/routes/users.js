@@ -39,6 +39,8 @@ router.post(
       return true;
     }),
     body('email').isEmail().withMessage('Valid email is required'),
+    // Format and uniqueness are enforced in the controller (utils/username.js).
+    body('username').optional({ values: 'null' }).isString().withMessage('Username must be text'),
     body('password')
       .isString()
       .withMessage('Password is required')
@@ -61,6 +63,7 @@ router.put(
   [
     body('name').optional().trim().notEmpty(),
     body('email').optional().isEmail(),
+    body('username').optional({ values: 'null' }).isString().withMessage('Username must be text'),
     body('status').optional().isIn(['active', 'inactive', 'suspended']),
     body('level').optional().isIn(['main', 'regional', 'city']),
   ],

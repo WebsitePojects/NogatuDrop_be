@@ -2,6 +2,7 @@
   "superAdmin": {
     "name": "Example Super Admin",
     "email": "super.admin@example.com",
+    "username": "superadmin",
     "passwordEnv": "SEED_SUPERADMIN_PASSWORD"
   },
   "product": {
@@ -26,13 +27,35 @@
       "lat": 14.6,
       "lng": 120.98,
       "staff": [
-        { "name": "Example Staff One", "email": "staff.one@example.com", "passwordEnv": "SEED_STAFF_ONE_PASSWORD" },
-        { "name": "Example Staff Two", "email": "staff.two@example.com", "passwordEnv": "SEED_STAFF_TWO_PASSWORD" }
+        {
+          "name": "Example Staff One",
+          "email": "staff.one@example.com",
+          "username": "staff1",
+          "passwordEnv": "SEED_STAFF_ONE_PASSWORD"
+        },
+        {
+          "name": "Example Staff Two",
+          "email": "staff.two@example.com",
+          "username": "staff2",
+          "passwordEnv": "SEED_STAFF_TWO_PASSWORD"
+        }
       ],
       "paymentAccounts": [
-        { "bankName": "GCASH", "accountName": "Example Account Holder", "accountNumber": "09000000001" },
-        { "bankName": "BDO", "accountName": "Example Account Holder", "accountNumber": "000000001234" },
-        { "bankName": "PSBANK", "accountName": "Example Account Holder", "accountNumber": "000000005678" }
+        {
+          "bankName": "GCASH",
+          "accountName": "Example Account Holder",
+          "accountNumber": "09000000001"
+        },
+        {
+          "bankName": "BDO",
+          "accountName": "Example Account Holder",
+          "accountNumber": "000000001234"
+        },
+        {
+          "bankName": "PSBANK",
+          "accountName": "Example Account Holder",
+          "accountNumber": "000000005678"
+        }
       ]
     },
     {
@@ -43,12 +66,29 @@
       "contactPerson": "Example Contact B",
       "contactPhone": "+639000000002",
       "staff": [
-        { "name": "Example Staff Three", "email": "staff.three@example.com", "passwordEnv": "SEED_STAFF_THREE_PASSWORD" }
+        {
+          "name": "Example Staff Three",
+          "email": "staff.three@example.com",
+          "username": "staff3",
+          "passwordEnv": "SEED_STAFF_THREE_PASSWORD"
+        }
       ],
       "paymentAccounts": [
-        { "bankName": "GCASH", "accountName": "Example Account Holder", "accountNumber": "09000000001" },
-        { "bankName": "BDO", "accountName": "Example Account Holder", "accountNumber": "000000001234" },
-        { "bankName": "PSBANK", "accountName": "Example Account Holder", "accountNumber": "000000005678" }
+        {
+          "bankName": "GCASH",
+          "accountName": "Example Account Holder",
+          "accountNumber": "09000000001"
+        },
+        {
+          "bankName": "BDO",
+          "accountName": "Example Account Holder",
+          "accountNumber": "000000001234"
+        },
+        {
+          "bankName": "PSBANK",
+          "accountName": "Example Account Holder",
+          "accountNumber": "000000005678"
+        }
       ]
     }
   ],

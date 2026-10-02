@@ -27,6 +27,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const bcrypt = require('bcryptjs');
 const { MAX_RECEIVE_QUANTITY, isFutureIsoDate, receiveStock } = require('../src/services/stockReceiving');
+const { normalizeUsername, isValidUsername } = require('../src/utils/username');
 
 const BCRYPT_ROUNDS = 12;
 const MIN_PASSWORD_LENGTH = 10;
@@ -72,6 +73,15 @@ function validateConfig(config, now = new Date()) {
     seenEmails.add(normalized);
   };
 
+  const seenUsernames = new Set();
+  const checkUsername = (pathName, value) => {
+    if (value == null) return;
+    const normalized = normalizeUsername(value);
+    expect(isValidUsername(normalized), `${pathName} must be 3-50 characters: letters, digits, dot, underscore or hyphen`);
+    expect(!seenUsernames.has(normalized), `${pathName} duplicates another username in the config`);
+    seenUsernames.add(normalized);
+  };
+
   const { superAdmin, product, opening, centers, influencer } = config;
 
   expect(superAdmin && typeof superAdmin === 'object', 'superAdmin is required');
@@ -80,6 +90,7 @@ function validateConfig(config, now = new Date()) {
     expect(isEmail(superAdmin.email), 'superAdmin.email must be a valid email');
     expect(ENV_NAME_PATTERN.test(superAdmin.passwordEnv || ''), 'superAdmin.passwordEnv must be an env var name like SUPERADMIN_PASSWORD');
     if (isEmail(superAdmin.email)) checkUniqueEmail('superAdmin.email', superAdmin.email);
+    checkUsername('superAdmin.username', superAdmin.username);
   }
 
   expect(product && typeof product === 'object', 'product is required');
@@ -146,8 +157,7 @@ function validateConfig(config, now = new Date()) {
       }
       expect(isNonEmptyString(staff.name, 150), `${staffAt}.name is required (max 150 chars)`);
       expect(isEmail(staff.email), `${staffAt}.email must be a valid email`);
-      // `username` is accepted for forward compatibility but not stored: users has no username column (login is by email).
-      expect(staff.username == null || isNonEmptyString(staff.username, 100), `${staffAt}.username must be a non-empty string when given`);
+      checkUsername(`${staffAt}.username`, staff.username);
       expect(ENV_NAME_PATTERN.test(staff.passwordEnv || ''), `${staffAt}.passwordEnv must be an env var name like STAFF_PASSWORD`);
       if (isEmail(staff.email)) checkUniqueEmail(`${staffAt}.email`, staff.email);
     });
@@ -234,6 +244,9 @@ function evaluatePreflight(snapshot) {
   if (!find('users', 'warehouse_id')) {
     problems.push('users.warehouse_id is missing — run: node --env-file=<env> scripts/addUserWarehouse.js');
   }
+  if (!find('users', 'username')) {
+    problems.push('users.username is missing — run: node --env-file=<env> scripts/addUsername.js');
+  }
 
   return {
     problems,
@@ -308,21 +321,39 @@ async function resolveProduct(conn, productConfig) {
   );
 }
 
+/**
+ * Fails closed when the configured username already belongs to a different account; otherwise the
+ * UNIQUE index would abort the whole seed transaction with a raw duplicate-key error.
+ */
+async function assertUsernameFree(ctx, username, email, at) {
+  if (!username) return;
+  const [rows] = await ctx.conn.execute(
+    'SELECT id FROM users WHERE username = ? AND LOWER(email) <> ? LIMIT 1',
+    [username, email]
+  );
+  if (rows.length) {
+    throw new Error(`Fail closed: ${at} username "${username}" is already used by another account (user id ${rows[0].id})`);
+  }
+}
+
 async function syncSuperAdmin(ctx, roleIds, superAdmin) {
   const email = superAdmin.email.trim().toLowerCase();
+  const username = normalizeUsername(superAdmin.username);
+  await assertUsernameFree(ctx, username, email, 'superAdmin');
   return upsert(ctx, {
     lookup: ['SELECT id, is_deleted FROM users WHERE email = ? LIMIT 1', [email]],
     insert: async () => [
-      `INSERT INTO users (name, email, password, role_id, partner_id, warehouse_id, level, location, status, is_deleted)
-       VALUES (?, ?, ?, ?, NULL, NULL, 'main', 'Head Office', 'active', 0)`,
-      [superAdmin.name.trim(), email, await ctx.hashPasswordFromEnv(superAdmin.passwordEnv), roleIds.super_admin],
+      `INSERT INTO users (name, email, username, password, role_id, partner_id, warehouse_id, level, location, status, is_deleted)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, 'main', 'Head Office', 'active', 0)`,
+      [superAdmin.name.trim(), email, username, await ctx.hashPasswordFromEnv(superAdmin.passwordEnv), roleIds.super_admin],
     ],
     // Password deliberately untouched: an existing admin keeps the credential they already have.
+    // COALESCE keeps a username set earlier when the config does not name one.
     update: [
-      `UPDATE users SET name = ?, role_id = ?, partner_id = NULL, warehouse_id = NULL, level = 'main',
+      `UPDATE users SET name = ?, username = COALESCE(?, username), role_id = ?, partner_id = NULL, warehouse_id = NULL, level = 'main',
               status = 'active', is_deleted = 0
        WHERE id = ?`,
-      [superAdmin.name.trim(), roleIds.super_admin],
+      [superAdmin.name.trim(), username, roleIds.super_admin],
     ],
   });
 }
@@ -397,19 +428,21 @@ async function syncCenterWarehouse(ctx, center, partnerId) {
 
 async function syncStaff(ctx, roleIds, center, staff, partnerId, warehouseId) {
   const email = staff.email.trim().toLowerCase();
+  const username = normalizeUsername(staff.username);
   const location = center.businessName.trim();
+  await assertUsernameFree(ctx, username, email, `center ${center.key} staff`);
   return upsert(ctx, {
     lookup: ['SELECT id, is_deleted FROM users WHERE email = ? LIMIT 1', [email]],
     insert: async () => [
-      `INSERT INTO users (name, email, password, role_id, partner_id, warehouse_id, level, location, status, is_deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`,
-      [staff.name.trim(), email, await ctx.hashPasswordFromEnv(staff.passwordEnv), roleIds.staff, partnerId, warehouseId, STAFF_LEVEL, location],
+      `INSERT INTO users (name, email, username, password, role_id, partner_id, warehouse_id, level, location, status, is_deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`,
+      [staff.name.trim(), email, username, await ctx.hashPasswordFromEnv(staff.passwordEnv), roleIds.staff, partnerId, warehouseId, STAFF_LEVEL, location],
     ],
     update: [
-      `UPDATE users SET name = ?, role_id = ?, partner_id = ?, warehouse_id = ?, level = ?, location = ?,
+      `UPDATE users SET name = ?, username = COALESCE(?, username), role_id = ?, partner_id = ?, warehouse_id = ?, level = ?, location = ?,
               status = 'active', is_deleted = 0
        WHERE id = ?`,
-      [staff.name.trim(), roleIds.staff, partnerId, warehouseId, STAFF_LEVEL, location],
+      [staff.name.trim(), username, roleIds.staff, partnerId, warehouseId, STAFF_LEVEL, location],
     ],
   });
 }

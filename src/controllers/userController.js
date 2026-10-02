@@ -5,10 +5,41 @@ const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const { resolveUserAssignment } = require('../rbac/userAssignments');
 const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
+const { normalizeUsername, isValidUsername } = require('../utils/username');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isMissingColumnError = (err) => err && err.code === 'ER_BAD_FIELD_ERROR';
 const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
+const duplicateMessage = (err) => (
+  String(err && err.message).includes('uq_users_username') ? 'Username already in use' : 'Email already in use'
+);
+
+/**
+ * Optional login username from a request body: undefined when not sent, null to clear it,
+ * otherwise the normalized value. Rejects anything outside the username format.
+ */
+function parseRequestedUsername(raw) {
+  if (raw === undefined) return undefined;
+  const username = normalizeUsername(raw);
+  if (username !== null && !isValidUsername(username)) {
+    throw ApiError.badRequest('Username must be 3-50 characters: lowercase letters, digits, dot, underscore or hyphen');
+  }
+  return username;
+}
+
+// Scans soft-deleted rows too: the UNIQUE index on users.username spans every row.
+async function assertUsernameAvailable(username, exceptUserId = 0) {
+  if (!username) return;
+  const [rows] = await pool.execute(
+    'SELECT id, is_deleted FROM users WHERE username = ? AND id <> ? LIMIT 1',
+    [username, exceptUserId]
+  );
+  if (rows.length > 0) {
+    throw ApiError.conflict(rows[0].is_deleted
+      ? 'A deleted account holds this username. Restore it or choose another.'
+      : 'Username already in use');
+  }
+}
 
 async function getWarehouseById(id) {
   const [rows] = await pool.execute(
@@ -70,7 +101,7 @@ const getUsers = asyncHandler(async (req, res) => {
   }
 
   const baseQuery = `
-    SELECT u.id, u.name, u.email, u.phone, u.level, u.location, u.status,
+    SELECT u.id, u.name, u.email, u.username, u.phone, u.level, u.location, u.status,
            u.last_login, u.created_at, u.updated_at,
            r.name AS role_name, r.slug AS role_slug,
            p.business_name AS partner_name, u.partner_id,
@@ -124,7 +155,7 @@ const getUser = asyncHandler(async (req, res) => {
   let users;
   try {
     [users] = await pool.execute(
-      `SELECT u.id, u.name, u.email, u.phone, u.level, u.location, u.status,
+      `SELECT u.id, u.name, u.email, u.username, u.phone, u.level, u.location, u.status,
               u.last_login, u.created_at, u.updated_at,
               r.name AS role_name, r.slug AS role_slug,
               p.business_name AS partner_name, u.partner_id,
@@ -214,6 +245,9 @@ const createUser = asyncHandler(async (req, res) => {
     throw ApiError.conflict('Email already in use');
   }
 
+  const username = parseRequestedUsername(req.body.username);
+  await assertUsernameAvailable(username);
+
   if (normalizeRoleSlug(role_slug) === 'mobile_stockist') {
     throw ApiError.badRequest('Create Mobile Stockist accounts from the Mobile Stockists module');
   }
@@ -243,11 +277,12 @@ const createUser = asyncHandler(async (req, res) => {
   let result;
   try {
     [result] = await pool.execute(
-      `INSERT INTO users (name, email, password, phone, role_id, partner_id, warehouse_id, level, location)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO users (name, email, username, password, phone, role_id, partner_id, warehouse_id, level, location)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         fullName,
         normalizedEmail,
+        username || null,
         hashedPassword,
         phone || null,
         assignment.roleId,
@@ -258,8 +293,10 @@ const createUser = asyncHandler(async (req, res) => {
       ]
     );
   } catch (err) {
-    if (isDupEntryError(err)) throw ApiError.conflict('Email already in use');
+    if (isDupEntryError(err)) throw ApiError.conflict(duplicateMessage(err));
     if (!isMissingColumnError(err)) throw err;
+    // A username cannot be stored without its column; refuse rather than silently drop it.
+    if (username) throw ApiError.badRequest('Usernames need the users.username migration (scripts/addUsername.js)');
     // Older schema without users.warehouse_id — fall back gracefully.
     try {
       [result] = await pool.execute(
@@ -296,6 +333,7 @@ const updateUser = asyncHandler(async (req, res) => {
   if (normalizedEmail && !EMAIL_RE.test(normalizedEmail)) {
     throw ApiError.badRequest('Email must be a valid email address');
   }
+  const username = parseRequestedUsername(req.body.username);
 
   // Verify user exists
   const checkParams = [userId];
@@ -330,6 +368,7 @@ const updateUser = asyncHandler(async (req, res) => {
       throw ApiError.conflict('Email already in use');
     }
   }
+  await assertUsernameAvailable(username, userId);
 
   // Resolve warehouse association (if being changed) BEFORE role/partner
   // assignment — the warehouse's own partner_id, when present, is the
@@ -395,6 +434,7 @@ const updateUser = asyncHandler(async (req, res) => {
 
   if (name) { fields.push('name = ?'); values.push(name); }
   if (normalizedEmail) { fields.push('email = ?'); values.push(normalizedEmail); }
+  if (username !== undefined) { fields.push('username = ?'); values.push(username); }
   if (phone !== undefined) { fields.push('phone = ?'); values.push(phone || null); }
   if (level) { fields.push('level = ?'); values.push(level); }
   if (location) { fields.push('location = ?'); values.push(location); }
@@ -411,7 +451,7 @@ const updateUser = asyncHandler(async (req, res) => {
   try {
     await pool.execute(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values);
   } catch (err) {
-    if (isDupEntryError(err)) throw ApiError.conflict('Email already in use');
+    if (isDupEntryError(err)) throw ApiError.conflict(duplicateMessage(err));
     if (!isMissingColumnError(err)) throw err;
     if (warehouse_id === undefined) throw err;
 
