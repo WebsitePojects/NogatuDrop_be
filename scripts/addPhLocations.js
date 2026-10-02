@@ -84,7 +84,8 @@ const ORDER_COLUMNS = [
   ['customer_last_name', 'VARCHAR(80) NULL'],
   ['customer_name_suffix', 'VARCHAR(10) NULL'],
   ['customer_address_line', 'VARCHAR(255) NULL'],
-  ['customer_barangay_code', 'CHAR(9) NULL'],
+  // Collation pinned to the PSGC tables' so the foreign key never depends on the orders table default.
+  ['customer_barangay_code', 'CHAR(9) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL'],
   ['customer_postal_code', 'CHAR(4) NULL'],
 ];
 
