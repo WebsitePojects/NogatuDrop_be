@@ -6,6 +6,7 @@ const { startReplenishmentCron } = require('./services/replenishmentCron');
 const { startPaymentDeadlineCron } = require('./services/paymentDeadlineCron');
 const { startExpiryAlertCron } = require('./services/expiryAlertCron');
 const { startTokenCleanupCron } = require('./services/tokenCleanupCron');
+const { startOrderNotificationOutboxCron } = require('./services/orderNotificationOutboxCron');
 
 const server = http.createServer(app);
 
@@ -21,6 +22,7 @@ async function start() {
     startPaymentDeadlineCron();
     startExpiryAlertCron();
     startTokenCleanupCron();
+    startOrderNotificationOutboxCron();
 
     // Start server
     server.listen(env.PORT, () => {

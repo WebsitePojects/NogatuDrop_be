@@ -64,6 +64,7 @@ const env = {
   PAYMENT_DEADLINE_CRON: process.env.PAYMENT_DEADLINE_CRON || '*/5 * * * *',
   EXPIRY_ALERT_CRON: process.env.EXPIRY_ALERT_CRON || '0 8 * * *',
   TOKEN_CLEANUP_CRON: process.env.TOKEN_CLEANUP_CRON || '0 3 * * *',
+  ORDER_NOTIFICATION_OUTBOX_CRON: process.env.ORDER_NOTIFICATION_OUTBOX_CRON || '* * * * *',
 };
 
 module.exports = env;
