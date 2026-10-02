@@ -150,16 +150,18 @@ async function receiveStock(conn, {
     expiry_date: expiryDate,
   });
 
-  // Inventory identity is (product, warehouse); the first receipt's batch/expiry label the row,
-  // later receipts only add quantity (same convention as completeGRN). The batch of every
-  // receipt is still preserved on its grn_items line.
+  // One inventories row per batch: a receipt adds to the row with the same batch number and expiry,
+  // otherwise it starts a new row. Merging into whichever row came first (as before) put new stock
+  // under the wrong batch and expiry, which breaks expiry alerts and earliest-expiry-first picking
+  // (services/batchStock.js). Matches how centers already record stock, e.g. Tycoon's counted batches.
   const [existing] = await conn.execute(
     `SELECT id, current_stock FROM inventories
      WHERE product_id = ? AND warehouse_id = ? AND is_active = 1
+       AND batch_number <=> ? AND expiry_date <=> ?
      ORDER BY id
      LIMIT 1
      FOR UPDATE`,
-    [productId, warehouseId]
+    [productId, warehouseId, batchNumber, expiryDate]
   );
 
   let inventoryId;

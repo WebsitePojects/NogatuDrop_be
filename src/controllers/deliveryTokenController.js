@@ -6,6 +6,7 @@ const { sendEmail, EMAIL } = require('../services/emailService');
 const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
+const { consumeReservedStock } = require('../services/batchStock');
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
@@ -905,17 +906,10 @@ const completeDelivery = asyncHandler(async (req, res) => {
     for (const item of items) {
       const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
-        const [updated] = await conn.execute(
-          `UPDATE inventories
-           SET current_stock = current_stock - ?,
-               reserved_stock = reserved_stock - ?,
-               last_movement_at = NOW()
-           WHERE product_id = ? AND warehouse_id = ?
-             AND current_stock >= ?
-             AND reserved_stock >= ?`,
-          [item.quantity, item.quantity, item.product_id, wid, item.quantity, item.quantity]
-        );
-        if (updated.affectedRows === 0) {
+        const delivered = await consumeReservedStock(conn, {
+          productId: item.product_id, warehouseId: wid, quantity: item.quantity,
+        });
+        if (!delivered) {
           throw ApiError.conflict('Reserved stock is no longer sufficient to complete this delivery');
         }
         await insertStockMovement(conn, {

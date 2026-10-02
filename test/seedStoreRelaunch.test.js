@@ -103,6 +103,13 @@ test('usernames from the management form are validated and unique across the con
   assert.deepEqual(problemsFor((c) => { delete c.centers[0].staff[0].username; }), [], 'username stays optional');
 });
 
+test('a center may adopt an existing warehouse by id, once', () => {
+  assert.deepEqual(problemsFor((c) => { c.centers[1].adoptWarehouseId = 16; }), []);
+  assert.ok(problemsFor((c) => { c.centers[1].adoptWarehouseId = 0; }).some((p) => p.startsWith('centers[1].adoptWarehouseId')));
+  assert.ok(problemsFor((c) => { c.centers[1].adoptWarehouseId = '16'; }).some((p) => p.startsWith('centers[1].adoptWarehouseId')));
+  assert.ok(problemsFor((c) => { c.centers[0].adoptWarehouseId = 16; c.centers[1].adoptWarehouseId = 16; }).some((p) => /used by another center/.test(p)));
+});
+
 test('center key + batch must fit the 64-char client_ref column', () => {
   assert.ok(problemsFor((c) => { c.opening.batch = 'B'.repeat(50); c.centers[0].key = 'K'.repeat(20); }).some((p) => /client reference longer/.test(p)));
   assert.equal(openingClientRef('CALOOCAN', ' B01 '), 'seed-opening-CALOOCAN-B01');

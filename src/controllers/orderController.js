@@ -23,6 +23,7 @@ const {
 } = require('../services/publicCheckoutPricing');
 const { getPaymentVerificationDecision } = require('../services/paymentVerification');
 const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
+const { reserveStock, releaseStock } = require('../services/batchStock');
 const { lookupMlmMember } = require('../services/mlmBridge');
 const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
@@ -122,57 +123,12 @@ async function getPublicOrderPlacedByUserId(db) {
   return rows[0].id;
 }
 
+// Spreads the reservation over the product's batch rows (services/batchStock.js).
 async function reserveInventoryOrThrow(conn, { productId, warehouseId, quantity, productName }) {
-  let result;
-  try {
-    [result] = await conn.execute(
-      `UPDATE inventories
-       SET reserved_stock = reserved_stock + ?,
-           last_movement_at = NOW()
-       WHERE product_id = ?
-         AND warehouse_id = ?
-         AND is_deleted = 0
-         AND current_stock >= reserved_stock + ?`,
-      [quantity, productId, warehouseId, quantity]
-    );
-  } catch (err) {
-    if (!isMissingSoftDeleteColumn(err)) {
-      throw err;
-    }
-
-    [result] = await conn.execute(
-      `UPDATE inventories
-       SET reserved_stock = reserved_stock + ?,
-           last_movement_at = NOW()
-       WHERE product_id = ?
-         AND warehouse_id = ?
-         AND current_stock >= reserved_stock + ?`,
-      [quantity, productId, warehouseId, quantity]
-    );
+  const result = await reserveStock(conn, { productId, warehouseId, quantity });
+  if (!result.reserved) {
+    throw ApiError.badRequest(`Insufficient stock for ${productName || 'product'} (available: ${result.available})`);
   }
-
-  if (result.affectedRows > 0) {
-    return;
-  }
-
-  const [inventory] = await executeSoftDeleteAware(
-    conn,
-    `SELECT current_stock, reserved_stock
-     FROM inventories
-     WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0
-     LIMIT 1`,
-    [productId, warehouseId],
-    `SELECT current_stock, reserved_stock
-     FROM inventories
-     WHERE product_id = ? AND warehouse_id = ?
-     LIMIT 1`
-  );
-
-  const available = inventory.length > 0
-    ? Number(inventory[0].current_stock || 0) - Number(inventory[0].reserved_stock || 0)
-    : 0;
-
-  throw ApiError.badRequest(`Insufficient stock for ${productName || 'product'} (available: ${available})`);
 }
 
 async function getWarehouseIdByPartner(db, partnerId) {
@@ -753,18 +709,18 @@ const createOrder = asyncHandler(async (req, res) => {
     const bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
     assertBankAccountAvailable(bankAccount);
 
-    // Check available stock if source warehouse known
+    // Check available stock if source warehouse known (summed over every batch row of the product)
     if (sourceWarehouseId) {
       for (const item of cartItems) {
         const [inv] = await executeSoftDeleteAware(
           conn,
-          `SELECT current_stock, reserved_stock FROM inventories
+          `SELECT COALESCE(SUM(current_stock - reserved_stock), 0) AS available FROM inventories
            WHERE product_id = ? AND warehouse_id = ? AND is_deleted = 0`,
           [item.product_id, sourceWarehouseId],
-          `SELECT current_stock, reserved_stock FROM inventories
+          `SELECT COALESCE(SUM(current_stock - reserved_stock), 0) AS available FROM inventories
            WHERE product_id = ? AND warehouse_id = ?`
         );
-        const available = inv.length > 0 ? inv[0].current_stock - inv[0].reserved_stock : 0;
+        const available = Number(inv[0].available);
         if (available < item.quantity) {
           throw ApiError.badRequest(`Insufficient stock for ${item.product_name} (available: ${available})`);
         }
@@ -1295,10 +1251,7 @@ const rejectOrder = asyncHandler(async (req, res) => {
     for (const item of items) {
       const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
-        await conn.execute(
-          `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
-          [item.quantity, item.product_id, wid]
-        );
+        await releaseStock(conn, { productId: item.product_id, warehouseId: wid, quantity: item.quantity });
         await insertStockMovement(conn, {
           productId: item.product_id,
           warehouseId: wid,
@@ -1369,10 +1322,7 @@ const cancelOrder = asyncHandler(async (req, res) => {
     for (const item of items) {
       const wid = item.source_warehouse_id || fallbackWarehouseId;
       if (wid) {
-        await conn.execute(
-          `UPDATE inventories SET reserved_stock = GREATEST(0, reserved_stock - ?) WHERE product_id = ? AND warehouse_id = ?`,
-          [item.quantity, item.product_id, wid]
-        );
+        await releaseStock(conn, { productId: item.product_id, warehouseId: wid, quantity: item.quantity });
         await insertStockMovement(conn, {
           productId: item.product_id,
           warehouseId: wid,

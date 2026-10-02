@@ -113,6 +113,7 @@ function validateConfig(config, now = new Date()) {
   expect(Array.isArray(centers) && centers.length > 0, 'centers must be a non-empty array');
   const seenKeys = new Set();
   const seenNames = new Set();
+  const seenAdopted = new Set();
   (Array.isArray(centers) ? centers : []).forEach((center, i) => {
     const at = `centers[${i}]`;
     if (!center || typeof center !== 'object') {
@@ -134,6 +135,12 @@ function validateConfig(config, now = new Date()) {
     expect(isNonEmptyString(center.contactPhone, 30), `${at}.contactPhone is required (max 30 chars)`);
     expect(center.operatingHours == null || isNonEmptyString(center.operatingHours, 150), `${at}.operatingHours must be a non-empty string when given`);
     expect(center.email == null || isEmail(center.email), `${at}.email must be a valid email when given`);
+
+    if (center.adoptWarehouseId != null) {
+      expect(Number.isInteger(center.adoptWarehouseId) && center.adoptWarehouseId > 0, `${at}.adoptWarehouseId must be a positive whole number (an existing warehouse id)`);
+      expect(!seenAdopted.has(center.adoptWarehouseId), `${at}.adoptWarehouseId is used by another center`);
+      seenAdopted.add(center.adoptWarehouseId);
+    }
 
     const hasLat = center.lat != null;
     const hasLng = center.lng != null;
@@ -391,6 +398,31 @@ async function syncCenterPartner(ctx, center) {
   });
 }
 
+const isValidCoordinate = (value, limit) => value != null && Number.isFinite(Number(value)) && Math.abs(Number(value)) <= limit;
+
+/**
+ * Checks the warehouse a center is configured to adopt (centers[].adoptWarehouseId) and returns it.
+ * Fails closed when it is missing, deleted, owned by another partner, or would keep invalid
+ * coordinates (an out-of-range longitude makes nearest-center routing error).
+ */
+async function loadAdoptableWarehouse(ctx, center, partnerId) {
+  const [rows] = await ctx.conn.execute(
+    'SELECT id, name, partner_id, type, lat, lng, is_deleted FROM warehouses WHERE id = ? LIMIT 1',
+    [center.adoptWarehouseId]
+  );
+  const warehouse = rows[0];
+  const at = `center ${center.key} adoptWarehouseId ${center.adoptWarehouseId}`;
+  if (!warehouse) throw new Error(`Fail closed: ${at} does not exist`);
+  if (Number(warehouse.is_deleted) === 1) throw new Error(`Fail closed: ${at} is deleted`);
+  if (warehouse.partner_id != null && Number(warehouse.partner_id) !== Number(partnerId)) {
+    throw new Error(`Fail closed: ${at} belongs to partner ${warehouse.partner_id}, not this center`);
+  }
+  if (center.lat == null && !(isValidCoordinate(warehouse.lat, 90) && isValidCoordinate(warehouse.lng, 180))) {
+    throw new Error(`Fail closed: ${at} has invalid coordinates (${warehouse.lat}, ${warehouse.lng}); set centers[].lat/lng in the config`);
+  }
+  return warehouse;
+}
+
 async function syncCenterWarehouse(ctx, center, partnerId) {
   const base = {
     name: center.businessName.trim(),
@@ -406,6 +438,18 @@ async function syncCenterWarehouse(ctx, center, partnerId) {
   const values = Object.values(columns);
   const lat = center.lat ?? null;
   const lng = center.lng ?? null;
+
+  // An adopted warehouse keeps its id and every stock row in it; it only becomes this center's.
+  if (center.adoptWarehouseId != null) {
+    const adopted = await loadAdoptableWarehouse(ctx, center, partnerId);
+    await write(ctx,
+      `UPDATE warehouses SET partner_id = ?, type = 'center', ${names.map((name) => `${name} = ?`).join(', ')},
+              lat = COALESCE(?, lat), lng = COALESCE(?, lng), is_active = 1, is_deleted = 0
+       WHERE id = ?`,
+      [partnerId, ...values, lat, lng, adopted.id]);
+    const already = Number(adopted.partner_id) === Number(partnerId) && adopted.type === 'center';
+    return { id: adopted.id, action: already ? 'update' : `adopt existing warehouse #${adopted.id} (was "${adopted.name}", ${adopted.type})` };
+  }
 
   return upsert(ctx, {
     lookup: partnerId

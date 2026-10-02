@@ -5,6 +5,7 @@ const { sendEmail, EMAIL } = require('./emailService');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { runWithCronLeaderLock } = require('./cronLeaderLock');
+const { releaseStock } = require('./batchStock');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -63,12 +64,7 @@ async function runPaymentDeadlineCheck() {
           const warehouseId = item.source_warehouse_id || order.source_warehouse_id;
           if (!warehouseId) continue;
 
-          await conn.execute(
-            `UPDATE inventories
-             SET reserved_stock = GREATEST(0, reserved_stock - ?)
-             WHERE product_id = ? AND warehouse_id = ?`,
-            [item.quantity, item.product_id, warehouseId]
-          );
+          await releaseStock(conn, { productId: item.product_id, warehouseId, quantity: item.quantity });
 
           await insertStockMovement(conn, {
             productId: item.product_id,
