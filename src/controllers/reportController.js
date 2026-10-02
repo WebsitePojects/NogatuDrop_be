@@ -11,6 +11,7 @@ const {
   JSON_ROW_LIMIT,
   EXPORT_ROW_LIMIT,
 } = require('../services/influencerReportService');
+const { getSalesChannelReport } = require('../services/salesChannelReportService');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -321,7 +322,16 @@ const exportInfluencerReport = asyncHandler(async (req, res) => {
   res.send(reportRowsToCsv(data.rows));
 });
 
+// GET /api/v1/reports/sales-channels?month=YYYY-MM
+// Standard store vs each influencer link for one month (Super Admin; company-wide revenue).
+const getSalesChannels = asyncHandler(async (req, res) => {
+  const data = await getSalesChannelReport(pool, { window: parseReportMonth(req.query.month) });
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true, data });
+});
+
 module.exports = {
+  getSalesChannels,
   getRevenueReport,
   getPurchaseReport,
   getProductReport,

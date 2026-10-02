@@ -9,6 +9,7 @@ const {
   getMovementsReport,
   getInfluencerReport,
   exportInfluencerReport,
+  getSalesChannels,
 } = require('../controllers/reportController');
 
 const router = Router();
@@ -20,6 +21,7 @@ router.use(auth);
 // stockists, so it must NOT gate these. Declared before the REPORTS_VIEW router.use below.
 router.get('/influencers', roleGuard('super_admin'), getInfluencerReport);
 router.get('/influencers/export', roleGuard('super_admin'), exportInfluencerReport);
+router.get('/sales-channels', roleGuard('super_admin'), getSalesChannels);
 
 router.use(requirePermission(PERMISSIONS.REPORTS_VIEW));
 
