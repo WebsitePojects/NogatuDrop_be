@@ -63,6 +63,8 @@
       "businessName": "Example Fulfillment Center B",
       "address": "456 Placeholder Avenue, Example Town",
       "region": "Example Region",
+      "lat": 14.58,
+      "lng": 121.06,
       "contactPerson": "Example Contact B",
       "contactPhone": "+639000000002",
       "staff": [

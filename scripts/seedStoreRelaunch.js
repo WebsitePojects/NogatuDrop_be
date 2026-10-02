@@ -145,6 +145,10 @@ function validateConfig(config, now = new Date()) {
     const hasLat = center.lat != null;
     const hasLng = center.lng != null;
     expect(hasLat === hasLng, `${at}.lat and ${at}.lng must be given together`);
+    // Online orders go to the nearest center; a center without coordinates can never be nearest, so it
+    // would silently receive no orders (CALOOCAN did, 2026-10-02). Adopted warehouses are checked
+    // against their stored coordinates when the seed runs.
+    expect(hasLat || center.adoptWarehouseId != null, `${at}.lat and ${at}.lng are required for a new center (nearest-center routing needs them)`);
     if (hasLat) {
       expect(isCoordinate(center.lat, 90), `${at}.lat must be a number between -90 and 90`);
       expect(isCoordinate(center.lng, 180), `${at}.lng must be a number between -180 and 180`);

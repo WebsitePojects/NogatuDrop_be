@@ -89,6 +89,9 @@ test('center field, coordinate and staff rules', () => {
   assert.ok(problemsFor((c) => { delete c.centers[0].contactPhone; }).some((p) => p.startsWith('centers[0].contactPhone')));
   assert.ok(problemsFor((c) => { delete c.centers[0].lng; }).some((p) => /given together/.test(p)));
   assert.ok(problemsFor((c) => { c.centers[0].lat = 91; }).some((p) => p.startsWith('centers[0].lat')));
+  // A new center without coordinates would never be "nearest", so it would silently get no online orders.
+  assert.ok(problemsFor((c) => { delete c.centers[1].lat; delete c.centers[1].lng; }).some((p) => /required for a new center/.test(p)));
+  assert.deepEqual(problemsFor((c) => { delete c.centers[1].lat; delete c.centers[1].lng; c.centers[1].adoptWarehouseId = 16; }), []);
   assert.ok(problemsFor((c) => { c.centers[0].staff[0].passwordEnv = 'lower-case'; }).some((p) => p.startsWith('centers[0].staff[0].passwordEnv')));
   assert.ok(problemsFor((c) => { c.centers = []; }).some((p) => p.startsWith('centers')));
   assert.deepEqual(problemsFor((c) => { c.centers[0].staff = []; c.centers[0].paymentAccounts = []; }), []);
