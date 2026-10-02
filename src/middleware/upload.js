@@ -38,9 +38,15 @@ function createCloudinaryStorage(options) {
   );
 }
 
+// multer-storage-cloudinary 2.x calls `opts.cloudinary.v2.uploader.upload_stream(...)`, i.e. it wants the
+// root SDK module. config/cloudinary.js exports the already-configured v2 client, so wrap it; passing
+// the v2 client directly made every upload fail with "Cannot read properties of undefined (reading
+// 'uploader')" (seen in production logs, 2026-10-02).
+const cloudinarySdkForStorage = { v2: cloudinary };
+
 function createUpload(folder, imageOnly = false, transformation = null) {
   const storage = createCloudinaryStorage({
-    cloudinary,
+    cloudinary: cloudinarySdkForStorage,
     params: {
       folder: `nogatu/${folder}`,
       allowed_formats: imageOnly
