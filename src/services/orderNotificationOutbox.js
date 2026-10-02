@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { sendEmail, EMAIL } = require('./emailService');
 const crypto = require('crypto');
+const { orderCustomerNameSql } = require('../utils/orderCustomerSql');
 
 async function enqueueOrderNotifications(conn, { orderId, orderNumber, users, eventType = 'public_order_placed' }) {
   for (const user of users) {
@@ -25,7 +26,7 @@ async function processOrderNotificationOutbox({ batchSize = 25, maxAttempts = 5,
       [maxAttempts],
     );
     const [jobs] = await conn.execute(
-      `SELECT n.id, n.order_number, n.user_id, n.event_type, n.attempts, o.customer_name
+      `SELECT n.id, n.order_number, n.user_id, n.event_type, n.attempts, ${orderCustomerNameSql('o')} AS customer_name
        FROM order_notification_outbox n JOIN orders o ON o.id = n.order_id
        WHERE ((n.status IN ('pending', 'retry') AND n.available_at <= NOW())
           OR (n.status = 'processing' AND n.locked_at < DATE_SUB(NOW(), INTERVAL 15 MINUTE)))

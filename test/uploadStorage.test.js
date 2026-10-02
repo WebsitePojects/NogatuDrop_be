@@ -33,5 +33,22 @@ test('a payment proof upload reaches Cloudinary upload_stream with the payment-p
   const info = await handled;
   assert.equal(calls.length, 1, 'upload_stream was called once');
   assert.equal(calls[0].folder, 'nogatu/payment-proofs');
-  assert.ok(info, 'the storage reported the uploaded file');
+  // Controllers store req.file.path; before the adapter it was undefined and every upload 500ed.
+  assert.equal(info.path, 'https://res.cloudinary.com/test/proof.png', 'req.file.path is the https URL');
+  assert.equal(info.file_id, 'nogatu/payment-proofs/x', 'file_id lets multer remove the file on a later error');
+});
+
+test('an upload result without a URL fails the upload instead of storing an empty link', async (t) => {
+  t.mock.method(cloudinary.uploader, 'upload_stream', (params, done) => {
+    const sink = new PassThrough();
+    sink.on('finish', () => done(null, { public_id: 'x' }));
+    sink.resume();
+    return sink;
+  });
+  const file = { fieldname: 'proof', originalname: 'proof.png', mimetype: 'image/png', stream: new PassThrough() };
+  const handled = new Promise((resolve, reject) => {
+    paymentProofUpload.storage._handleFile({}, file, (err, info) => (err ? reject(err) : resolve(info)));
+  });
+  file.stream.end(Buffer.from('fake image bytes'));
+  await assert.rejects(handled, (err) => err.statusCode === 502);
 });

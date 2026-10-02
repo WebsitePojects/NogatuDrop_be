@@ -7,6 +7,7 @@ const env = require('../config/env');
 const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { consumeReservedStock } = require('../services/batchStock');
+const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
@@ -457,8 +458,8 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               o.status AS order_status,
               o.partner_id,
               pt.business_name AS partner_name,
-              o.customer_name,
-              o.customer_address,
+              ${orderCustomerNameSql('o')} AS customer_name,
+              ${orderCustomerAddressSql('o')} AS customer_address,
               o.customer_phone,
               o.delivered_at AS order_delivered_at,
               dt.used_at AS token_used_at,
@@ -476,6 +477,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               tw.location AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
+       ${orderCustomerJoins('o')}
        LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
@@ -519,8 +521,8 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               o.status AS order_status,
               o.partner_id,
               pt.business_name AS partner_name,
-              o.customer_name,
-              o.customer_address,
+              ${orderCustomerNameSql('o')} AS customer_name,
+              ${orderCustomerAddressSql('o')} AS customer_address,
               o.customer_phone,
               o.delivered_at AS order_delivered_at,
               dt.used_at AS token_used_at,
@@ -538,6 +540,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               NULL AS target_warehouse_location
        FROM proof_of_delivery pod
        JOIN orders o ON o.id = pod.order_id
+       ${orderCustomerJoins('o')}
        LEFT JOIN partners pt ON pt.id = o.partner_id
        LEFT JOIN delivery_tokens dt ON dt.id = pod.token_id
        LEFT JOIN delivery_tracking tr ON tr.order_id = o.id
@@ -666,11 +669,13 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
   let tokens;
   try {
     [tokens] = await pool.execute(
-      `SELECT dt.*, o.order_number, o.customer_name, o.customer_address, o.customer_phone,
+      `SELECT dt.*, o.order_number, ${orderCustomerNameSql('o')} AS customer_name,
+              ${orderCustomerAddressSql('o')} AS customer_address, o.customer_phone,
               o.customer_lat, o.customer_lng,
               o.total_amount, o.partner_id, o.status AS order_status, o.source_warehouse_id
        FROM delivery_tokens dt
        JOIN orders o ON o.id = dt.order_id
+       ${orderCustomerJoins('o')}
        WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW()
        LIMIT 1`,
       [token]
@@ -679,11 +684,13 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
     // source_warehouse_id may not exist in older migrations
     if (!isMissingColumn(err, 'source_warehouse_id')) throw err;
     [tokens] = await pool.execute(
-      `SELECT dt.*, o.order_number, o.customer_name, o.customer_address, o.customer_phone,
+      `SELECT dt.*, o.order_number, ${orderCustomerNameSql('o')} AS customer_name,
+              ${orderCustomerAddressSql('o')} AS customer_address, o.customer_phone,
               NULL AS customer_lat, NULL AS customer_lng,
               o.total_amount, o.partner_id, o.status AS order_status, NULL AS source_warehouse_id
        FROM delivery_tokens dt
        JOIN orders o ON o.id = dt.order_id
+       ${orderCustomerJoins('o')}
        WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW()
        LIMIT 1`,
       [token]

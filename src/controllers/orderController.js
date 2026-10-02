@@ -25,6 +25,8 @@ const { getPaymentVerificationDecision } = require('../services/paymentVerificat
 const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
 const { reserveStock, releaseStock } = require('../services/batchStock');
 const { lookupMlmMember } = require('../services/mlmBridge');
+const { readPublicCustomer, assertBarangayExists } = require('../services/publicCustomerInput');
+const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
 const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
   resolveAffiliationContext,
@@ -537,13 +539,15 @@ const getOrders = asyncHandler(async (req, res) => {
                AND dt.is_used = 0
                AND dt.expires_at > NOW()
            ) AS has_active_delivery_link,
-           o.placed_by_type, o.customer_name, o.customer_phone, o.customer_email, o.customer_address,
-           (o.placed_by_type = 'public' OR (o.placed_by IS NULL AND o.customer_name IS NOT NULL)) AS is_public,
+           o.placed_by_type, ${orderCustomerNameSql('o')} AS customer_name, o.customer_phone, o.customer_email,
+           ${orderCustomerAddressSql('o')} AS customer_address,
+           ${orderIsPublicSql('o')} AS is_public,
            o.notes, o.created_at, o.approved_at, o.delivered_at
     FROM orders o
     LEFT JOIN partners pt ON pt.id = o.partner_id
     LEFT JOIN users u ON u.id = o.placed_by
     LEFT JOIN roles ur ON ur.id = u.role_id
+    ${orderCustomerJoins('o')}
     ${where}
     ORDER BY o.created_at DESC`;
 
@@ -606,19 +610,24 @@ const getOrder = asyncHandler(async (req, res) => {
     `SELECT o.*, pt.business_name AS partner_name, u.name AS placed_by_name,
             u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
             a.name AS approved_by_name, verifier.name AS payment_verified_by_name,
-            (o.placed_by_type = 'public' OR (o.placed_by IS NULL AND o.customer_name IS NOT NULL)) AS is_public
+            ${orderIsPublicSql('o')} AS is_public,
+            ${orderCustomerNameSql('o')} AS customer_display_name,
+            ${orderCustomerAddressSql('o')} AS customer_display_address
      FROM orders o
      LEFT JOIN partners pt ON pt.id = o.partner_id
      LEFT JOIN users u ON u.id = o.placed_by
      LEFT JOIN roles ur ON ur.id = u.role_id
      LEFT JOIN users a ON a.id = o.approved_by
      LEFT JOIN users verifier ON verifier.id = o.payment_proof_verified_by
+     ${orderCustomerJoins('o')}
      ${where} LIMIT 1`,
     params
   );
 
   if (rows.length === 0) throw ApiError.notFound('Order not found');
-  const order = rows[0];
+  const { customer_display_name: customerName, customer_display_address: customerAddress, ...order } = rows[0];
+  order.customer_name = customerName;
+  order.customer_address = customerAddress;
 
   const [items] = await pool.execute(
     `SELECT oi.id, oi.product_id, p.name AS product_name, p.sku, p.image_url,
@@ -840,9 +849,9 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
 const createPublicOrder = asyncHandler(async (req, res) => {
-  const { customer_name, customer_phone, customer_email, customer_address, customer_lat, customer_lng, items, notes, payment_method } = req.body;
+  const { customer_phone, customer_email, customer_lat, customer_lng, items, notes, payment_method } = req.body;
+  const customer = readPublicCustomer(req.body);
 
-  if (!customer_name || !customer_address) throw ApiError.badRequest('customer_name and customer_address are required');
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
 
   // Optional pinned delivery coordinates (consent-gated on the client). Stored
@@ -864,6 +873,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       await conn.rollback();
       return res.status(201).json(idempotency.replay);
     }
+    await assertBarangayExists(conn, customer.barangayCode);
     const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
     let merchandiseSubtotal = 0;
@@ -927,72 +937,26 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     }
     assertBankAccountAvailable(bankAccount);
 
+    // The old single-text customer_name / customer_address stay NULL: the parts are the only copy.
     let orderResult;
     try {
       [orderResult] = await conn.execute(
         `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
-                             customer_name, customer_phone, customer_email, customer_address,
-                             customer_lat, customer_lng, cod_amount,
+                             customer_first_name, customer_middle_name, customer_last_name, customer_name_suffix,
+                             customer_address_line, customer_barangay_code, customer_postal_code,
+                             customer_phone, customer_email, customer_lat, customer_lng, cod_amount,
                              total_amount, notes)
-         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
-         customer_email || null, customer_address, custLat, custLng, codAmount, totalAmount, notes || null]
+         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId,
+         customer.firstName, customer.middleName, customer.lastName, customer.suffix,
+         customer.addressLine, customer.barangayCode, customer.postalCode,
+         customer_phone || null, customer_email || null, custLat, custLng, codAmount, totalAmount, notes || null]
       );
     } catch (err) {
-      // Some DBs are partially migrated and only miss source_warehouse_id.
-      if (isMissingColumn(err, 'cod_amount')) {
-        try {
-          [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type, source_warehouse_id,
-                                 customer_name, customer_phone, customer_email, customer_address,
-                                 total_amount, notes)
-             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId, customer_name, customer_phone || null,
-             customer_email || null, customer_address, totalAmount, notes || null]
-          );
-        } catch (innerErr) {
-          if (isMissingColumn(innerErr, 'source_warehouse_id')) {
-            try {
-              [orderResult] = await conn.execute(
-                `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
-                                     customer_name, customer_phone, customer_email, customer_address,
-                                     total_amount, notes)
-                 VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-                [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
-                 customer_email || null, customer_address, totalAmount, notes || null]
-              );
-            } catch (legacyErr) {
-              if (isMissingColumn(legacyErr, 'placed_by_type') || isMissingColumn(legacyErr, 'customer_name')) {
-                throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
-              }
-              throw legacyErr;
-            }
-          } else if (isMissingColumn(innerErr, 'placed_by_type') || isMissingColumn(innerErr, 'customer_name')) {
-            throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
-          }
-          throw innerErr;
-        }
-      } else if (isMissingColumn(err, 'source_warehouse_id')) {
-        try {
-          [orderResult] = await conn.execute(
-            `INSERT INTO orders (order_number, partner_id, placed_by, placed_by_type,
-                                 customer_name, customer_phone, customer_email, customer_address,
-                                 total_amount, notes)
-             VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?)`,
-            [orderNumber, partnerId, publicPlacedByUserId, customer_name, customer_phone || null,
-             customer_email || null, customer_address, totalAmount, notes || null]
-          );
-        } catch (innerErr) {
-          if (isMissingColumn(innerErr, 'placed_by_type') || isMissingColumn(innerErr, 'customer_name')) {
-            throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
-          }
-          throw innerErr;
-        }
-      } else if (isMissingColumn(err, 'placed_by_type') || isMissingColumn(err, 'customer_name')) {
-        throw ApiError.internal('Database schema is outdated for public orders. Please apply the latest migration.');
-      } else {
-        throw err;
+      if (isMissingColumn(err, 'customer_last_name') || isMissingColumn(err, 'customer_barangay_code')) {
+        throw ApiError.internal('Database schema is outdated for public orders. Run scripts/addPhLocations.js.');
       }
+      throw err;
     }
     const orderId = orderResult.insertId;
 
@@ -1412,11 +1376,12 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
 
   const normalizedOrderNumber = String(order_number).trim().toUpperCase();
   const [orders] = await pool.execute(
-    `SELECT id, order_number, partner_id, status, payment_status, payment_proof_url, customer_name, customer_phone
-     FROM orders
-     WHERE order_number = ?
-       AND placed_by_type = 'public'
-       AND is_deleted = 0
+    `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status, o.payment_proof_url,
+            ${orderCustomerNameSql('o')} AS customer_name, o.customer_phone
+     FROM orders o
+     WHERE o.order_number = ?
+       AND o.placed_by_type = 'public'
+       AND o.is_deleted = 0
      LIMIT 1`,
     [normalizedOrderNumber]
   );

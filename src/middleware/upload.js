@@ -44,8 +44,35 @@ function createCloudinaryStorage(options) {
 // 'uploader')" (seen in production logs, 2026-10-02).
 const cloudinarySdkForStorage = { v2: cloudinary };
 
+/**
+ * multer-storage-cloudinary 2.x hands Cloudinary's raw upload result to multer, so req.file gets
+ * `secure_url` but no `path`; every controller reads req.file.path, which was undefined and made each
+ * upload fail at the database write ("Bind parameters must not contain undefined"). This adapter gives
+ * every route the same shape: `path` is the https URL, `file_id` is what _removeFile needs to clean up.
+ * A result without a URL fails the upload instead of storing an empty link.
+ */
+function withUrlPath(storage) {
+  return {
+    _handleFile(req, file, cb) {
+      storage._handleFile(req, file, (err, result) => {
+        if (err) return cb(err);
+        const url = result && (result.secure_url || result.path);
+        if (!url) {
+          const missing = new Error('File storage did not return a file URL. Please try the upload again.');
+          missing.statusCode = 502;
+          return cb(missing);
+        }
+        return cb(null, { path: url, public_id: result.public_id, file_id: result.public_id, size: result.bytes });
+      });
+    },
+    _removeFile(req, file, cb) {
+      storage._removeFile(req, file, cb);
+    },
+  };
+}
+
 function createUpload(folder, imageOnly = false, transformation = null) {
-  const storage = createCloudinaryStorage({
+  const storage = withUrlPath(createCloudinaryStorage({
     cloudinary: cloudinarySdkForStorage,
     params: {
       folder: `nogatu/${folder}`,
@@ -54,7 +81,7 @@ function createUpload(folder, imageOnly = false, transformation = null) {
         : ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf'],
       ...(transformation && { transformation }),
     },
-  });
+  }));
 
   return multer({
     storage,
@@ -117,6 +144,10 @@ function uploadErrorHandler(err, req, res, next) {
 
   if (err.statusCode === 503) {
     return next(ApiError.serviceUnavailable(err.message));
+  }
+
+  if (err.statusCode === 502) {
+    return next(new ApiError(502, err.message));
   }
 
   return next(err);

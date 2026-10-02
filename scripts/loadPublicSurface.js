@@ -71,10 +71,12 @@ async function performScenario(index, publicProductId) {
     } else if (scenario === 'public-order') {
       if (!publicProductId) throw new Error('Public product id missing for public-order scenario.');
       await api.post('/orders/public', {
-        customer_name: `Load Test ${Date.now()}-${index}`,
+        customer_first_name: 'Load',
+        customer_last_name: 'Test',
         customer_phone: `0917${String(100000 + index).padStart(6, '0')}`,
         customer_email: `loadtest${Date.now()}${index}@example.com`,
-        customer_address: 'Load Test Address, Manila',
+        customer_address_line: `Load Test ${Date.now()}-${index}`,
+        customer_barangay_code: '133901001', // a Manila (Tondo) barangay
         payment_method: 'bank_transfer',
         items: [{ product_id: publicProductId, quantity: 1 }],
       });

@@ -6,6 +6,7 @@ const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
 const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
 const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
 const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
+const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
 const {
   PUBLIC_ORDER_SHIPPING_FEE,
   reconcilePublicOrderPricing,
@@ -302,8 +303,8 @@ const getActiveTracking = asyncHandler(async (req, res) => {
             o.order_number,
             o.partner_id,
             o.status AS order_status,
-            o.customer_name,
-            o.customer_address,
+            ${orderCustomerNameSql('o')} AS customer_name,
+            ${orderCustomerAddressSql('o')} AS customer_address,
             o.source_warehouse_id,
             dt.status AS tracking_status,
             dt.rider_name,
@@ -316,6 +317,7 @@ const getActiveTracking = asyncHandler(async (req, res) => {
             lp.pinged_at AS last_pinged_at
      FROM delivery_tracking dt
      JOIN orders o ON o.id = dt.order_id
+     ${orderCustomerJoins('o')}
      LEFT JOIN couriers c ON c.id = dt.courier_id
      LEFT JOIN (
        SELECT gp1.tracking_id, gp1.lat, gp1.lng, gp1.pinged_at

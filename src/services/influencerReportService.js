@@ -1,5 +1,6 @@
 const ApiError = require('../utils/ApiError');
 const { toCsv } = require('../utils/csvExport');
+const { orderCustomerJoins, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
 
 const MONTH_PATTERN = /^(\d{4})-(0[1-9]|1[0-2])$/;
 const MIN_REPORT_YEAR = 2000;
@@ -120,11 +121,15 @@ function buildSummary(groups) {
 async function getInfluencerReportData(db, { window, slug, rowLimit }) {
   const slugClause = slug ? ' AND a.slug = ?' : '';
   const params = slug ? [window.start, window.end, slug] : [window.start, window.end];
-  const fromWhere = `
+  const from = `
     FROM order_attribution a
     JOIN orders o ON o.id = a.order_id
-    LEFT JOIN warehouses w ON w.id = o.source_warehouse_id
+    LEFT JOIN warehouses w ON w.id = o.source_warehouse_id`;
+  const where = `
     WHERE o.is_deleted = 0 AND o.created_at >= ? AND o.created_at < ?${slugClause}`;
+  const fromWhere = `${from}${where}`;
+  const fromWhereWithCustomer = `${from}
+    ${orderCustomerJoins('o')}${where}`;
 
   const [[groups], [rows]] = await Promise.all([
     db.execute(
@@ -139,9 +144,9 @@ async function getInfluencerReportData(db, { window, slug, rowLimit }) {
     ),
     db.execute(
       `SELECT o.order_number, o.created_at, a.slug AS influencer_slug, o.payment_provider,
-              w.name AS fulfillment_center, o.customer_address AS customer_location,
+              w.name AS fulfillment_center, ${orderCustomerAddressSql('o')} AS customer_location,
               o.total_amount, o.status, o.payment_status
-       ${fromWhere}
+       ${fromWhereWithCustomer}
        ORDER BY o.created_at ASC, o.id ASC
        LIMIT ?`,
       // mysql2 prepared statements reject a numeric LIMIT bind; same convention as utils/paginate.

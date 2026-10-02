@@ -26,6 +26,7 @@ const settlementRoutes = require('./settlements');
 const exportRoutes = require('./exports');
 const allianceRoutes = require('./alliance');
 const mobileInventoryRoutes = require('./mobileInventory');
+const locationRoutes = require('./locations');
 
 const router = Router();
 
@@ -35,6 +36,7 @@ router.use('/products', productRoutes);
 router.use('/inventory', inventoryRoutes);
 router.use('/warehouses', warehouseRoutes);
 router.use('/orders', orderRoutes);
+router.use('/locations', locationRoutes);
 router.use('/cart', cartRoutes);
 router.use('/partners', partnerRoutes);
 router.use('/stock-transfers', stockTransferRoutes);
