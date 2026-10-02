@@ -11,3 +11,9 @@ dist/
 
 # Store relaunch seed config holds staff emails/phones/bank accounts (personal data). Example is committed instead.
 scripts/store-relaunch.config.json
+
+# Database dumps hold password hashes and customer data; they never belong in a public repo.
+/nogatu_ncdms.sql
+*.sql.gz
+*.dump
+db_snapshots/
