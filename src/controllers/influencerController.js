@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const { normalizeProvider } = require('../services/bankAccountResolver');
+const { PUBLIC_ORDER_MAX_QUANTITY_PER_LINE } = require('../services/publicOrderLimits');
 
 function normalizeSlug(value) {
   const slug = String(value || '').trim().toLowerCase();
@@ -28,8 +29,10 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
   if (req.body.member_username != null && String(req.body.member_username).trim()) {
     throw ApiError.badRequest('Member username is not supported on influencer checkout');
   }
-  if (!Array.isArray(req.body.items) || req.body.items.length !== 1 || Number(req.body.items[0].quantity) !== 1) {
-    throw ApiError.badRequest('Influencer checkout requires exactly one item with quantity 1');
+  // One product per link (Berry NAD+ for /kawoodee); the buyer chooses how many, within the public cap.
+  const quantity = Array.isArray(req.body.items) && req.body.items.length === 1 ? Number(req.body.items[0].quantity) : NaN;
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > PUBLIC_ORDER_MAX_QUANTITY_PER_LINE) {
+    throw ApiError.badRequest(`Influencer checkout requires exactly one item with a quantity from 1 to ${PUBLIC_ORDER_MAX_QUANTITY_PER_LINE}`);
   }
   if (Number(req.body.items[0].product_id) !== Number(products[0].id)) {
     throw ApiError.badRequest('Influencer checkout product does not match the configured product');
@@ -37,7 +40,7 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
   req.body = {
     ...req.body,
     member_username: undefined,
-    items: [{ product_id: products[0].id, quantity: 1 }],
+    items: [{ product_id: products[0].id, quantity }],
   };
   req.influencerContext = { slug, linkId: links[0].id };
   next();

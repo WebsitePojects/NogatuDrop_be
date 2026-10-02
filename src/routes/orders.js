@@ -15,6 +15,8 @@ const {
   archiveOrder, unarchiveOrder,
 } = require('../controllers/orderController');
 
+const { PUBLIC_ORDER_MAX_QUANTITY_PER_LINE } = require('../services/publicOrderLimits');
+
 const router = Router();
 const { requirePermission } = role;
 
@@ -25,7 +27,8 @@ const publicOrderValidation = [
   bodyValidator('customer_email').optional({ values: 'null' }).isEmail().normalizeEmail(),
   bodyValidator('items').isArray({ min: 1, max: 50 }),
   bodyValidator('items.*.product_id').isInt({ min: 1 }),
-  bodyValidator('items.*.quantity').isInt({ min: 1 }),
+  bodyValidator('items.*.quantity').isInt({ min: 1, max: PUBLIC_ORDER_MAX_QUANTITY_PER_LINE })
+    .withMessage(`Quantity must be a whole number from 1 to ${PUBLIC_ORDER_MAX_QUANTITY_PER_LINE}`),
   bodyValidator('payment_method').optional().isIn(['bank_transfer']),
   bodyValidator('payment_provider').optional().toUpperCase().isIn(['GCASH', 'BDO', 'PSBANK']),
   bodyValidator('member_username').optional().isString().isLength({ max: 100 }),

@@ -14,7 +14,8 @@ test('public and influencer routes require idempotency and enforce boundary fiel
   assert.match(ordersSource, /bodyValidator\('items'\)\.isArray/);
   assert.match(orderSource, /getIdempotencyKey\(req\)/);
   assert.match(influencerSource, /member_username[\s\S]*not supported/);
-  assert.match(influencerSource, /quantity: 1/);
+  assert.match(influencerSource, /items: \[\{ product_id: products\[0\]\.id, quantity \}\]/);
+  assert.match(ordersSource, /items\.\*\.quantity'\)\.isInt\(\{ min: 1, max: PUBLIC_ORDER_MAX_QUANTITY_PER_LINE \}\)/);
 });
 
 test('influencer identity is configured by canonical SKU and fails closed when unresolved', () => {
@@ -26,7 +27,7 @@ test('influencer identity is configured by canonical SKU and fails closed when u
 test('influencer checkout permits an omitted member username and rejects a supplied one', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/controllers/influencerController.js'), 'utf8');
   assert.match(source, /req\.body\.member_username != null/);
-  assert.match(source, /Influencer checkout requires exactly one item/);
+  assert.match(source, /Influencer checkout requires exactly one item with a quantity from 1 to/);
 });
 
 // Regression: the migration used to INSERT ... ON DUPLICATE KEY UPDATE the kawoodee link with the
