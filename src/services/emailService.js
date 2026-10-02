@@ -1,4 +1,6 @@
 const { BrevoClient } = require('@getbrevo/brevo');
+const fs = require('fs');
+const path = require('path');
 const env = require('../config/env');
 
 let brevoClient = null;
@@ -21,7 +23,26 @@ function getBrevoClient() {
   return brevoClient;
 }
 
+// Writes the email to a local file instead of sending it. Never available in production, where it
+// would silently swallow real mail (and write sign-in codes to disk).
+function writeEmailToFile({ to, subject, html }) {
+  if (env.NODE_ENV === 'production') throw new Error('EMAIL_TRANSPORT=file is not allowed in production');
+  if (!env.EMAIL_FILE_PATH) throw new Error('EMAIL_TRANSPORT=file needs EMAIL_FILE_PATH');
+  fs.mkdirSync(path.dirname(env.EMAIL_FILE_PATH), { recursive: true });
+  fs.appendFileSync(env.EMAIL_FILE_PATH, `${JSON.stringify({ at: new Date().toISOString(), to, subject, html })}\n`);
+}
+
 async function sendEmail({ to, toName, subject, html, throwOnFailure = false }) {
+  if (env.EMAIL_TRANSPORT === 'file') {
+    try {
+      writeEmailToFile({ to, subject, html });
+    } catch (err) {
+      console.error('[Email] File transport failed:', err.message);
+      if (throwOnFailure) throw err;
+    }
+    return;
+  }
+
   if (!hasUsableBrevoKey()) {
     if (throwOnFailure) throw new Error('Email transport is not configured');
     console.log(`[Email] Brevo key is not configured - skipping email subject: ${subject}`);
@@ -52,6 +73,11 @@ async function sendEmail({ to, toName, subject, html, throwOnFailure = false }) 
     if (throwOnFailure) throw err;
   }
 }
+
+// Values that can come from users (names, emails) must be escaped before going into email HTML.
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+));
 
 const EMAIL = {
   orderPlaced: (orderNumber, stockistName) => ({
@@ -145,6 +171,28 @@ const EMAIL = {
       <p>This code expires in 15 minutes. If you did not request a password reset, ignore this email.</p>
     `,
   }),
+
+  loginCode: (code, minutes) => ({
+    subject: 'Your Nogatu sign-in code',
+    html: `
+      <p>Someone signed in to your Nogatu account and we need to confirm it is you.</p>
+      <p>Your sign-in code is: <strong style="font-size:24px;letter-spacing:4px">${escapeHtml(code)}</strong></p>
+      <p>The code expires in ${Number(minutes)} minutes. If this was not you, do not share the code and change your password now.</p>
+    `,
+  }),
+
+  suspiciousLogin: ({ userName, userEmail, country, ip, at, reasons }) => ({
+    subject: `Unusual sign-in: ${String(userName ?? '').replace(/[\r\n]+/g, ' ').slice(0, 80)}`,
+    html: `
+      <p>An unusual sign-in was detected on <strong>${escapeHtml(userName)}</strong> (${escapeHtml(userEmail)}).</p>
+      <p><strong>Why it was flagged:</strong> ${escapeHtml(reasons)}</p>
+      <p><strong>When:</strong> ${escapeHtml(at)} (Manila time)<br/>
+         <strong>Country:</strong> ${escapeHtml(country || 'unknown')}<br/>
+         <strong>IP address:</strong> ${escapeHtml(ip || 'unknown')}</p>
+      <p>The person had to enter a code sent to the account email before getting in. If this was not
+         expected, open Sign-in Activity in the Nogatu admin to end the session, and reset the password.</p>
+    `,
+  }),
 };
 
-module.exports = { sendEmail, EMAIL };
+module.exports = { sendEmail, EMAIL, escapeHtml };

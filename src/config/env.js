@@ -23,12 +23,27 @@ const env = {
   JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '15m',
   JWT_REFRESH_EXPIRES_IN: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
 
+  // Sign-in sessions: a session ends 7 days after sign-in, or after 1 day without any activity.
+  SESSION_MAX_AGE_HOURS: parseInt(process.env.SESSION_MAX_AGE_HOURS, 10) || 168,
+  SESSION_IDLE_HOURS: parseInt(process.env.SESSION_IDLE_HOURS, 10) || 24,
+
+  // Sign-in risk (services/loginRisk.js): a flagged sign-in needs an emailed code.
+  LOGIN_HOME_COUNTRIES: (process.env.LOGIN_HOME_COUNTRIES || 'PH').split(',').map((c) => c.trim().toUpperCase()).filter(Boolean),
+  LOGIN_QUIET_HOURS: process.env.LOGIN_QUIET_HOURS || '0-5',
+  LOGIN_FAILED_ATTEMPTS_THRESHOLD: parseInt(process.env.LOGIN_FAILED_ATTEMPTS_THRESHOLD, 10) || 5,
+  LOGIN_FAILED_WINDOW_MINUTES: parseInt(process.env.LOGIN_FAILED_WINDOW_MINUTES, 10) || 15,
+  SECURITY_ALERT_CRON: process.env.SECURITY_ALERT_CRON || '* * * * *',
+
   // CORS
   ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173',
   CORS_ALLOW_ALL: (process.env.CORS_ALLOW_ALL || 'false').toLowerCase() === 'true',
 
   // Brevo (transactional email — replaces SMS)
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',
+  // Development only: EMAIL_TRANSPORT=file appends each email (JSON line) to EMAIL_FILE_PATH instead of
+  // calling Brevo, so sign-in codes can be tested locally. Refused when NODE_ENV=production.
+  EMAIL_TRANSPORT: process.env.EMAIL_TRANSPORT || 'brevo',
+  EMAIL_FILE_PATH: process.env.EMAIL_FILE_PATH || '',
   EMAIL_FROM: 'noreply@nogatu.store',
   EMAIL_FROM_NAME: 'Nogatu',
 
