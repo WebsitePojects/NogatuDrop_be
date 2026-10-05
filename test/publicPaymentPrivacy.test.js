@@ -5,7 +5,7 @@ const path = require('node:path');
 const { maskPersonName, toBuyerFacingAccount, resolveOrderPaymentAccount } = require('../src/services/bankAccountResolver');
 const { phoneKey, phonesMatch } = require('../src/utils/phoneMatch');
 const { publicPaymentDeadline, PUBLIC_ORDER_PAYMENT_WINDOW_HOURS } = require('../src/services/publicOrderPayment');
-const { planReservationRelease } = require('../scripts/resetOrders');
+const { planReservationRelease, reservedDeltas } = require('../scripts/resetOrders');
 
 test('e-wallet holder names are masked the way management asked ("HA***D T.")', () => {
   assert.equal(maskPersonName('HAROLD TUGANO'), 'HA***D T.');
@@ -86,4 +86,9 @@ test('the orders reset releases reservations only for orders that still hold the
     { warehouseId: 19, productId: 16, quantity: 2 },
     { warehouseId: 16, productId: 16, quantity: 4 },
   ]);
+});
+
+test('the reset journal records exactly how much each inventory row released, so rollback can put it back', () => {
+  assert.deepEqual(reservedDeltas({ 10: 5, 11: 3, 12: 0 }, { 10: 1, 11: 3, 12: 0 }), [{ inventory_id: 10, released: 4 }]);
+  assert.deepEqual(reservedDeltas({}, {}), []);
 });
