@@ -14,6 +14,7 @@ const {
   assertBankAccountAvailable,
   getPublicPaymentAccounts,
   selectPublicPaymentAccount,
+  toBuyerFacingAccount,
 } = require('../services/bankAccountResolver');
 const { getIdempotencyKey, claimPublicOrderIntent, completePublicOrderIntent } = require('../services/publicOrderIdempotency');
 const {
@@ -26,6 +27,8 @@ const { enqueueOrderNotifications } = require('../services/orderNotificationOutb
 const { reserveStock, releaseStock } = require('../services/batchStock');
 const { lookupMlmMember } = require('../services/mlmBridge');
 const { readPublicCustomer, assertBarangayExists } = require('../services/publicCustomerInput');
+const { publicPaymentDeadline } = require('../services/publicOrderPayment');
+const { phonesMatch } = require('../utils/phoneMatch');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
 const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
@@ -431,10 +434,6 @@ function buildBankDetailsString(bankAccount) {
   return `${bankAccount.bank_name} - ${bankAccount.account_name} - ${bankAccount.account_number}`;
 }
 
-function normalizePhoneForLookup(value) {
-  return String(value || '').replace(/\D+/g, '');
-}
-
 function buildPublicPaymentContext({
   orderNumber,
   totalAmount,
@@ -457,11 +456,7 @@ function buildPublicPaymentContext({
     payment_status: paymentStatus || 'pending',
     payment_deadline: paymentDeadline || null,
     payment_proof_uploaded_at: paymentProofUploadedAt || null,
-    bank_account: bankAccount ? {
-      bank_name: bankAccount.bank_name,
-      account_name: bankAccount.account_name,
-      account_number: bankAccount.account_number,
-    } : null,
+    bank_account: toBuyerFacingAccount(bankAccount),
   };
 }
 
@@ -929,7 +924,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
-    const paymentDeadline = new Date(Date.now() + env.PAYMENT_DEADLINE_HOURS * 60 * 60 * 1000);
+    const paymentDeadline = publicPaymentDeadline();
     let bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
     if (req.body.payment_provider) {
       const accounts = await getPublicPaymentAccounts(conn, sourceWarehouseId);
@@ -945,12 +940,13 @@ const createPublicOrder = asyncHandler(async (req, res) => {
                              customer_first_name, customer_middle_name, customer_last_name, customer_name_suffix,
                              customer_address_line, customer_barangay_code, customer_postal_code,
                              customer_phone, customer_email, customer_lat, customer_lng, cod_amount,
-                             total_amount, notes)
-         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                             total_amount, notes, payment_deadline)
+         VALUES (?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [orderNumber, partnerId, publicPlacedByUserId, sourceWarehouseId,
          customer.firstName, customer.middleName, customer.lastName, customer.suffix,
          customer.addressLine, customer.barangayCode, customer.postalCode,
-         customer_phone || null, customer_email || null, custLat, custLng, codAmount, totalAmount, notes || null]
+         customer_phone || null, customer_email || null, custLat, custLng, codAmount, totalAmount, notes || null,
+         paymentDeadline]
       );
     } catch (err) {
       if (isMissingColumn(err, 'customer_last_name') || isMissingColumn(err, 'customer_barangay_code')) {
@@ -1144,7 +1140,10 @@ const approveOrder = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
     await conn.execute(
-      `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(), payment_deadline = ? WHERE id = ?`,
+      // A public order already carries its deadline from checkout (the buyer was shown it); approving
+      // must not shorten it. Stockist orders get theirs here.
+      `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(),
+                         payment_deadline = COALESCE(payment_deadline, ?) WHERE id = ?`,
       [req.user.id, deadline, orderId]
     );
 
@@ -1388,9 +1387,7 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
 
   if (orders.length === 0) throw ApiError.notFound('Public order not found for this order number');
 
-  const providedPhone = normalizePhoneForLookup(customer_phone);
-  const storedPhone = normalizePhoneForLookup(orders[0].customer_phone);
-  if (!providedPhone || !storedPhone || providedPhone !== storedPhone) {
+  if (!phonesMatch(customer_phone, orders[0].customer_phone)) {
     throw ApiError.badRequest('The phone number does not match the public order record');
   }
   if (['cancelled', 'rejected'].includes(String(orders[0].status || '').toLowerCase())) {

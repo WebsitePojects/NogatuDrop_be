@@ -5,7 +5,8 @@ const { ROLES, canonicalRole } = require('../rbac/roles');
 const { buildActiveTrackingScope } = require('../rbac/trackingScopes');
 const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter');
 const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
-const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
+const { resolveOrderPaymentAccount, toBuyerFacingAccount } = require('../services/bankAccountResolver');
+const { phonesMatch } = require('../utils/phoneMatch');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
 const {
   PUBLIC_ORDER_SHIPPING_FEE,
@@ -176,6 +177,8 @@ const getTracking = asyncHandler(async (req, res) => {
 });
 
 // GET /api/v1/tracking/public/:orderNumber
+// Anyone holding an order number sees its progress, courier, live GPS and ETA. Money and the payment
+// account are NOT here: they need the buyer's phone (POST .../payment-details), per management 2026-10-05.
 const getPublicTracking = asyncHandler(async (req, res) => {
   const { orderNumber } = req.params;
 
@@ -183,23 +186,11 @@ const getPublicTracking = asyncHandler(async (req, res) => {
     `SELECT o.status AS order_status,
             o.payment_status,
             o.payment_proof_uploaded_at,
-            o.total_amount,
-            o.merchandise_subtotal,
-            o.member_discount_amount,
-            o.shipping_fee,
-            o.system_fee,
-            o.payment_provider,
-            o.payment_account_id,
-            selected_payment.bank_name AS selected_bank_name,
-            selected_payment.account_name AS selected_account_name,
-            selected_payment.account_number AS selected_account_number,
-            (SELECT ROUND(SUM(oi.subtotal), 2) FROM order_items oi WHERE oi.order_id = o.id) AS item_subtotal,
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status,
             dt.est_delivery_at,
             c.name AS courier_name
      FROM orders o
-     LEFT JOIN bank_accounts selected_payment ON selected_payment.id = o.payment_account_id
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
      LEFT JOIN couriers c ON c.id = dt.courier_id
      WHERE o.order_number = ? AND o.is_deleted = 0
@@ -211,11 +202,6 @@ const getPublicTracking = asyncHandler(async (req, res) => {
 
   const row = rows[0];
   const latestPing = row.tracking_id ? await getLatestPingByTrackingId(row.tracking_id) : null;
-  const bankAccount = !['cancelled', 'rejected'].includes(row.order_status) && row.payment_status !== 'paid'
-    ? (row.payment_account_id && row.selected_bank_name
-      ? { bank_name: row.selected_bank_name, account_name: row.selected_account_name, account_number: row.selected_account_number }
-      : await getBankAccountForWarehouseOrDefault(pool, row.source_warehouse_id || null))
-    : null;
   const gps = latestPing
     ? {
         latitude: latestPing.latitude,
@@ -251,17 +237,61 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       status: normalizePublicStatus(row.order_status, row.tracking_status),
       payment_status: row.payment_status || 'pending',
       payment_proof_uploaded_at: row.payment_proof_uploaded_at || null,
-      total_amount: Number(row.total_amount || 0),
-      pricing_breakdown: buildTrackingPricingBreakdown(row),
-      bank_account: bankAccount ? {
-        bank_name: bankAccount.bank_name,
-        account_name: bankAccount.account_name,
-        account_number: bankAccount.account_number,
-      } : null,
+      // Tells the page to offer the phone check; true while the buyer may still need to pay.
+      payment_due: isPaymentDue(row),
       courier: row.courier_name || null,
       gps,
       source_warehouse: sourceWarehouse,
       eta: row.est_delivery_at || null,
+    },
+  });
+});
+
+function isPaymentDue(row) {
+  return !['cancelled', 'rejected'].includes(row.order_status) && row.payment_status !== 'paid';
+}
+
+// POST /api/v1/tracking/public/:orderNumber/payment-details  { customer_phone }
+// The amount, its breakdown, the deadline and the account to pay, for the buyer only: the phone used at
+// checkout must match. A wrong phone and an unknown order get the same 404 so neither can be probed.
+const getPublicPaymentDetails = asyncHandler(async (req, res) => {
+  const [rows] = await pool.execute(
+    `SELECT o.status AS order_status,
+            o.payment_status,
+            o.customer_phone,
+            o.total_amount,
+            o.merchandise_subtotal,
+            o.member_discount_amount,
+            o.shipping_fee,
+            o.system_fee,
+            o.payment_deadline,
+            o.payment_account_id,
+            o.source_warehouse_id,
+            (SELECT ROUND(SUM(oi.subtotal), 2) FROM order_items oi WHERE oi.order_id = o.id) AS item_subtotal
+     FROM orders o
+     WHERE o.order_number = ? AND o.placed_by_type = 'public' AND o.is_deleted = 0
+     LIMIT 1`,
+    [req.params.orderNumber]
+  );
+  const row = rows[0];
+  if (!row || !phonesMatch(req.body.customer_phone, row.customer_phone)) {
+    throw ApiError.notFound('No order matches that order number and phone number');
+  }
+
+  const bankAccount = isPaymentDue(row)
+    ? await resolveOrderPaymentAccount(pool, { paymentAccountId: row.payment_account_id, sourceWarehouseId: row.source_warehouse_id })
+    : null;
+
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    success: true,
+    data: {
+      payment_status: row.payment_status || 'pending',
+      payment_due: isPaymentDue(row),
+      payment_deadline: row.payment_deadline || null,
+      total_amount: Number(row.total_amount || 0),
+      pricing_breakdown: buildTrackingPricingBreakdown(row),
+      bank_account: toBuyerFacingAccount(bankAccount),
     },
   });
 });
@@ -644,6 +674,7 @@ const createTracking = asyncHandler(async (req, res) => {
 module.exports = {
   getTracking,
   getPublicTracking,
+  getPublicPaymentDetails,
   getOrderPings,
   getActiveTracking,
   postPingByToken,

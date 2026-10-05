@@ -13,32 +13,44 @@ const isMissingColumn = (err, columnName) => (
   String(err.sqlMessage || '').includes(columnName)
 );
 
+const UNPAID_PAST_DEADLINE_SQL = `o.status IN ('pending', 'approved')
+         AND o.payment_status IN ('pending', 'unpaid')
+         AND o.payment_proof_url IS NULL
+         AND o.payment_deadline IS NOT NULL
+         AND o.payment_deadline < NOW()`;
+
 async function runPaymentDeadlineCheck() {
   const conn = await pool.getConnection();
   try {
-    // Find approved orders where payment_deadline has passed and payment is still pending.
+    // Orders past their payment deadline with nothing paid and NO receipt uploaded. A buyer who uploaded
+    // a receipt is waiting on us to verify it, so their order is never cancelled for lateness. Public
+    // orders get their deadline when placed (3 days, services/publicOrderPayment.js) and may still be
+    // pending; stockist orders get theirs on approval.
     const [expiredOrders] = await conn.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id
        FROM orders o
-       WHERE o.status = 'approved'
-         AND o.payment_status IN ('pending', 'unpaid')
-         AND o.payment_deadline IS NOT NULL
-         AND o.payment_deadline < NOW()
+       WHERE ${UNPAID_PAST_DEADLINE_SQL}
          AND o.is_deleted = 0`
     );
 
     for (const order of expiredOrders) {
       await conn.beginTransaction();
       try {
-        await conn.execute(
-          `UPDATE orders
-           SET status = 'cancelled',
-               cancellation_reason = 'Payment deadline expired',
-               cancelled_by = NULL,
-               updated_at = NOW()
-           WHERE id = ?`,
+        // Re-check the same conditions in the UPDATE: a receipt uploaded or a payment verified after the
+        // SELECT wins, and the order is left alone.
+        const [cancelled] = await conn.execute(
+          `UPDATE orders o
+           SET o.status = 'cancelled',
+               o.cancellation_reason = 'Not paid within the payment deadline',
+               o.cancelled_by = NULL,
+               o.updated_at = NOW()
+           WHERE o.id = ? AND ${UNPAID_PAST_DEADLINE_SQL}`,
           [order.id]
         );
+        if (cancelled.affectedRows !== 1) {
+          await conn.rollback();
+          continue;
+        }
 
         let items = [];
         try {

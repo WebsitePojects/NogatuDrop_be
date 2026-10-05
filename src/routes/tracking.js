@@ -7,6 +7,7 @@ const { PERMISSIONS } = require('../rbac/permissions');
 const {
   getTracking,
   getPublicTracking,
+  getPublicPaymentDetails,
   getOrderPings,
   getActiveTracking,
   postPingByToken,
@@ -19,6 +20,17 @@ const router = Router();
 
 // Public tracking endpoints (no auth)
 router.get('/public/:orderNumber', param('orderNumber').isString().trim().notEmpty(), validate, getPublicTracking);
+// POST so the phone number travels in the body, never in a URL that ends up in access logs.
+router.post(
+  '/public/:orderNumber/payment-details',
+  [
+    param('orderNumber').isString().trim().notEmpty(),
+    body('customer_phone').isString().withMessage('Enter the phone number used at checkout').bail()
+      .trim().isLength({ min: 10, max: 30 }).withMessage('Enter the phone number used at checkout'),
+  ],
+  validate,
+  getPublicPaymentDetails
+);
 
 router.post(
   '/ping/:token',

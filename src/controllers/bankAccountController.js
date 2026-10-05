@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const { ROLES, canonicalRole } = require('../rbac/roles');
-const { getBankAccountForWarehouseOrDefault } = require('../services/bankAccountResolver');
+const { resolveOrderPaymentAccount } = require('../services/bankAccountResolver');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -200,39 +200,23 @@ const deleteBankAccount = asyncHandler(async (req, res) => {
 });
 
 // GET /api/v1/bank-accounts/for-order/:orderId — get bank account for an order's source warehouse
+// The account the buyer was told to pay: the one chosen at checkout, else the source warehouse's account.
+// Reading only the warehouse default showed staff GCASH for an order the buyer paid by BDO.
 const getBankAccountForOrder = asyncHandler(async (req, res) => {
-  let warehouseId = null;
   const scope = scopedOrderClause(req.user);
+  const [orders] = await pool.execute(
+    `SELECT o.source_warehouse_id, o.payment_account_id
+     FROM orders o
+     WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
+     LIMIT 1`,
+    [req.params.orderId, ...scope.params]
+  );
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
 
-  try {
-    const [orders] = await pool.execute(
-      `SELECT o.source_warehouse_id
-       FROM orders o
-       WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
-       LIMIT 1`,
-      [req.params.orderId, ...scope.params]
-    );
-    if (orders.length === 0) throw ApiError.notFound('Order not found');
-    warehouseId = orders[0].source_warehouse_id || null;
-  } catch (err) {
-    // Backward compatibility for DBs not yet migrated with source_warehouse_id.
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      const [orders] = await pool.execute(
-        `SELECT o.id
-         FROM orders o
-         WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
-         LIMIT 1`,
-        [req.params.orderId, ...scope.params]
-      );
-      if (orders.length === 0) throw ApiError.notFound('Order not found');
-      warehouseId = null;
-    } else {
-      throw err;
-    }
-  }
-
-  const bank = await getBankAccountForWarehouseOrDefault(pool, warehouseId);
-
+  const bank = await resolveOrderPaymentAccount(pool, {
+    paymentAccountId: orders[0].payment_account_id,
+    sourceWarehouseId: orders[0].source_warehouse_id,
+  });
   res.json({ success: true, data: bank });
 });
 

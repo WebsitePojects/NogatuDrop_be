@@ -127,8 +127,55 @@ function selectPublicPaymentAccount(accounts, provider, warehouseId) {
   return selected;
 }
 
+// E-wallet accounts are personal (a named person's GCash), so buyers see a masked name; bank accounts
+// for the store are company names and stay readable.
+const PERSONAL_NAME_PROVIDERS = Object.freeze(['GCASH']);
+
+/**
+ * "HAROLD TUGANO" -> "HA***D T.": enough for a buyer to confirm they are sending to the right person in
+ * the app, without publishing the account holder's full name (management request, 2026-10-05).
+ */
+function maskPersonName(name) {
+  const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  const first = words[0];
+  const maskedFirst = first.length <= 3 ? `${first[0]}***` : `${first.slice(0, 2)}***${first.slice(-1)}`;
+  return words.length > 1 ? `${maskedFirst} ${words[words.length - 1][0]}.` : maskedFirst;
+}
+
+/** The account as shown to a public buyer: number in full (they must type it), name masked for e-wallets. */
+function toBuyerFacingAccount(bank) {
+  if (!bank) return null;
+  const masked = PERSONAL_NAME_PROVIDERS.includes(normalizeProvider(bank.bank_name));
+  return {
+    bank_name: bank.bank_name,
+    account_name: masked ? maskPersonName(bank.account_name) : bank.account_name,
+    account_number: bank.account_number,
+  };
+}
+
+/**
+ * The account an order must be paid into: the one the buyer chose at checkout (orders.payment_account_id),
+ * else the source warehouse's account, else the company default. Staff screens and the tracking page use
+ * this so they never show a different account from the one the buyer was told to pay.
+ */
+async function resolveOrderPaymentAccount(db, { paymentAccountId, sourceWarehouseId }) {
+  if (paymentAccountId) {
+    const [rows] = await db.execute(
+      `SELECT id, warehouse_id, bank_name, account_name, account_number
+       FROM bank_accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`,
+      [paymentAccountId]
+    );
+    if (rows.length > 0) return toPublicBankAccount(rows[0]);
+  }
+  return getBankAccountForWarehouseOrDefault(db, sourceWarehouseId || null);
+}
+
 module.exports = {
   getBankAccountForWarehouseOrDefault,
+  resolveOrderPaymentAccount,
+  toBuyerFacingAccount,
+  maskPersonName,
   assertBankAccountAvailable,
   PUBLIC_PAYMENT_PROVIDERS,
   normalizeProvider,

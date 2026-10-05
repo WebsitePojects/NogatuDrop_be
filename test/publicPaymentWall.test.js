@@ -88,15 +88,18 @@ test('public order proof upload is exposed as a non-auth storefront route', () =
   assert.match(orderRoutesSource, /router\.post\('\/public\/payment-proof', paymentProofUpload\.single\('proof'\), uploadErrorHandler, uploadPublicPaymentProof\);/);
   assert.equal(orderControllerSource.includes('const uploadPublicPaymentProof = asyncHandler(async (req, res) => {'), true);
   assert.equal(orderControllerSource.includes("throw ApiError.badRequest('order_number and customer_phone are required');"), true);
-  assert.equal(orderControllerSource.includes('normalizePhoneForLookup'), true);
+  assert.equal(orderControllerSource.includes('phonesMatch(customer_phone, orders[0].customer_phone)'), true);
   assert.equal(orderControllerSource.includes("throw ApiError.badRequest('The phone number does not match the public order record');"), true);
   assert.equal(orderControllerSource.includes("throw ApiError.badRequest('This order is closed and can no longer accept payment proof');"), true);
 });
 
-test('public tracking returns unpaid bank instructions and payment-proof state', () => {
-  assert.equal(trackingControllerSource.includes('payment_status: row.payment_status || \'pending\''), true);
+// Management 2026-10-05: the amount and the account to pay are shown only after the buyer enters the
+// phone used at checkout (POST /tracking/public/:orderNumber/payment-details).
+test('public tracking shows payment state; amount and account need the buyer phone', () => {
+  assert.equal(trackingControllerSource.includes("payment_status: row.payment_status || 'pending'"), true);
   assert.equal(trackingControllerSource.includes('payment_proof_uploaded_at: row.payment_proof_uploaded_at || null'), true);
+  assert.equal(trackingControllerSource.includes('const getPublicPaymentDetails = asyncHandler'), true);
   assert.equal(trackingControllerSource.includes('total_amount: Number(row.total_amount || 0)'), true);
   assert.equal(trackingControllerSource.includes('pricing_breakdown: buildTrackingPricingBreakdown(row)'), true);
-  assert.equal(trackingControllerSource.includes('bank_account: bankAccount ? {'), true);
+  assert.equal(trackingControllerSource.includes('bank_account: toBuyerFacingAccount(bankAccount)'), true);
 });
