@@ -181,10 +181,14 @@ function assertCanAccessOrder(affiliationContext, order) {
     }
     if (
       childCityPartnerIds.includes(Number(order.partner_id))
-      && String(order.placed_by_role_slug || '') === 'city_stockist'
+      && ['city_stockist', 'staff'].includes(String(order.placed_by_role_slug || ''))
     ) {
       return;
     }
+  }
+
+  if (partnerLevel === 'center' && Number(order.partner_id) === partnerId) {
+    return;
   }
 
   throw ApiError.forbidden('You do not have permission to access this order');
@@ -253,7 +257,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   let orders;
   try {
     [orders] = await pool.execute(
-      `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.payment_status, o.status,
+      `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.placed_by_type, o.payment_status, o.status,
               r.slug AS placed_by_role_slug
        FROM orders o
        LEFT JOIN users u ON u.id = o.placed_by
@@ -393,7 +397,7 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
 
   const [orders] = await pool.execute(
-    `SELECT o.id, o.partner_id, o.placed_by, r.slug AS placed_by_role_slug
+    `SELECT o.id, o.partner_id, o.placed_by, o.placed_by_type, r.slug AS placed_by_role_slug
      FROM orders o
      LEFT JOIN users u ON u.id = o.placed_by
      LEFT JOIN roles r ON r.id = u.role_id

@@ -9,8 +9,8 @@ const ROLES = Object.freeze({
 });
 
 // partners.stockist_level values. A 'center' is a company-owned fulfillment center (Caloocan, Tycoon):
-// it owns a warehouse and staff, but is NOT a Stockist — no discount, no parent, no MLM sync,
-// and it never appears in approval chains. Anything not listed here is unknown and must fail closed.
+// it owns a warehouse and staff, but is NOT a Stockist — no discount, no parent, no MLM sync.
+// Its staff approve and ship only the public store orders routed to it. Anything not listed here is unknown and must fail closed.
 const PARTNER_LEVELS = Object.freeze({
   PROVINCIAL: 'provincial_stockist',
   CITY: 'city_stockist',

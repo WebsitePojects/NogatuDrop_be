@@ -1,4 +1,4 @@
-const { ROLES, canonicalRole } = require('./roles');
+const { ROLES, PARTNER_LEVELS, canonicalRole } = require('./roles');
 
 async function executePartnerLookup(db, sql, params) {
   try {
@@ -211,13 +211,21 @@ function canApproveOrderFromContext(context, order) {
       && (placedByRoleSlug === ROLES.CITY_STOCKIST || placedByRoleSlug === ROLES.STAFF);
   }
 
-  // Any other level — notably a fulfillment 'center', which has no approval chain — is unknown
-  // here and fails closed: only Super Admin (handled above) approves or verifies its orders.
-  // Center staff still see their own orders through the plain partner_id list scope.
+  if (partnerLevel === PARTNER_LEVELS.CENTER) {
+    // A fulfillment center accepts the store orders routed to it (management, 2026-10-06), so its
+    // staff approve and ship those. Orders from Stockists are never a center's to approve.
+    return orderPartnerId === partnerId && order?.placed_by_type === 'public';
+  }
+
+  // Any other level is unknown here and fails closed: only Super Admin (handled above) approves.
   return false;
 }
 
 function canVerifyPaymentFromContext(context, order) {
+  // Confirming money on a center's orders stays with Super Admin until management hands it to staff.
+  if (canonicalRole(context?.partnerLevel) === PARTNER_LEVELS.CENTER) {
+    return false;
+  }
   return canApproveOrderFromContext(context, order);
 }
 

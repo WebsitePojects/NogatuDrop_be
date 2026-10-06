@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const cache = require('../services/cacheService');
+const { PARTNER_LEVELS } = require('../rbac/roles');
 
 // GET /api/v1/dashboard/kpis
 const getKPIs = asyncHandler(async (req, res) => {
@@ -10,7 +11,14 @@ const getKPIs = asyncHandler(async (req, res) => {
     if (req.user.role_slug === 'super_admin') {
       // Use the view for super admin
       const [rows] = await pool.execute('SELECT * FROM vw_dashboard_kpis');
-      return rows[0];
+      // The view counts every active partner, which includes the company's fulfillment centers.
+      // Centers are not Stockists, so the card counts Stockist levels only.
+      const [stockists] = await pool.execute(
+        `SELECT COUNT(*) AS active_stockists FROM partners
+         WHERE status = 'active' AND is_deleted = 0 AND stockist_level IN (?, ?)`,
+        [PARTNER_LEVELS.PROVINCIAL, PARTNER_LEVELS.CITY]
+      );
+      return { ...rows[0], active_stockists: Number(stockists[0].active_stockists) };
     }
 
     // Partner-scoped KPIs

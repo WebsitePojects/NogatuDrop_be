@@ -1095,7 +1095,7 @@ const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status, o.placed_by_type,
             r.slug AS placed_by_role_slug
      FROM orders o
      LEFT JOIN users u ON u.id = o.placed_by
@@ -1139,15 +1139,22 @@ const approveOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.execute(
+    const [approved] = await conn.execute(
       // A public order already carries its deadline from checkout (the buyer was shown it); approving
-      // must not shorten it. Stockist orders get theirs here.
+      // must not shorten it. Stockist orders get theirs here. The status condition makes a double
+      // click, or two people approving at once, a single approval.
       `UPDATE orders SET status = 'approved', approved_by = ?, approved_at = NOW(),
-                         payment_deadline = COALESCE(payment_deadline, ?) WHERE id = ?`,
+                         payment_deadline = COALESCE(payment_deadline, ?)
+       WHERE id = ? AND status = 'pending' AND is_deleted = 0`,
       [req.user.id, deadline, orderId]
     );
+    if (approved.affectedRows !== 1) {
+      throw ApiError.conflict('This order was already handled. Refresh to see its current status.');
+    }
 
-    const partnerUsers = await notifyPartnerUsers(
+    // The Stockist who placed an order is told to pay. A public order's partner is the center
+    // that just approved it, so there is no one to notify (the buyer sees it on the tracking page).
+    const partnerUsers = orders[0].placed_by_type === 'public' ? [] : await notifyPartnerUsers(
       conn, orders[0].partner_id, 'order_approved',
       `Order Approved: #${orders[0].order_number}`,
       `Your order #${orders[0].order_number} has been approved. Pay within ${env.PAYMENT_DEADLINE_HOURS} hours.`,
@@ -1180,7 +1187,7 @@ const rejectOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
   const [orders] = await pool.execute(
-    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status,
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status, o.placed_by_type,
             r.slug AS placed_by_role_slug
      FROM orders o
      LEFT JOIN users u ON u.id = o.placed_by
@@ -1200,10 +1207,15 @@ const rejectOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.execute(
-      `UPDATE orders SET status = 'rejected', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW() WHERE id = ?`,
+    const [rejected] = await conn.execute(
+      `UPDATE orders SET status = 'rejected', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW()
+       WHERE id = ? AND status = 'pending' AND is_deleted = 0`,
       [reason || null, req.user.id, orderId]
     );
+    // Only the request that actually moved the order releases its stock; a duplicate releases nothing.
+    if (rejected.affectedRows !== 1) {
+      throw ApiError.conflict('This order was already handled. Refresh to see its current status.');
+    }
 
     // Release reserved stock
     const items = await getOrderItemsWithOptionalSourceColumn(conn, orderId);
@@ -1447,7 +1459,7 @@ const verifyPayment = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     const [orders] = await conn.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status,
-              o.payment_proof_url, o.total_amount, r.slug AS placed_by_role_slug
+              o.payment_proof_url, o.total_amount, o.placed_by_type, r.slug AS placed_by_role_slug
        FROM orders o
        LEFT JOIN users u ON u.id = o.placed_by
        LEFT JOIN roles r ON r.id = u.role_id
