@@ -38,8 +38,10 @@ router.post(
     param('token').isString().trim().notEmpty(),
     body('lat').isFloat().withMessage('Latitude is required'),
     body('lng').isFloat().withMessage('Longitude is required'),
-    body('speed_kmh').optional().isFloat(),
-    body('accuracy_meters').optional().isFloat(),
+    // Phones send null speed/accuracy when they have no reading (standing still, weak fix). null must
+    // pass, or every such ping is refused and the rider never shows on the map.
+    body('speed_kmh').optional({ values: 'null' }).isFloat().withMessage('speed_kmh must be a number'),
+    body('accuracy_meters').optional({ values: 'null' }).isFloat().withMessage('accuracy_meters must be a number'),
   ],
   validate,
   postPingByToken
