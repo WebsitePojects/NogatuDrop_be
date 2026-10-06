@@ -44,6 +44,8 @@ const env = {
   ALLIANCE_API_KEY: process.env.ALLIANCE_API_KEY || '',
 
   MLM_API_URL: process.env.MLM_API_URL || '',
+  // Road routing for the delivery map (OSRM). Self-host or swap provider by changing this URL.
+  OSRM_URL: process.env.OSRM_URL || 'https://router.project-osrm.org',
   MLM_API_KEY: process.env.MLM_API_KEY || '',
 
   // Public base URL (for magic links)

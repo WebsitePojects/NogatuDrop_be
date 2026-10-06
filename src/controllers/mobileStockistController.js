@@ -4,6 +4,10 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const { ROLES, canonicalRole } = require('../rbac/roles');
+const { resolveAddress, hasAddressParts, readCoordinates } = require('../services/addressInput');
+const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
+
+const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -96,11 +100,13 @@ const getMobileStockists = asyncHandler(async (req, res) => {
   }
 
   const baseQuery = `
-    SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.status,
+    SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.region, ms.lat, ms.lng, ms.status,
+           ${addressPartsSelect('ms', 'address')},
            ms.partner_id, p.business_name AS parent_name,
            ms.created_at, ms.last_login
     FROM mobile_stockists ms
     LEFT JOIN partners p ON p.id = ms.partner_id
+    ${addressPartsJoins('ms')}
     ${where} ORDER BY ms.created_at DESC`;
   const countQuery = `SELECT COUNT(*) AS total FROM mobile_stockists ms LEFT JOIN partners p ON p.id = ms.partner_id ${where}`;
 
@@ -113,11 +119,13 @@ const getMobileStockists = asyncHandler(async (req, res) => {
     }
 
     const fallbackQuery = `
-      SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.status,
+      SELECT ms.id, ms.name, ms.email, ms.phone, ms.address, ms.region, ms.lat, ms.lng, ms.status,
+             ${addressPartsSelect('ms', 'address')},
              ms.partner_id, p.business_name AS parent_name,
              ms.created_at, NULL AS last_login
       FROM mobile_stockists ms
       LEFT JOIN partners p ON p.id = ms.partner_id
+      ${addressPartsJoins('ms')}
       ${where} ORDER BY ms.created_at DESC`;
     result = await paginate(fallbackQuery, countQuery, params, page, limit);
   }
@@ -127,7 +135,7 @@ const getMobileStockists = asyncHandler(async (req, res) => {
 
 // POST /api/v1/mobile-stockists
 const createMobileStockist = asyncHandler(async (req, res) => {
-  const { name, email, phone, address, parent_partner_id, password } = req.body;
+  const { name, email, phone, parent_partner_id, password } = req.body;
   if (!name || !email) throw ApiError.badRequest('name and email are required');
   if (!password || password.length < 8) throw ApiError.badRequest('Password must be at least 8 characters');
 
@@ -135,6 +143,8 @@ const createMobileStockist = asyncHandler(async (req, res) => {
   if (!parentId) throw ApiError.badRequest('Parent Stockist is required');
 
   await assertActiveStockistPartner(pool, parentId);
+  const place = await resolveAddress(pool, req.body);
+  const { lat, lng } = readCoordinates(req.body);
 
   const [existingMobile] = await pool.execute(
     'SELECT id FROM mobile_stockists WHERE email = ? LIMIT 1',
@@ -158,15 +168,17 @@ const createMobileStockist = asyncHandler(async (req, res) => {
     const [userResult] = await conn.execute(
       `INSERT INTO users (name, email, password, phone, role_id, partner_id, level, location)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, email, hashedPassword, phone || null, mobileRoleId, parentId, 'mobile', address || 'Mobile Stockist']
+      [name, email, hashedPassword, phone || null, mobileRoleId, parentId, 'mobile', place.text]
     );
 
     let result;
     try {
       [result] = await conn.execute(
-        `INSERT INTO mobile_stockists (user_id, name, email, phone, address, partner_id, status)
-         VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-        [userResult.insertId, name, email, phone || null, address || null, parentId]
+        `INSERT INTO mobile_stockists (user_id, name, email, phone, address, region, address_line, barangay_code,
+                                       postal_code, lat, lng, partner_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+        [userResult.insertId, name, email, phone || null, place.text, place.regionName, place.addressLine,
+         place.barangayCode, place.postalCode, lat, lng, parentId]
       );
     } catch (err) {
       if (!isMissingColumn(err, 'user_id')) {
@@ -174,9 +186,11 @@ const createMobileStockist = asyncHandler(async (req, res) => {
       }
 
       [result] = await conn.execute(
-        `INSERT INTO mobile_stockists (name, email, phone, address, partner_id, status)
-         VALUES (?, ?, ?, ?, ?, 'active')`,
-        [name, email, phone || null, address || null, parentId]
+        `INSERT INTO mobile_stockists (name, email, phone, address, region, address_line, barangay_code,
+                                       postal_code, lat, lng, partner_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+        [name, email, phone || null, place.text, place.regionName, place.addressLine,
+         place.barangayCode, place.postalCode, lat, lng, parentId]
       );
     }
 
@@ -188,6 +202,8 @@ const createMobileStockist = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     await conn.rollback();
+    // Two identical submits can both pass the e-mail pre-checks; the unique indexes stop the loser.
+    if (isDupEntryError(err)) throw ApiError.conflict('Email already registered as a Mobile Stockist');
     throw err;
   } finally {
     conn.release();
@@ -200,16 +216,27 @@ const updateMobileStockist = asyncHandler(async (req, res) => {
   const existing = await getMobileStockistById(pool, id, req.user);
   if (!existing) throw ApiError.notFound('Mobile Stockist not found');
 
-  const { name, phone, address, status } = req.body;
+  const { name, phone, status } = req.body;
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    await conn.execute(
-      `UPDATE mobile_stockists SET name = COALESCE(?, name), phone = COALESCE(?, phone),
-       address = COALESCE(?, address), status = COALESCE(?, status) WHERE id = ?`,
-      [name, phone, address, status, id]
-    );
+    const fields = ['name = COALESCE(?, name)', 'phone = COALESCE(?, phone)', 'status = COALESCE(?, status)'];
+    const values = [name ?? null, phone ?? null, status ?? null];
+    // The street, barangay and postal code replace the stored address as a unit; the old address text
+    // and region are rewritten from them.
+    if (hasAddressParts(req.body)) {
+      const place = await resolveAddress(conn, req.body);
+      fields.push('address = ?', 'region = ?', 'address_line = ?', 'barangay_code = ?', 'postal_code = ?');
+      values.push(place.text, place.regionName, place.addressLine, place.barangayCode, place.postalCode);
+    }
+    // Sending the pair (even as nulls) sets or clears the pin; leaving both out keeps it.
+    if ('lat' in req.body || 'lng' in req.body) {
+      const { lat, lng } = readCoordinates(req.body);
+      fields.push('lat = ?', 'lng = ?');
+      values.push(lat, lng);
+    }
+    await conn.execute(`UPDATE mobile_stockists SET ${fields.join(', ')} WHERE id = ?`, [...values, id]);
 
     if (status) {
       const userStatus = status === 'active' ? 'active' : 'inactive';

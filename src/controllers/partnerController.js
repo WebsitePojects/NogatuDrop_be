@@ -4,6 +4,8 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const paginate = require('../utils/paginate');
 const { PARTNER_LEVELS, STOCKIST_LEVELS } = require('../rbac/roles');
+const { resolveAddress, hasAddressParts } = require('../services/addressInput');
+const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
@@ -44,12 +46,14 @@ const getPartners = asyncHandler(async (req, res) => {
   }
 
   const baseQuery = `
-    SELECT p.id, p.business_name, p.email, p.phone, p.address,
+    SELECT p.id, p.business_name, p.email, p.phone, p.address, p.region,
+           ${addressPartsSelect('p', 'address')},
            p.stockist_level, p.discount_pct, p.parent_partner_id,
            parent.business_name AS parent_name,
            p.status, p.created_at, p.updated_at
     FROM partners p
     LEFT JOIN partners parent ON parent.id = p.parent_partner_id
+    ${addressPartsJoins('p')}
     ${where}
     ORDER BY p.business_name ASC`;
 
@@ -61,12 +65,14 @@ const getPartners = asyncHandler(async (req, res) => {
 // GET /api/v1/partners/:id
 const getPartner = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT p.id, p.business_name, p.email, p.phone, p.address,
+    `SELECT p.id, p.business_name, p.email, p.phone, p.address, p.region,
+            ${addressPartsSelect('p', 'address')},
             p.stockist_level, p.discount_pct, p.parent_partner_id,
             parent.business_name AS parent_name,
             p.status, p.created_at, p.updated_at
      FROM partners p
      LEFT JOIN partners parent ON parent.id = p.parent_partner_id
+     ${addressPartsJoins('p')}
      WHERE p.id = ? AND p.is_deleted = 0 LIMIT 1`,
     [req.params.id]
   );
@@ -77,7 +83,7 @@ const getPartner = asyncHandler(async (req, res) => {
 // POST /api/v1/partners
 const createPartner = asyncHandler(async (req, res) => {
   const {
-    business_name, email, phone, address, stockist_level,
+    business_name, email, phone, stockist_level,
     parent_partner_id, discount_pct,
     admin_name, admin_email, admin_password,
   } = req.body;
@@ -98,6 +104,7 @@ const createPartner = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('Password must be at least 8 characters');
   }
   if (parent_partner_id) await assertProvincialParent(parent_partner_id);
+  const place = await resolveAddress(pool, req.body);
 
   const adminMail = (admin_email || normalizedEmail || '').trim();
   if (!EMAIL_RE.test(adminMail)) {
@@ -131,10 +138,12 @@ const createPartner = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
 
     const [partnerResult] = await conn.execute(
-      `INSERT INTO partners (business_name, email, phone, address, stockist_level, parent_partner_id, discount_pct)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [normalizedBusinessName, normalizedEmail, phone || null, address || null, stockist_level,
-       parent_partner_id || null, discount_pct !== undefined ? discount_pct : 0]
+      `INSERT INTO partners (business_name, email, phone, address, region, address_line, barangay_code, postal_code,
+                             stockist_level, parent_partner_id, discount_pct)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [normalizedBusinessName, normalizedEmail, phone || '', place.text, place.regionName,
+       place.addressLine, place.barangayCode, place.postalCode,
+       stockist_level, parent_partner_id || null, discount_pct !== undefined ? discount_pct : 0]
     );
     const partnerId = partnerResult.insertId;
 
@@ -172,7 +181,7 @@ const createPartner = asyncHandler(async (req, res) => {
 // PUT /api/v1/partners/:id
 const updatePartner = asyncHandler(async (req, res) => {
   const partnerId = req.params.id;
-  const { business_name, email, phone, address, status, parent_partner_id } = req.body;
+  const { business_name, email, phone, status, parent_partner_id } = req.body;
 
   const [existing] = await pool.execute(
     'SELECT id, stockist_level FROM partners WHERE id = ? AND is_deleted = 0', [partnerId]
@@ -198,7 +207,13 @@ const updatePartner = asyncHandler(async (req, res) => {
   if (business_name) { fields.push('business_name = ?'); values.push(business_name); }
   if (email) { fields.push('email = ?'); values.push(email); }
   if (phone !== undefined) { fields.push('phone = ?'); values.push(phone); }
-  if (address !== undefined) { fields.push('address = ?'); values.push(address); }
+  // The street, barangay and postal code replace the stored address as a unit; the old address text
+  // and region are rewritten from them.
+  if (hasAddressParts(req.body)) {
+    const place = await resolveAddress(pool, req.body);
+    fields.push('address = ?', 'region = ?', 'address_line = ?', 'barangay_code = ?', 'postal_code = ?');
+    values.push(place.text, place.regionName, place.addressLine, place.barangayCode, place.postalCode);
+  }
   if (status) { fields.push('status = ?'); values.push(status); }
   if (parent_partner_id !== undefined) { fields.push('parent_partner_id = ?'); values.push(parent_partner_id || null); }
 

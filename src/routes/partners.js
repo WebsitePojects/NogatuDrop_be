@@ -4,6 +4,7 @@ const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
 const { getPartners, getPartner, createPartner, updatePartner, updateDiscount } = require('../controllers/partnerController');
+const { addressPartsValidators } = require('../services/addressInput');
 
 const router = Router();
 router.use(auth);
@@ -22,12 +23,13 @@ router.post(
     body('admin_name').optional().trim(),
     body('admin_email').optional().isEmail(),
     body('admin_password').optional().isLength({ min: 8 }),
+    ...addressPartsValidators({ required: true }),
   ],
   validate,
   createPartner
 );
 
-router.put('/:id', param('id').isInt(), validate, updatePartner);
+router.put('/:id', param('id').isInt(), addressPartsValidators({ required: false }), validate, updatePartner);
 router.patch('/:id/discount', [body('discount_pct').isFloat({ min: 0, max: 100 })], validate, updateDiscount);
 
 module.exports = router;

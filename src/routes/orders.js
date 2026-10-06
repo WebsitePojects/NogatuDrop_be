@@ -20,6 +20,7 @@ const {
   NAME_SUFFIXES, PERSON_NAME_PATTERN, NAME_MAX_LENGTH, ADDRESS_LINE_MAX_LENGTH,
   BARANGAY_CODE_PATTERN, POSTAL_CODE_PATTERN,
 } = require('../services/publicCustomerInput');
+const { coordinatePairValidator } = require('../services/addressInput');
 
 const router = Router();
 const { requirePermission } = role;
@@ -52,6 +53,8 @@ const publicOrderValidation = [
   bodyValidator('customer_postal_code').optional({ values: 'falsy' })
     .isString().bail().trim().matches(POSTAL_CODE_PATTERN)
     .withMessage('Postal code must be 4 digits'),
+  // The optional delivery pin must be a lat/lng pair inside the Philippines (400 with the shared message).
+  coordinatePairValidator('customer_lat', 'customer_lng'),
   bodyValidator('customer_phone').optional().isString().isLength({ max: 30 }),
   // Blank means "not given": the checkout labels email as optional and may send an empty string.
   bodyValidator('customer_email').optional({ values: 'falsy' }).isEmail().withMessage('Please enter a valid email address, or leave it blank').normalizeEmail(),

@@ -8,6 +8,7 @@ const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { consumeReservedStock } = require('../services/batchStock');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
+const { buildOrderRoute, UNSCOPED } = require('../services/orderRouteService');
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
@@ -132,8 +133,8 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
-async function getLatestActiveToken(orderId) {
-  const [rows] = await pool.execute(
+async function getLatestActiveToken(orderId, db = pool) {
+  const [rows] = await db.execute(
     `SELECT id, token, expires_at, is_used, created_at
      FROM delivery_tokens
      WHERE order_id = ? AND is_used = 0 AND expires_at > NOW()
@@ -209,7 +210,7 @@ function assertCanManageDeliveryLink(affiliationContext, order) {
   }
 
   if (!canManageDeliveryLinkFromContext(affiliationContext, order)) {
-    throw ApiError.forbidden('You do not have permission to generate or view the delivery link for this order');
+    throw ApiError.forbidden('You do not have permission to create or view the Rider Link for this order');
   }
 }
 
@@ -249,9 +250,35 @@ async function getDeliveryProofOwnership(orderId) {
   return rows[0] || null;
 }
 
-// POST /api/v1/delivery-tokens — generate magic link for an order
+/**
+ * Creates or updates the order's delivery_tracking row. A vehicle or courier left out keeps the
+ * stored value, so regenerating a link without picking again does not reset it.
+ */
+async function upsertTracking(conn, orderId, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery }) {
+  const [trackingRows] = await conn.execute('SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1', [orderId]);
+  if (trackingRows.length === 0) {
+    await conn.execute(
+      `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number, vehicle_type)
+       VALUES (?, 'out_for_delivery', ?, ?, ?)`,
+      [orderId, courier_id || null, courier_tracking_number || null, vehicle_type || 'motorcycle']
+    );
+    return;
+  }
+  await conn.execute(
+    `UPDATE delivery_tracking
+     SET status = IF(?, 'out_for_delivery', status),
+         courier_id = COALESCE(?, courier_id),
+         courier_tracking_number = COALESCE(?, courier_tracking_number),
+         vehicle_type = COALESCE(?, vehicle_type),
+         updated_at = NOW()
+     WHERE order_id = ?`,
+    [setOutForDelivery ? 1 : 0, courier_id || null, courier_tracking_number || null, vehicle_type || null, orderId]
+  );
+}
+
+// POST /api/v1/delivery-tokens — create the Rider Link for an order (body validated in routes)
 const generateDeliveryLink = asyncHandler(async (req, res) => {
-  const { order_id, courier_id, courier_tracking_number } = req.body;
+  const { order_id, courier_id, courier_tracking_number, vehicle_type } = req.body;
   if (!order_id) throw ApiError.badRequest('order_id is required');
 
   let orders;
@@ -273,41 +300,34 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
   assertCanAccessOrder(affiliationContext, orders[0]);
   assertCanManageDeliveryLink(affiliationContext, orders[0]);
   if (orders[0].payment_status !== 'paid') {
-    throw ApiError.badRequest('Payment must be verified before generating a delivery link');
+    throw ApiError.badRequest('Payment must be verified before creating the Rider Link');
   }
   if (['delivered', 'cancelled', 'rejected'].includes(orders[0].status)) {
-    throw ApiError.badRequest('Cannot generate delivery link for this order status');
-  }
-
-  const existingToken = await getLatestActiveToken(order_id);
-  if (existingToken) {
-    const [trackingRows] = await pool.execute(
-      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
-      [order_id]
-    );
-    if (trackingRows.length === 0) {
-      await pool.execute(
-        `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number)
-         VALUES (?, 'out_for_delivery', ?, ?)`,
-        [order_id, courier_id || null, courier_tracking_number || null]
-      );
-    }
-
-    const existingMagicLink = `${resolveFrontendBaseUrl(req)}/deliver/${existingToken.token}`;
-    return res.status(200).json({
-      success: true,
-      message: 'Active delivery link already exists',
-      data: {
-        token: existingToken.token,
-        magic_link: existingMagicLink,
-        expires_at: existingToken.expires_at,
-      },
-    });
+    throw ApiError.badRequest('This order is closed, so it cannot get a Rider Link');
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Lock the order so two clicks (or two staff) cannot each create a link; the loser finds the
+    // winner's link below and returns it instead.
+    await conn.execute('SELECT id FROM orders WHERE id = ? FOR UPDATE', [order_id]);
+
+    const existingToken = await getLatestActiveToken(order_id, conn);
+    if (existingToken) {
+      await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: false });
+      await conn.commit();
+      return res.status(200).json({
+        success: true,
+        message: 'This order already has an active Rider Link',
+        data: {
+          token: existingToken.token,
+          magic_link: `${resolveFrontendBaseUrl(req)}/deliver/${existingToken.token}`,
+          expires_at: existingToken.expires_at,
+          vehicle_type: vehicle_type || null,
+        },
+      });
+    }
 
     const token = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48h
@@ -317,28 +337,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
       [order_id, token, expiresAt, req.user.id]
     );
 
-    const [trackingRows] = await conn.execute(
-      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
-      [order_id]
-    );
-
-    if (trackingRows.length === 0) {
-      await conn.execute(
-        `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number)
-         VALUES (?, 'out_for_delivery', ?, ?)`,
-        [order_id, courier_id || null, courier_tracking_number || null]
-      );
-    } else {
-      await conn.execute(
-        `UPDATE delivery_tracking
-         SET status = 'out_for_delivery',
-             courier_id = COALESCE(?, courier_id),
-             courier_tracking_number = COALESCE(?, courier_tracking_number),
-             updated_at = NOW()
-         WHERE order_id = ?`,
-        [courier_id || null, courier_tracking_number || null, order_id]
-      );
-    }
+    await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: true });
 
     // Update order status to 'delivering'
     await conn.execute(`UPDATE orders SET status = 'delivering' WHERE id = ?`, [order_id]);
@@ -347,8 +346,9 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token}`;
 
-    // Notify Stockist users that order is on its way
-    const [partnerUsers] = await pool.execute(
+    // Tell the Stockist who ordered that it is on its way. A store order's partner is the center
+    // that just created this link, so there is nobody to tell.
+    const [partnerUsers] = orders[0].placed_by_type === 'public' ? [[]] : await pool.execute(
       `SELECT u.id, u.email, u.name FROM users u WHERE u.partner_id = ? AND u.is_deleted = 0 AND u.status = 'active'`,
       [orders[0].partner_id]
     );
@@ -381,7 +381,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Delivery link generated',
+      message: 'Rider Link created',
       data: { token, magic_link: magicLink, expires_at: expiresAt },
     });
   } catch (err) {
@@ -701,7 +701,7 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
     );
   }
 
-  if (tokens.length === 0) throw ApiError.notFound('Delivery link is invalid, expired, or already used');
+  if (tokens.length === 0) throw ApiError.notFound('This Rider Link is invalid, expired, or already used');
 
   const info = tokens[0];
   const [items] = await pool.execute(
@@ -760,9 +760,19 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
     // GPS data is best-effort; the delivery flow must work without it
   }
 
+  // The rider's map: road route from where they are (or the center) to the door, and an arrival
+  // window. The token already authorized this order; routing trouble only costs the map.
+  let route = null;
+  try {
+    route = await buildOrderRoute(info.order_id, UNSCOPED);
+  } catch {
+    route = null;
+  }
+
   res.json({
     success: true,
     data: {
+      route,
       order_number: info.order_number,
       customer_name: info.customer_name,
       customer_address: info.customer_address,
@@ -794,7 +804,7 @@ const completeDelivery = asyncHandler(async (req, res) => {
      WHERE dt.token = ? AND dt.is_used = 0 AND dt.expires_at > NOW() LIMIT 1`,
     [token]
   );
-  if (tokens.length === 0) throw ApiError.notFound('Delivery link is invalid, expired, or already used');
+  if (tokens.length === 0) throw ApiError.notFound('This Rider Link is invalid, expired, or already used');
 
   const { id: tokenId, order_id: orderId } = tokens[0];
   const podUrl = req.file.path; // Cloudinary URL

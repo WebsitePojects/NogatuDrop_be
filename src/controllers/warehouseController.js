@@ -5,6 +5,12 @@ const paginate = require('../utils/paginate');
 const { canonicalRole, ROLES } = require('../rbac/roles');
 const { resolveAffiliationContext } = require('../rbac/affiliationScopes');
 const { buildWarehouseListScope, canManageWarehouse } = require('../rbac/warehouseScopes');
+const { resolveAddress, hasAddressParts, readCoordinates } = require('../services/addressInput');
+const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
+const { withAdvisoryLock } = require('../utils/advisoryLock');
+
+// warehouses.location is varchar(200); the composed address text is shortened to fit.
+const LOCATION_MAX_LENGTH = 200;
 
 async function getContext(req, db = pool) {
   return resolveAffiliationContext(db, req.user);
@@ -26,10 +32,12 @@ function mobileLocationQueries(where) {
              ms.name AS manager_name, ms.email AS manager_email, ms.phone AS manager_phone,
              ms.lat, ms.lng, (ms.status = 'active') AS is_active,
              ms.created_at, ms.updated_at,
+             ${addressPartsSelect('ms', 'address')},
              p.business_name AS owner_stockist_name,
              'network' AS scope_kind, 'mobile_stockist' AS record_kind
       FROM mobile_stockists ms
       JOIN partners p ON p.id = ms.partner_id
+      ${addressPartsJoins('ms')}
       ${where}
       ORDER BY ms.name ASC`,
     countQuery: `SELECT COUNT(*) AS total FROM mobile_stockists ms ${where}`,
@@ -72,10 +80,12 @@ const getWarehouses = asyncHandler(async (req, res) => {
            ROUND((w.capacity_used / NULLIF(w.capacity_total, 0)) * 100, 1) AS capacity_percent,
            w.manager_name, w.manager_email, w.manager_phone,
            w.lat, w.lng, w.is_active, w.created_at, w.updated_at,
+           ${addressPartsSelect('w', 'location')},
            p.business_name AS owner_stockist_name,
            NULL AS scope_kind, 'warehouse' AS record_kind
     FROM warehouses w
     LEFT JOIN partners p ON p.id = w.partner_id
+    ${addressPartsJoins('w')}
     ${where}
     ORDER BY w.name ASC`;
   const countQuery = `SELECT COUNT(*) AS total FROM warehouses w ${where}`;
@@ -90,7 +100,12 @@ const getWarehouses = asyncHandler(async (req, res) => {
 async function findWarehouseForRead(req, warehouseId) {
   const context = await getContext(req);
   if (canonicalRole(context.role) === ROLES.SUPER_ADMIN) {
-    const [rows] = await pool.execute('SELECT * FROM warehouses WHERE id = ? AND is_deleted = 0 LIMIT 1', [warehouseId]);
+    const [rows] = await pool.execute(
+      `SELECT w.*, ${addressPartsSelect('w', 'location')}
+       FROM warehouses w ${addressPartsJoins('w')}
+       WHERE w.id = ? AND w.is_deleted = 0 LIMIT 1`,
+      [warehouseId]
+    );
     return { context, warehouse: rows[0] || null };
   }
 
@@ -101,7 +116,8 @@ async function findWarehouseForRead(req, warehouseId) {
   const predicate = clauses.map((scope) => `(1 = 1${scope.clause})`).join(' OR ');
   const params = clauses.flatMap((scope) => scope.params);
   const [rows] = await pool.execute(
-    `SELECT w.* FROM warehouses w
+    `SELECT w.*, ${addressPartsSelect('w', 'location')}
+     FROM warehouses w ${addressPartsJoins('w')}
      WHERE w.id = ? AND w.is_deleted = 0 AND (${predicate}) LIMIT 1`,
     [warehouseId, ...params]
   );
@@ -117,7 +133,7 @@ const getWarehouse = asyncHandler(async (req, res) => {
 const createWarehouse = asyncHandler(async (req, res) => {
   const context = await getContext(req);
   const role = canonicalRole(context.role);
-  const { name, type, location, capacity_total, manager_name, manager_email, manager_phone, lat, lng } = req.body;
+  const { name, type, capacity_total, manager_name, manager_email, manager_phone } = req.body;
   const partnerId = role === ROLES.SUPER_ADMIN ? null : context.partnerId;
   if (role === ROLES.SUPER_ADMIN && type && type !== 'manufacturer') {
     throw ApiError.forbidden('Super Admin can create only main manufacturer warehouses from this view');
@@ -128,15 +144,29 @@ const createWarehouse = asyncHandler(async (req, res) => {
   }
   const warehouseType = role === ROLES.SUPER_ADMIN ? 'manufacturer' : (type || defaultWarehouseTypeForContext(context));
 
-  const [result] = await pool.execute(
-    `INSERT INTO warehouses
-       (partner_id, name, type, location, capacity_total, manager_name, manager_email, manager_phone, lat, lng)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [partnerId, name, warehouseType, location,
-     capacity_total || 100000, manager_name, manager_email || null, manager_phone || null, lat || null, lng || null]
-  );
-  const [created] = await pool.execute('SELECT * FROM warehouses WHERE id = ?', [result.insertId]);
-  res.status(201).json({ success: true, message: 'Warehouse created', data: created[0] });
+  const address = await resolveAddress(pool, req.body, { maxLength: LOCATION_MAX_LENGTH });
+  const { lat, lng } = readCoordinates(req.body);
+
+  // warehouses has no unique index on the name, so the lock is what makes a double-click or a retry
+  // create one warehouse: the second request waits, finds the first, and gets a clean 409.
+  const created = await withAdvisoryLock('warehouse-create', `${partnerId ?? 'company'}|${name.toLowerCase()}`, async (conn) => {
+    const [duplicates] = await conn.execute(
+      'SELECT id FROM warehouses WHERE partner_id <=> ? AND name = ? AND is_deleted = 0 LIMIT 1',
+      [partnerId, name]
+    );
+    if (duplicates.length > 0) throw ApiError.conflict('A warehouse with this name already exists');
+    const [result] = await conn.execute(
+      `INSERT INTO warehouses
+         (partner_id, name, type, location, address_line, barangay_code, postal_code,
+          capacity_total, manager_name, manager_email, manager_phone, lat, lng)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [partnerId, name, warehouseType, address.text, address.addressLine, address.barangayCode, address.postalCode,
+       capacity_total || 100000, manager_name, manager_email || null, manager_phone || null, lat, lng]
+    );
+    const [rows] = await conn.execute('SELECT * FROM warehouses WHERE id = ?', [result.insertId]);
+    return rows[0];
+  });
+  res.status(201).json({ success: true, message: 'Warehouse created', data: created });
 });
 
 const updateWarehouse = asyncHandler(async (req, res) => {
@@ -151,7 +181,7 @@ const updateWarehouse = asyncHandler(async (req, res) => {
   }
 
   const allowedFields = [
-    'name', 'type', 'location', 'capacity_total', 'capacity_used', 'manager_name',
+    'name', 'type', 'capacity_total', 'capacity_used', 'manager_name',
     'manager_email', 'manager_phone', 'lat', 'lng', 'is_active',
   ];
   const fields = [];
@@ -164,6 +194,13 @@ const updateWarehouse = asyncHandler(async (req, res) => {
       fields.push(`${field} = ?`);
       values.push(req.body[field] === '' ? null : req.body[field]);
     }
+  }
+  // The street, barangay and postal code replace the stored address as a unit, and the old location
+  // text is rewritten from them.
+  if (hasAddressParts(req.body)) {
+    const address = await resolveAddress(pool, req.body, { maxLength: LOCATION_MAX_LENGTH });
+    fields.push('location = ?', 'address_line = ?', 'barangay_code = ?', 'postal_code = ?');
+    values.push(address.text, address.addressLine, address.barangayCode, address.postalCode);
   }
   if (fields.length === 0) throw ApiError.badRequest('No fields to update');
   values.push(warehouseId);

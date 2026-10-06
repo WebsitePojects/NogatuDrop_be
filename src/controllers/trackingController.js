@@ -7,7 +7,9 @@ const { buildTrackingMapSnapshot } = require('../services/trackingRoutePresenter
 const { resolveAffiliationContext, buildOrderScopeFromContext } = require('../rbac/affiliationScopes');
 const { resolveOrderPaymentAccount, toBuyerFacingAccount } = require('../services/bankAccountResolver');
 const { phonesMatch } = require('../utils/phoneMatch');
-const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
+const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
+const { buildOrderRoute, fetchWarehouseRowsByIds, fetchPrimaryWarehouseRowsByPartnerIds, UNSCOPED } = require('../services/orderRouteService');
+const { isInsidePhilippines, OUTSIDE_PH_MESSAGE } = require('../utils/phBounds');
 const {
   PUBLIC_ORDER_SHIPPING_FEE,
   reconcilePublicOrderPricing,
@@ -77,78 +79,6 @@ function scopedOrderPredicate(affiliationContext, orderAlias = 'o') {
   return buildOrderScopeFromContext(affiliationContext, { orderAlias });
 }
 
-async function fetchWarehouseRowsByIds(ids) {
-  if (!ids.length) {
-    return [];
-  }
-
-  const placeholders = ids.map(() => '?').join(', ');
-
-  try {
-    const [rows] = await pool.execute(
-      `SELECT id, partner_id, name, location, lat, lng
-       FROM warehouses
-       WHERE id IN (${placeholders}) AND is_deleted = 0`,
-      ids
-    );
-    return rows;
-  } catch (err) {
-    if (!isMissingColumn(err, 'is_deleted')) {
-      throw err;
-    }
-
-    const [rows] = await pool.execute(
-      `SELECT id, partner_id, name, location, lat, lng
-       FROM warehouses
-       WHERE id IN (${placeholders})`,
-      ids
-    );
-    return rows;
-  }
-}
-
-async function fetchPrimaryWarehouseRowsByPartnerIds(partnerIds) {
-  if (!partnerIds.length) {
-    return [];
-  }
-
-  const placeholders = partnerIds.map(() => '?').join(', ');
-
-  try {
-    const [rows] = await pool.execute(
-      `SELECT w.partner_id, w.id, w.name, w.location, w.lat, w.lng
-       FROM warehouses w
-       JOIN (
-         SELECT partner_id, MIN(id) AS first_id
-         FROM warehouses
-         WHERE partner_id IN (${placeholders}) AND is_deleted = 0
-         GROUP BY partner_id
-       ) picked
-         ON picked.first_id = w.id`,
-      partnerIds
-    );
-    return rows;
-  } catch (err) {
-    if (!isMissingColumn(err, 'is_deleted')) {
-      throw err;
-    }
-
-    const [rows] = await pool.execute(
-      `SELECT w.partner_id, w.id, w.name, w.location, w.lat, w.lng
-       FROM warehouses w
-       JOIN (
-         SELECT partner_id, MIN(id) AS first_id
-         FROM warehouses
-         WHERE partner_id IN (${placeholders})
-         GROUP BY partner_id
-       ) picked
-         ON picked.first_id = w.id`,
-      partnerIds
-    );
-    return rows;
-  }
-}
-
 // GET /api/v1/tracking/:orderId
 const getTracking = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
@@ -183,11 +113,11 @@ const getPublicTracking = asyncHandler(async (req, res) => {
   const { orderNumber } = req.params;
 
   const [rows] = await pool.execute(
-    `SELECT o.status AS order_status,
+    `SELECT o.id AS order_id, o.status AS order_status,
             o.payment_status,
             o.payment_proof_uploaded_at,
             o.source_warehouse_id,
-            dt.id AS tracking_id, dt.status AS tracking_status,
+            dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type,
             dt.est_delivery_at,
             c.name AS courier_name
      FROM orders o
@@ -211,6 +141,15 @@ const getPublicTracking = asyncHandler(async (req, res) => {
         pinged_at: latestPing.pinged_at,
       }
     : null;
+
+  let arrivalWindow = null;
+  if (gps && row.order_status === 'delivering') {
+    try {
+      arrivalWindow = (await buildOrderRoute(row.order_id, UNSCOPED)).eta;
+    } catch {
+      arrivalWindow = null; // an estimate is a nicety; tracking must still load
+    }
+  }
 
   // Fetch origin warehouse coordinates (safe to expose — no financial or personal data)
   let sourceWarehouse = null;
@@ -243,6 +182,10 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       gps,
       source_warehouse: sourceWarehouse,
       eta: row.est_delivery_at || null,
+      vehicle_type: row.vehicle_type || null,
+      // Minutes only. The road line itself is not sent: it ends at the buyer's door and anyone with
+      // the order number can open this page.
+      eta_window: arrivalWindow,
     },
   });
 });
@@ -337,8 +280,12 @@ const getActiveTracking = asyncHandler(async (req, res) => {
             ${orderCustomerAddressSql('o')} AS customer_address,
             o.source_warehouse_id,
             dt.status AS tracking_status,
+            dt.vehicle_type,
             dt.rider_name,
             dt.est_delivery_at,
+            o.customer_lat AS customer_latitude,
+            o.customer_lng AS customer_longitude,
+            ${orderIsPublicSql('o')} AS is_public,
             dt.courier_tracking_number,
             c.name AS courier_name,
             dt.updated_at,
@@ -371,8 +318,11 @@ const getActiveTracking = asyncHandler(async (req, res) => {
   const sourceWarehouseIds = Array.from(
     new Set(rows.map((row) => Number(row.source_warehouse_id)).filter((value) => Number.isFinite(value) && value > 0))
   );
+  // A store order's partner is the center that ships it, so its destination is the buyer's pin,
+  // never that partner's own warehouse. Only Stockist orders end at the Stockist's warehouse.
   const partnerIds = Array.from(
-    new Set(rows.map((row) => Number(row.partner_id)).filter((value) => Number.isFinite(value) && value > 0))
+    new Set(rows.filter((row) => !Number(row.is_public)).map((row) => Number(row.partner_id))
+      .filter((value) => Number.isFinite(value) && value > 0))
   );
 
   const [sourceWarehouses, targetWarehouses] = await Promise.all([
@@ -385,7 +335,7 @@ const getActiveTracking = asyncHandler(async (req, res) => {
 
   const data = rows.map((row) => {
     const sourceWarehouse = sourceWarehouseById.get(Number(row.source_warehouse_id)) || null;
-    const targetWarehouse = targetWarehouseByPartnerId.get(Number(row.partner_id)) || null;
+    const targetWarehouse = Number(row.is_public) ? null : (targetWarehouseByPartnerId.get(Number(row.partner_id)) || null);
     const mapSnapshot = buildTrackingMapSnapshot({
       ...row,
       source_warehouse_id: sourceWarehouse?.id || row.source_warehouse_id || null,
@@ -407,6 +357,7 @@ const getActiveTracking = asyncHandler(async (req, res) => {
       order_number: row.order_number,
       order_status: row.order_status,
       tracking_status: row.tracking_status,
+      vehicle_type: row.vehicle_type || 'motorcycle',
       courier_name: row.courier_name || null,
       courier_tracking_number: row.courier_tracking_number || null,
       rider_name: row.rider_name || null,
@@ -428,10 +379,22 @@ const getActiveTracking = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
+// GET /api/v1/tracking/:orderId/route
+const getOrderRoute = asyncHandler(async (req, res) => {
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  const data = await buildOrderRoute(req.params.orderId, scopedOrderPredicate(affiliationContext));
+  res.json({ success: true, data });
+});
+
+// A phone that reports every second would flood gps_pings; one point per window is plenty for a map.
+const MIN_PING_INTERVAL_SECONDS = 10;
+
 // POST /api/v1/tracking/ping/:token
 const postPingByToken = asyncHandler(async (req, res) => {
   const { token } = req.params;
   const { lat, lng, speed_kmh, accuracy_meters } = req.body;
+  // A pin outside the Philippines is a phone/GPS fault, not a delivery position: refuse it.
+  if (!isInsidePhilippines(lat, lng)) throw ApiError.badRequest(OUTSIDE_PH_MESSAGE);
 
   let tokens;
   try {
@@ -463,7 +426,7 @@ const postPingByToken = asyncHandler(async (req, res) => {
   }
 
   if (tokens.length === 0) {
-    throw ApiError.notFound('Delivery link is invalid, expired, or already used');
+    throw ApiError.notFound('This Rider Link is invalid, expired, or already used');
   }
 
   const tokenInfo = tokens[0];
@@ -535,11 +498,18 @@ const postPingByToken = asyncHandler(async (req, res) => {
       );
     }
 
-    await conn.execute(
-      `INSERT INTO gps_pings (tracking_id, lat, lng, speed_kmh, accuracy_meters)
-       VALUES (?, ?, ?, ?, ?)`,
-      [trackingId, lat, lng, speed_kmh || null, accuracy_meters || null]
+    // The status updates above still run, so an early ping can start the delivery; only the point is skipped.
+    const [recent] = await conn.execute(
+      `SELECT 1 FROM gps_pings WHERE tracking_id = ? AND pinged_at > NOW() - INTERVAL ? SECOND LIMIT 1`,
+      [trackingId, MIN_PING_INTERVAL_SECONDS]
     );
+    if (recent.length === 0) {
+      await conn.execute(
+        `INSERT INTO gps_pings (tracking_id, lat, lng, speed_kmh, accuracy_meters)
+         VALUES (?, ?, ?, ?, ?)`,
+        [trackingId, lat, lng, speed_kmh || null, accuracy_meters || null]
+      );
+    }
 
     await conn.commit();
   } catch (err) {
@@ -588,7 +558,7 @@ const updateTrackingStatus = asyncHandler(async (req, res) => {
   const scope = scopedOrderPredicate(affiliationContext);
 
   if (status === 'delivered') {
-    throw ApiError.badRequest('Use the courier proof-of-delivery link to mark an order delivered');
+    throw ApiError.badRequest('Only the rider can mark an order delivered, from the Rider Link');
   }
 
   const [existing] = await pool.execute(
@@ -672,6 +642,7 @@ const createTracking = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  getOrderRoute,
   getTracking,
   getPublicTracking,
   getPublicPaymentDetails,

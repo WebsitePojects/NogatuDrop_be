@@ -5,6 +5,7 @@ const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
 const { getWarehouses, getWarehouse, createWarehouse, updateWarehouse, deleteWarehouse } = require('../controllers/warehouseController');
+const { addressPartsValidators, coordinatePairValidator } = require('../services/addressInput');
 
 const router = Router();
 const { requirePermission } = roleGuard;
@@ -19,12 +20,13 @@ router.post(
   requirePermission(PERMISSIONS.WAREHOUSES_MANAGE),
   [
     body('name').trim().notEmpty().withMessage('Warehouse name is required'),
-    body('type').optional().isIn(['manufacturer', 'region', 'city']),
-    body('location').trim().notEmpty().withMessage('Location is required'),
+    body('type').optional().isIn(['manufacturer', 'region', 'city']).withMessage('Unknown warehouse type'),
     body('manager_name').trim().notEmpty().withMessage('Manager name is required'),
-    body('capacity_total').optional().isInt({ min: 1 }),
-    body('manager_email').optional().isEmail(),
+    body('capacity_total').optional().isInt({ min: 1 }).withMessage('Capacity must be a whole number above 0'),
+    body('manager_email').optional().isEmail().withMessage('Manager email must be a valid email address'),
     body('manager_phone').optional().trim(),
+    ...addressPartsValidators({ required: true }),
+    coordinatePairValidator('lat', 'lng'),
   ],
   validate,
   createWarehouse
@@ -35,11 +37,12 @@ router.put(
   requirePermission(PERMISSIONS.WAREHOUSES_MANAGE),
   param('id').isInt(),
   [
-    body('name').optional().trim().notEmpty(),
-    body('type').optional().isIn(['manufacturer', 'region', 'city']),
-    body('location').optional().trim().notEmpty(),
-    body('manager_name').optional().trim().notEmpty(),
-    body('is_active').optional().isBoolean(),
+    body('name').optional().trim().notEmpty().withMessage('Warehouse name cannot be blank'),
+    body('type').optional().isIn(['manufacturer', 'region', 'city']).withMessage('Unknown warehouse type'),
+    body('manager_name').optional().trim().notEmpty().withMessage('Manager name cannot be blank'),
+    body('is_active').optional().isBoolean().withMessage('is_active must be true or false'),
+    ...addressPartsValidators({ required: false }),
+    coordinatePairValidator('lat', 'lng'),
   ],
   validate,
   updateWarehouse

@@ -27,6 +27,7 @@ const { enqueueOrderNotifications } = require('../services/orderNotificationOutb
 const { reserveStock, releaseStock } = require('../services/batchStock');
 const { lookupMlmMember } = require('../services/mlmBridge');
 const { readPublicCustomer, assertBarangayExists } = require('../services/publicCustomerInput');
+const { readCoordinates } = require('../services/addressInput');
 const { publicPaymentDeadline } = require('../services/publicOrderPayment');
 const { phonesMatch } = require('../utils/phoneMatch');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
@@ -844,17 +845,15 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // POST /api/v1/orders/public — public order (no auth, mobile/walk-in customer)
 const createPublicOrder = asyncHandler(async (req, res) => {
-  const { customer_phone, customer_email, customer_lat, customer_lng, items, notes, payment_method } = req.body;
+  const { customer_phone, customer_email, items, notes, payment_method } = req.body;
   const customer = readPublicCustomer(req.body);
 
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
 
   // Optional pinned delivery coordinates (consent-gated on the client). Stored
   // as sensitive data — never returned by the public tracking endpoint.
-  const parsedLat = Number(customer_lat);
-  const parsedLng = Number(customer_lng);
-  const custLat = Number.isFinite(parsedLat) && parsedLat >= 4 && parsedLat <= 22 ? parsedLat : null;
-  const custLng = Number.isFinite(parsedLng) && parsedLng >= 115 && parsedLng <= 128 ? parsedLng : null;
+  // The route already refused a pin outside the Philippines or a half pair.
+  const { lat: custLat, lng: custLng } = readCoordinates(req.body, 'customer_lat', 'customer_lng');
 
   const conn = await pool.getConnection();
   try {
