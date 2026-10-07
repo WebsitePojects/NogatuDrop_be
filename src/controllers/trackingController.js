@@ -309,6 +309,8 @@ const getActiveTracking = asyncHandler(async (req, res) => {
      ) lp ON lp.tracking_id = dt.id
      WHERE o.is_deleted = 0
        AND (o.status = 'delivering' OR dt.status IN ('in_progress', 'out_for_delivery'))
+       -- a finished or stopped order is never "on the road", whatever its tracking row still says
+       AND o.status NOT IN ('delivered', 'cancelled', 'rejected')
        ${scope.clause}
      ORDER BY dt.updated_at DESC
      LIMIT 100`,
