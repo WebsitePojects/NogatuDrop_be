@@ -3,7 +3,7 @@ const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
-const { productUpload: upload } = require('../middleware/upload');
+const { productUpload: upload, uploadErrorHandler } = require('../middleware/upload');
 const { getProducts, getPublicProducts, getProduct, createProduct, updateProduct, deleteProduct } = require('../controllers/productController');
 
 const router = Router();
@@ -19,6 +19,7 @@ router.post(
   '/',
   roleGuard('super_admin'),
   upload.single('image'),
+  uploadErrorHandler,
   [
     body('name').trim().notEmpty().withMessage('Product name is required'),
     body('sku').trim().notEmpty().withMessage('SKU is required'),
@@ -37,6 +38,7 @@ router.put(
   roleGuard('super_admin'),
   param('id').isInt(),
   upload.single('image'),
+  uploadErrorHandler,
   [
     body('name').optional().trim().notEmpty(),
     body('sku').optional().trim().notEmpty(),

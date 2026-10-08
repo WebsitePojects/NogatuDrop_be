@@ -129,6 +129,9 @@ const podUpload = createUpload('pod', true, [
 // catch-all handler as an opaque 500 (which is what iPhone users were hitting:
 // HEIC rejected by fileFilter -> generic 500 -> FE showed "Upload failed").
 // Unrecognized errors are passed through untouched (fail closed, not swallowed).
+// busboy's messages for a multipart body that is cut short or malformed.
+const MALFORMED_MULTIPART = /^(Unexpected end of form|Malformed part header|Unexpected end of multipart data|Multipart: Boundary not found)/;
+
 function uploadErrorHandler(err, req, res, next) {
   if (!err) {
     return next();
@@ -140,6 +143,18 @@ function uploadErrorHandler(err, req, res, next) {
 
   if (err.code === 'INVALID_FILE_TYPE') {
     return next(ApiError.badRequest('Unsupported file type. Please upload a JPG, PNG, HEIC, or PDF.'));
+  }
+
+  // Every other multer limit (a field without a name, too many parts) and a body that ends early or has
+  // broken part headers are the sender's mistake: answer 400, never 500. These endpoints are public, so
+  // malformed requests are expected.
+  if (err instanceof multer.MulterError || MALFORMED_MULTIPART.test(String(err.message))) {
+    return next(ApiError.badRequest('The upload could not be read. Please choose the file again.'));
+  }
+
+  // Cloudinary looked inside the file and refused it (named .png but not really an image or PDF).
+  if (err.http_code === 400) {
+    return next(ApiError.badRequest('This file is not a readable image or PDF. Please upload a photo or screenshot.'));
   }
 
   if (err.statusCode === 503) {
