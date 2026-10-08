@@ -457,7 +457,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               pod.signature_hash,
               pod.signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -581,7 +581,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               pod.recipient_signature,
               pod.signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -609,7 +609,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
          WHERE w2.partner_id = o.partner_id
        )
        WHERE o.is_deleted = 0${scope.clause}
-       ORDER BY COALESCE(pod.signed_at, pod.created_at) DESC
+       ORDER BY COALESCE(pod.signed_at, pod.submitted_at) DESC
        LIMIT ?`,
       [...scope.params, limit]
     );
@@ -676,7 +676,7 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
       `SELECT dt.*, o.order_number, ${orderCustomerNameSql('o')} AS customer_name,
               ${orderCustomerAddressSql('o')} AS customer_address, o.customer_phone,
               o.customer_lat, o.customer_lng,
-              o.total_amount, o.partner_id, o.status AS order_status, o.source_warehouse_id
+              o.partner_id, o.status AS order_status, o.source_warehouse_id
        FROM delivery_tokens dt
        JOIN orders o ON o.id = dt.order_id
        ${orderCustomerJoins('o')}
@@ -691,7 +691,7 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
       `SELECT dt.*, o.order_number, ${orderCustomerNameSql('o')} AS customer_name,
               ${orderCustomerAddressSql('o')} AS customer_address, o.customer_phone,
               NULL AS customer_lat, NULL AS customer_lng,
-              o.total_amount, o.partner_id, o.status AS order_status, NULL AS source_warehouse_id
+              o.partner_id, o.status AS order_status, NULL AS source_warehouse_id
        FROM delivery_tokens dt
        JOIN orders o ON o.id = dt.order_id
        ${orderCustomerJoins('o')}
@@ -704,8 +704,10 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
   if (tokens.length === 0) throw ApiError.notFound('Delivery link is invalid, expired, or already used');
 
   const info = tokens[0];
+  // No prices on the rider page: every order is paid before it ships (no COD), and anyone holding
+  // the link could read them.
   const [items] = await pool.execute(
-    `SELECT p.name AS product_name, oi.quantity, oi.unit_price
+    `SELECT p.name AS product_name, oi.quantity
      FROM order_items oi JOIN products p ON p.id = oi.product_id
      WHERE oi.order_id = ?`,
     [info.order_id]
@@ -767,7 +769,6 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
       customer_name: info.customer_name,
       customer_address: info.customer_address,
       customer_phone: info.customer_phone,
-      total_amount: info.total_amount,
       items,
       source_warehouse: sourceWarehouse,
       // Destination = the buyer's pinned coordinates (if they consented) so the
