@@ -2,7 +2,7 @@ const { Router } = require('express');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
-const { podUpload } = require('../middleware/upload');
+const { podUpload, uploadErrorHandler } = require('../middleware/upload');
 const c = require('../controllers/deliveryTokenController');
 const { body } = require('express-validator');
 const validate = require('../middleware/validate');
@@ -30,6 +30,6 @@ r.get('/pods', auth, requirePermission(PERMISSIONS.ORDERS_VIEW), c.listDeliveryP
 r.get('/pods/by-order/:orderId', auth, requirePermission(PERMISSIONS.ORDERS_VIEW), c.getDeliveryProofForOrder);
 
 r.get('/deliver/:token', c.getDeliveryInfo);
-r.post('/deliver/:token/complete', podUpload.single('photo'), c.completeDelivery);
+r.post('/deliver/:token/complete', podUpload.single('photo'), uploadErrorHandler, c.completeDelivery);
 
 module.exports = r;
