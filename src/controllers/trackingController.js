@@ -1,3 +1,4 @@
+const { amountStillOwed } = require('../services/orderBalance');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -109,6 +110,10 @@ const getTracking = asyncHandler(async (req, res) => {
 // GET /api/v1/tracking/public/:orderNumber
 // Anyone holding an order number sees its progress, courier, live GPS and ETA. Money and the payment
 // account are NOT here: they need the buyer's phone (POST .../payment-details), per management 2026-10-05.
+// The public page may say "you owe more" but never how much (that needs the buyer's phone), so the check
+// runs in SQL and no peso amount is read on this path.
+const OWES_MORE_SQL = '(o.payment_covered_total IS NOT NULL AND o.payment_covered_total < o.total_amount)';
+
 const getPublicTracking = asyncHandler(async (req, res) => {
   const { orderNumber } = req.params;
 
@@ -116,6 +121,7 @@ const getPublicTracking = asyncHandler(async (req, res) => {
     `SELECT o.id AS order_id, o.status AS order_status,
             o.payment_status,
             o.payment_proof_uploaded_at,
+            ${OWES_MORE_SQL} AS owes_more,
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type,
             dt.est_delivery_at,
@@ -178,6 +184,9 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       payment_proof_uploaded_at: row.payment_proof_uploaded_at || null,
       // Tells the page to offer the phone check; true while the buyer may still need to pay.
       payment_due: isPaymentDue(row),
+      // The delivery fee went up after the buyer's receipt: the page asks for the phone again and offers a
+      // second upload. Only a yes/no here; the amount needs the phone check.
+      extra_payment_due: isPaymentDue(row) && Boolean(row.owes_more),
       courier: row.courier_name || null,
       gps,
       source_warehouse: sourceWarehouse,
@@ -203,6 +212,8 @@ const getPublicPaymentDetails = asyncHandler(async (req, res) => {
             o.payment_status,
             o.customer_phone,
             o.total_amount,
+            o.payment_covered_total,
+            o.payment_proof_url,
             o.merchandise_subtotal,
             o.member_discount_amount,
             o.shipping_fee,
@@ -233,6 +244,8 @@ const getPublicPaymentDetails = asyncHandler(async (req, res) => {
       payment_due: isPaymentDue(row),
       payment_deadline: row.payment_deadline || null,
       total_amount: Number(row.total_amount || 0),
+      receipt_uploaded: Boolean(row.payment_proof_url),
+      amount_still_owed: amountStillOwed(row),
       pricing_breakdown: buildTrackingPricingBreakdown(row),
       bank_account: toBuyerFacingAccount(bankAccount),
     },

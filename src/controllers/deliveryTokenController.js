@@ -457,7 +457,7 @@ const getDeliveryProofForOrder = asyncHandler(async (req, res) => {
               pod.signature_hash,
               pod.signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -581,7 +581,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
               pod.recipient_signature,
               pod.signed_at,
               pod.notes,
-              pod.created_at AS pod_created_at,
+              pod.submitted_at AS pod_created_at,
               o.order_number,
               o.status AS order_status,
               o.partner_id,
@@ -609,7 +609,7 @@ const listDeliveryProofs = asyncHandler(async (req, res) => {
          WHERE w2.partner_id = o.partner_id
        )
        WHERE o.is_deleted = 0${scope.clause}
-       ORDER BY COALESCE(pod.signed_at, pod.created_at) DESC
+       ORDER BY COALESCE(pod.signed_at, pod.submitted_at) DESC
        LIMIT ?`,
       [...scope.params, limit]
     );

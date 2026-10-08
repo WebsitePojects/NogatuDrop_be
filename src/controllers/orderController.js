@@ -37,8 +37,11 @@ const {
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
   canVerifyPaymentFromContext,
+  canChangeShippingFeeFromContext,
 } = require('../rbac/affiliationScopes');
 const { PARTNER_LEVELS } = require('../rbac/roles');
+const { findTerritoryStockists } = require('../services/territoryRouting');
+const { toCents, totalWithShippingFee, amountStillOwed, amountOverpaid } = require('../services/orderBalance');
 
 const isMissingSoftDeleteColumn = (err) => (
   err &&
@@ -203,9 +206,8 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
-// Public (storefront + influencer) orders are fulfilled ONLY by company fulfillment centers.
-// A Stockist never fulfils them and there is deliberately no fallback to one: if no center can
-// serve the order the customer gets a clear 409 instead of the order leaking to a Stockist.
+// Company fulfillment centers. They take every store order outside a Stockist territory, every order a
+// territory Stockist cannot fill from stock, and every affiliate-link order (management, 2026-10-08).
 async function listPublicFulfillmentCandidates(db) {
   const [rows] = await db.execute(
     `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
@@ -302,10 +304,30 @@ function rankPublicFulfillmentCandidates(candidates, { customerLat, customerLng 
     .map(({ candidate }) => candidate);
 }
 
+/**
+ * Who fulfils a store order. The Stockist whose territory holds the buyer's barangay, when it has every
+ * item in stock; otherwise (and always for affiliate-link orders, `centersOnly`) the best center.
+ * `payment_warehouse_id` is whose accounts the buyer pays: always a center's, because store-order money goes
+ * to Nogatu even when a Stockist ships it (management, 2026-10-08).
+ */
 async function resolvePublicFulfillmentRoute(db, items, location = {}) {
   const candidates = await listPublicFulfillmentCandidates(db);
   if (candidates.length === 0) {
     throw ApiError.serviceUnavailable('No fulfillment center is available to handle this order');
+  }
+  const nearestCenter = rankPublicFulfillmentCandidates(candidates, location)[0];
+
+  if (!location.centersOnly) {
+    for (const stockist of await findTerritoryStockists(db, location.barangayCode)) {
+      if ((await canWarehouseFulfillItems(db, stockist.warehouse_id, items)).ok) {
+        return {
+          partner_id: stockist.partner_id,
+          warehouse_id: stockist.warehouse_id,
+          payment_warehouse_id: nearestCenter.warehouse_id,
+          routed_by: 'territory',
+        };
+      }
+    }
   }
 
   const capable = [];
@@ -326,7 +348,8 @@ async function resolvePublicFulfillmentRoute(db, items, location = {}) {
     );
   }
 
-  return rankPublicFulfillmentCandidates(capable, location)[0];
+  const center = rankPublicFulfillmentCandidates(capable, location)[0];
+  return { ...center, payment_warehouse_id: center.warehouse_id, routed_by: 'center' };
 }
 
 // ─── Helper: notify users of a partner ───────────────────────────────────────
@@ -635,8 +658,112 @@ const getOrder = asyncHandler(async (req, res) => {
   );
   order.items = items;
   order.pricing_breakdown = buildOrderPricingBreakdown(order, items);
+  order.amount_still_owed = amountStillOwed(order);
+  order.amount_overpaid = amountOverpaid(order);
+  order.can_change_shipping_fee = canChangeShippingFeeFromContext(affiliationContext, order)
+    && ['pending', 'approved'].includes(order.status) && order.payment_status !== 'paid';
+
+  const [[proofs], [feeChanges]] = await Promise.all([
+    pool.execute(
+      `SELECT id, proof_url, covers_total, kind, uploaded_at
+       FROM order_payment_proofs WHERE order_id = ? ORDER BY uploaded_at ASC, id ASC`,
+      [order.id]
+    ),
+    pool.execute(
+      `SELECT f.id, f.old_shipping_fee, f.new_shipping_fee, f.old_total, f.new_total, f.reason,
+              f.created_at, u.name AS adjusted_by_name
+       FROM order_fee_adjustments f LEFT JOIN users u ON u.id = f.adjusted_by
+       WHERE f.order_id = ? ORDER BY f.created_at ASC, f.id ASC`,
+      [order.id]
+    ),
+  ]);
+  order.payment_proofs = proofs;
+  order.fee_adjustments = feeChanges;
 
   res.json({ success: true, data: order });
+});
+
+// PATCH /api/v1/orders/:id/shipping-fee  { shipping_fee, reason }
+// Staff change a store order's delivery fee before payment is verified, for example a bulk order or a far
+// address (management, 2026-10-08), instead of cancelling it. Only the fee and the total move; VAT is on
+// merchandise. Duplicate-safe: the row is locked, the UPDATE is conditional on the fee it read, and asking
+// for the fee the order already has is a no-op that returns the current amounts.
+const changeShippingFee = asyncHandler(async (req, res) => {
+  const orderId = req.params.id;
+  const newFee = Number(req.body.shipping_fee);
+  const reason = String(req.body.reason || '').trim();
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.execute(
+      `SELECT id, order_number, partner_id, status, payment_status, placed_by_type, shipping_fee,
+              total_amount, payment_covered_total
+       FROM orders WHERE id = ? AND is_deleted = 0 FOR UPDATE`,
+      [orderId]
+    );
+    if (rows.length === 0) throw ApiError.notFound('Order not found');
+    const order = rows[0];
+
+    const affiliationContext = await resolveAffiliationContext(conn, req.user);
+    if (!canChangeShippingFeeFromContext(affiliationContext, order)) {
+      throw ApiError.forbidden('You do not have permission to change the delivery fee on this order');
+    }
+    if (order.payment_status === 'paid') {
+      throw ApiError.conflict('Payment is already verified, so the delivery fee can no longer change');
+    }
+    if (!['pending', 'approved'].includes(order.status)) {
+      throw ApiError.conflict('The delivery fee can only change before the order ships');
+    }
+
+    const amounts = (o) => ({
+      shipping_fee: Number(o.shipping_fee),
+      total_amount: Number(o.total_amount),
+      amount_still_owed: amountStillOwed(o),
+      amount_overpaid: amountOverpaid(o),
+    });
+    if (toCents(order.shipping_fee) === toCents(newFee)) {
+      await conn.commit();
+      return res.json({ success: true, message: 'The delivery fee is already this amount', data: amounts(order) });
+    }
+
+    const newTotal = totalWithShippingFee(order, newFee);
+    const [updated] = await conn.execute(
+      `UPDATE orders SET shipping_fee = ?, total_amount = ?
+       WHERE id = ? AND shipping_fee = ? AND payment_status <> 'paid'`,
+      [newFee, newTotal, orderId, order.shipping_fee]
+    );
+    if (updated.affectedRows !== 1) {
+      throw ApiError.conflict('This order changed while you were editing it. Refresh and try again.');
+    }
+    await conn.execute(
+      `INSERT INTO order_fee_adjustments
+         (order_id, old_shipping_fee, new_shipping_fee, old_total, new_total, reason, adjusted_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [orderId, order.shipping_fee, newFee, order.total_amount, newTotal, reason, req.user.id]
+    );
+    if (req.user.role_slug !== 'super_admin') {
+      await notifySuperAdmins(
+        conn, 'system',
+        `Delivery fee changed: #${order.order_number}`,
+        `Delivery fee for #${order.order_number} changed from ₱${Number(order.shipping_fee).toFixed(2)} to ₱${newFee.toFixed(2)}: ${reason}`,
+        orderId
+      );
+    }
+    await conn.commit();
+    await cache.delPattern('dashboard:*');
+
+    res.json({
+      success: true,
+      message: 'Delivery fee updated',
+      data: amounts({ ...order, shipping_fee: newFee, total_amount: newTotal }),
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 });
 
 // POST /api/v1/orders — checkout cart (authenticated stockist)
@@ -916,18 +1043,21 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems, {
       customerLat: custLat,
       customerLng: custLng,
+      barangayCode: customer.barangayCode,
+      centersOnly: Boolean(req.influencerContext), // affiliate-link sales are always Caloocan or Tycoon
     });
     const partnerId = fulfillmentRoute.partner_id;
     const sourceWarehouseId = fulfillmentRoute.warehouse_id;
+    const paymentWarehouseId = fulfillmentRoute.payment_warehouse_id;
 
     normalizeOrderPaymentMethod(payment_method);
     const codAmount = 0;
     const orderNumber = await generateOrderNum('PUB', 'orders', 'order_number');
     const paymentDeadline = publicPaymentDeadline();
-    let bankAccount = await getBankAccountForWarehouseOrDefault(conn, sourceWarehouseId);
+    let bankAccount = await getBankAccountForWarehouseOrDefault(conn, paymentWarehouseId);
     if (req.body.payment_provider) {
-      const accounts = await getPublicPaymentAccounts(conn, sourceWarehouseId);
-      bankAccount = selectPublicPaymentAccount(accounts, req.body.payment_provider, sourceWarehouseId);
+      const accounts = await getPublicPaymentAccounts(conn, paymentWarehouseId);
+      bankAccount = selectPublicPaymentAccount(accounts, req.body.payment_provider, paymentWarehouseId);
     }
     assertBankAccountAvailable(bankAccount);
 
@@ -1387,6 +1517,7 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   const normalizedOrderNumber = String(order_number).trim().toUpperCase();
   const [orders] = await pool.execute(
     `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status, o.payment_proof_url,
+            o.total_amount, o.payment_covered_total,
             ${orderCustomerNameSql('o')} AS customer_name, o.customer_phone
      FROM orders o
      WHERE o.order_number = ?
@@ -1407,7 +1538,10 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   if (orders[0].payment_status === 'paid') {
     throw ApiError.badRequest('Payment has already been verified for this order');
   }
-  if (orders[0].payment_proof_url) {
+  // A second receipt is accepted only for money still owed after staff raised the delivery fee
+  // (management, 2026-10-08); otherwise one receipt per order, as before.
+  const isAdditional = Boolean(orders[0].payment_proof_url);
+  if (isAdditional && amountStillOwed(orders[0]) === 0) {
     throw ApiError.conflict('Payment proof has already been uploaded for this order');
   }
 
@@ -1417,16 +1551,28 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    // Conditional on "no receipt yet, or receipts cover less than the total": two submits at once both
+    // wait on the row lock and the second finds nothing left to cover, so it gets a 409.
     const [proofUpdate] = await conn.execute(
-      `UPDATE orders SET payment_proof_url = ?, payment_proof_uploaded_at = NOW() WHERE id = ? AND payment_proof_url IS NULL`,
+      `UPDATE orders
+       SET payment_proof_url = ?, payment_proof_uploaded_at = NOW(), payment_covered_total = total_amount
+       WHERE id = ? AND payment_status <> 'paid'
+         AND (payment_proof_url IS NULL OR payment_covered_total < total_amount)`,
       [proofUrl, orderId]
     );
     if (proofUpdate.affectedRows !== 1) throw ApiError.conflict('Payment proof has already been uploaded for this order');
+    await conn.execute(
+      `INSERT INTO order_payment_proofs (order_id, proof_url, covers_total, kind)
+       SELECT id, ?, total_amount, ? FROM orders WHERE id = ?`,
+      [proofUrl, isAdditional ? 'additional' : 'payment', orderId]
+    );
 
     const admins = await notifySuperAdmins(
       conn, 'payment_proof_uploaded',
-      `Payment Proof: #${orders[0].order_number}`,
-      `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`,
+      `${isAdditional ? 'Extra payment proof' : 'Payment Proof'}: #${orders[0].order_number}`,
+      isAdditional
+        ? `The buyer uploaded a receipt for the delivery fee difference on order #${orders[0].order_number}. Please verify.`
+        : `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`,
       orderId
     );
     await conn.commit();
@@ -1458,7 +1604,8 @@ const verifyPayment = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     const [orders] = await conn.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status,
-              o.payment_proof_url, o.total_amount, o.placed_by_type, r.slug AS placed_by_role_slug
+              o.payment_proof_url, o.total_amount, o.payment_covered_total, o.placed_by_type,
+              r.slug AS placed_by_role_slug
        FROM orders o
        LEFT JOIN users u ON u.id = o.placed_by
        LEFT JOIN roles r ON r.id = u.role_id
@@ -1525,6 +1672,7 @@ module.exports = {
   verifyPayment,
   archiveOrder,
   unarchiveOrder,
+  changeShippingFee,
   __testables: {
     buildOrderScope,
     getPublicOrderPlacedByUserId,

@@ -13,6 +13,7 @@ const {
   approveOrder, rejectOrder, cancelOrder,
   uploadPaymentProof, verifyPayment,
   archiveOrder, unarchiveOrder,
+  changeShippingFee,
 } = require('../controllers/orderController');
 
 const { PUBLIC_ORDER_MAX_QUANTITY_PER_LINE } = require('../services/publicOrderLimits');
@@ -98,6 +99,19 @@ router.patch('/:id/cancel', requirePermission(PERMISSIONS.ORDERS_CANCEL), cancel
 
 // Stockist uploads payment proof (Cloudinary)
 router.post('/:id/payment-proof', requirePermission(PERMISSIONS.ORDERS_UPLOAD_PAYMENT_PROOF), paymentProofUpload.single('proof'), uploadErrorHandler, uploadPaymentProof);
+
+// Staff change a store order's delivery fee before payment is verified (who may: affiliationScopes).
+router.patch(
+  '/:id/shipping-fee',
+  requirePermission(PERMISSIONS.ORDERS_APPROVE),
+  [
+    param('id').isInt({ min: 1 }).withMessage('Invalid order'),
+    body('shipping_fee').isFloat({ min: 0, max: 100000 }).withMessage('Enter a delivery fee from 0 to 100,000'),
+    body('reason').isString().trim().isLength({ min: 3, max: 255 }).withMessage('Give a short reason (3 to 255 characters)'),
+  ],
+  validate,
+  changeShippingFee
+);
 
 // Super admin verifies payment proof
 router.patch('/:id/verify-payment', requirePermission(PERMISSIONS.ORDERS_VERIFY_PAYMENT), verifyPayment);

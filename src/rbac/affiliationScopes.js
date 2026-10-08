@@ -198,6 +198,13 @@ function canApproveOrderFromContext(context, order) {
     return false;
   }
 
+  // A store order is approved and shipped by whoever it was routed to: a center, or the Stockist whose
+  // territory the buyer is in (management, 2026-10-08). Nobody else at partner level touches it.
+  if (order?.placed_by_type === 'public') {
+    return orderPartnerId === partnerId
+      && [PARTNER_LEVELS.CENTER, ROLES.PROVINCIAL_STOCKIST, ROLES.CITY_STOCKIST].includes(partnerLevel);
+  }
+
   if (partnerLevel === ROLES.CITY_STOCKIST) {
     return orderPartnerId === partnerId && placedByRoleSlug === ROLES.MOBILE_STOCKIST;
   }
@@ -211,22 +218,26 @@ function canApproveOrderFromContext(context, order) {
       && (placedByRoleSlug === ROLES.CITY_STOCKIST || placedByRoleSlug === ROLES.STAFF);
   }
 
-  if (partnerLevel === PARTNER_LEVELS.CENTER) {
-    // A fulfillment center accepts the store orders routed to it (management, 2026-10-06), so its
-    // staff approve and ship those. Orders from Stockists are never a center's to approve.
-    return orderPartnerId === partnerId && order?.placed_by_type === 'public';
-  }
-
-  // Any other level is unknown here and fails closed: only Super Admin (handled above) approves.
+  // A center's only orders are store orders (handled above). Any other level is unknown here and fails
+  // closed: only Super Admin (handled above) approves.
   return false;
 }
 
 function canVerifyPaymentFromContext(context, order) {
-  // Confirming money on a center's orders stays with Super Admin until management hands it to staff.
+  // Store-order money goes to the company account, so Super Admin confirms it (management, 2026-10-08),
+  // whoever ships the order. Centers verify nothing until management hands it to staff.
+  if (order?.placed_by_type === 'public' && canonicalRole(context?.role) !== ROLES.SUPER_ADMIN) {
+    return false;
+  }
   if (canonicalRole(context?.partnerLevel) === PARTNER_LEVELS.CENTER) {
     return false;
   }
   return canApproveOrderFromContext(context, order);
+}
+
+/** Changing a store order's delivery fee: Super Admin, or the center/Stockist shipping it. */
+function canChangeShippingFeeFromContext(context, order) {
+  return order?.placed_by_type === 'public' && canApproveOrderFromContext(context, order);
 }
 
 function canManageDeliveryLinkFromContext(context, order) {
@@ -239,6 +250,7 @@ module.exports = {
   canApproveOrderFromContext,
   canVerifyPaymentFromContext,
   canManageDeliveryLinkFromContext,
+  canChangeShippingFeeFromContext,
   __testables: {
     getPlacedByRoleExpression,
   },
