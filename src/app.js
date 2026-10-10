@@ -135,6 +135,8 @@ if (env.RATE_LIMIT_ENABLED) {
   }, 'rl:auth:');
   app.use('/api/v1/auth/login', authLimiter);
   app.use('/api/v1/auth/forgot-password', authLimiter);
+  // Reset codes are 6 digits: the per-code attempt limit stops guessing one code, this stops cycling codes.
+  app.use('/api/v1/auth/reset-password', authLimiter);
 
   const publicOrderLimiter = createRateLimiter({
     windowMs: 15 * 60 * 1000,

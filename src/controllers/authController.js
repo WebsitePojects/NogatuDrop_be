@@ -1,7 +1,6 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
-const redis = require('../config/redis');
 const env = require('../config/env');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -13,6 +12,7 @@ const {
 const { countryForIp, manilaHour, evaluateLoginRisk } = require('../services/loginRisk');
 const { recordLoginEvent, loadRiskHistory, notifySuperAdminsInApp } = require('../services/loginSecurityService');
 const { createLoginChallenge, verifyLoginChallenge } = require('../services/loginChallengeService');
+const { createPasswordResetCode, verifyPasswordResetCode } = require('../services/passwordResetService');
 
 function isBcryptHash(value = '') {
   return /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(value);
@@ -67,6 +67,14 @@ function verifyPassword(user, password) {
   return bcrypt.compare(String(password ?? ''), user.password);
 }
 
+// Compared against when the account does not exist, so "no such account" takes as long as "wrong
+// password" and the response time does not reveal which emails are registered. Hashed once at startup,
+// so even the first unknown-account attempt costs exactly one compare.
+const decoyHashPromise = bcrypt.hash('decoy-password-never-matches', 12);
+function spendDecoyCompare(password) {
+  return decoyHashPromise.then((hash) => bcrypt.compare(String(password ?? ''), hash));
+}
+
 // The request facts every sign-in decision uses. req.ip is the client address (trust proxy is set).
 function signInContext(req) {
   const ip = req.ip || null;
@@ -107,19 +115,23 @@ function userPayload(user) {
   };
 }
 
-/** Starts a session (row + cookie) and sends the signed-in response shared by login and code verification. */
-async function startSessionAndRespond(res, user, context) {
+/** Starts a session row for a signed-in user. Respond with signedInResponse only after recording the event. */
+async function startSession(user, context) {
   const session = await createSession(pool, {
     userId: user.id, ip: context.ip, country: context.country, userAgent: context.userAgent,
   });
   await pool.execute('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
+  return session;
+}
+
+/** The signed-in response shared by login and code verification: refresh cookie + access token. */
+function signedInResponse(res, user, session) {
   res.cookie(REFRESH_COOKIE, session.refreshToken, { ...refreshCookieOptions(), maxAge: session.maxAgeMs });
   res.json({
     success: true,
     message: 'Login successful',
     data: { access_token: accessTokenFor(user, session.sessionId), user: userPayload(user) },
   });
-  return session.sessionId;
 }
 
 function maskEmail(email) {
@@ -136,10 +148,8 @@ const login = asyncHandler(async (req, res) => {
 
   const user = await findUserForLogin(identifierLower);
   if (!user) {
+    await spendDecoyCompare(password);
     throw ApiError.unauthorized('Invalid email or password');
-  }
-  if (user.status !== 'active') {
-    throw ApiError.unauthorized('Account is inactive or suspended');
   }
 
   const context = signInContext(req);
@@ -147,13 +157,19 @@ const login = asyncHandler(async (req, res) => {
     await recordLoginEvent(pool, { userId: user.id, outcome: 'bad_password', ...context });
     throw ApiError.unauthorized('Invalid email or password');
   }
+  // Checked only after the password, so the account's status is never revealed to someone without it.
+  if (user.status !== 'active') {
+    throw ApiError.unauthorized('Account is inactive or suspended');
+  }
 
   const history = await loadRiskHistory(pool, user.id);
   const flags = evaluateLoginRisk({ ...history, country: context.country, hour: context.hour });
 
   if (flags.length === 0) {
-    const sessionId = await startSessionAndRespond(res, user, context);
-    await recordLoginEvent(pool, { userId: user.id, outcome: 'success', ...context, sessionId });
+    // The event is recorded before responding: it is the history the next sign-in's checks read.
+    const session = await startSession(user, context);
+    await recordLoginEvent(pool, { userId: user.id, outcome: 'success', ...context, sessionId: session.sessionId });
+    signedInResponse(res, user, session);
     return;
   }
 
@@ -219,11 +235,12 @@ const verifyLogin = asyncHandler(async (req, res) => {
     throw ApiError.unauthorized('Account is inactive or suspended');
   }
 
-  const sessionId = await startSessionAndRespond(res, user, signInContext(req));
+  const session = await startSession(user, signInContext(req));
   await pool.execute(
     "UPDATE login_events SET outcome = 'code_passed', session_id = ? WHERE id = ?",
-    [sessionId, result.loginEventId]
+    [session.sessionId, result.loginEventId]
   );
+  signedInResponse(res, user, session);
 });
 
 // POST /api/v1/auth/logout — ends only this device's session (identified by its refresh cookie).
@@ -313,13 +330,11 @@ const forgotPassword = asyncHandler(async (req, res) => {
   }
 
   const user = users[0];
-  const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit OTP
-  const ttlSeconds = 15 * 60; // 15 minutes
-
-  await redis.setex(`otp:reset:${user.id}`, ttlSeconds, otp);
-
-  const tmpl = EMAIL.passwordReset(otp);
-  await sendEmail({ to: user.email, toName: user.name, ...tmpl });
+  const issued = await createPasswordResetCode(pool, { userId: user.id });
+  if (issued) {
+    const tmpl = EMAIL.passwordReset(issued.code);
+    await sendEmail({ to: user.email, toName: user.name, ...tmpl });
+  }
 
   res.json({ success: true, message: 'If that email exists, a reset code has been sent.' });
 });
@@ -337,18 +352,28 @@ const resetPassword = asyncHandler(async (req, res) => {
   if (users.length === 0) throw ApiError.badRequest('Invalid reset request');
 
   const userId = users[0].id;
-  const storedOtp = await redis.get(`otp:reset:${userId}`);
-
-  if (!storedOtp || storedOtp !== otp) {
-    throw ApiError.badRequest('Invalid or expired reset code');
+  // The code is checked before the password is hashed, so a wrong guess costs the server no bcrypt work.
+  const status = await verifyPasswordResetCode(pool, { userId, code: String(otp) });
+  if (status !== 'ok') {
+    throw ApiError.badRequest(status === 'invalid'
+      ? 'That reset code is not correct. Check the email and try again.'
+      : 'This reset code has expired or was tried too many times. Please request a new one.');
   }
+  const hashed = await bcrypt.hash(String(new_password), 12);
 
-  const hashed = await bcrypt.hash(new_password, 12);
-  await pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashed, userId]);
-  await redis.del(`otp:reset:${userId}`);
-
-  // A password change ends every signed-in device.
-  await revokeAllSessions(pool, userId, SESSION_REVOKE_REASONS.PASSWORD_RESET);
+  // The new password and the end of every signed-in device commit together.
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute('UPDATE users SET password = ? WHERE id = ?', [hashed, userId]);
+    await revokeAllSessions(conn, userId, SESSION_REVOKE_REASONS.PASSWORD_RESET);
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 
   res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
 });

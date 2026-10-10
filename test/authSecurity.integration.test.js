@@ -12,6 +12,7 @@ let pool;
 let sessions;
 let challenges;
 let security;
+let resets;
 let userId;
 
 test.before(async () => {
@@ -20,6 +21,7 @@ test.before(async () => {
   sessions = require('../src/services/sessionService');
   challenges = require('../src/services/loginChallengeService');
   security = require('../src/services/loginSecurityService');
+  resets = require('../src/services/passwordResetService');
 
   const [[role]] = await pool.execute("SELECT id FROM roles WHERE slug = 'super_admin' LIMIT 1");
   const stamp = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -152,4 +154,44 @@ test('each flagged sign-in alert is emailed once even with two workers, and fail
   assert.equal(failed.alert_status, 'failed');
   assert.equal(Number(failed.alert_attempts), 5);
   assert.equal(failed.alert_last_error, 'brevo down');
+});
+
+// Password reset codes (audit AUD-08): the guess limit must hold under parallel requests.
+async function newResetCode() {
+  await pool.execute('DELETE FROM password_reset_codes WHERE user_id = ?', [userId]); // test rows only: reset the hourly cap
+  return resets.createPasswordResetCode(pool, { userId });
+}
+
+test('reset code: parallel wrong guesses stop at 5, then even the right code is refused', opts, async () => {
+  const { code } = await newResetCode();
+  const wrong = code === '000000' ? '111111' : '000000';
+  const results = await Promise.all(Array.from({ length: 8 }, () => resets.verifyPasswordResetCode(pool, { userId, code: wrong })));
+  assert.equal(results.filter((r) => r === 'invalid').length, 5);
+  assert.equal(results.filter((r) => r === 'expired').length, 3);
+  assert.equal(await resets.verifyPasswordResetCode(pool, { userId, code }), 'expired');
+});
+
+test('reset code: the right code three times at once resets the password once', opts, async () => {
+  const { code } = await newResetCode();
+  const results = await Promise.all([1, 2, 3].map(() => resets.verifyPasswordResetCode(pool, { userId, code })));
+  assert.equal(results.filter((r) => r === 'ok').length, 1);
+  assert.equal(await resets.verifyPasswordResetCode(pool, { userId, code }), 'expired', 'a used code cannot be reused');
+});
+
+test('reset code: asking again retires the earlier code; an expired code is refused', opts, async () => {
+  const first = await newResetCode();
+  const second = await resets.createPasswordResetCode(pool, { userId });
+  if (first.code !== second.code) {
+    assert.equal(await resets.verifyPasswordResetCode(pool, { userId, code: first.code }), 'invalid', 'only the newest email works');
+  }
+  await pool.execute('UPDATE password_reset_codes SET expires_at = NOW() - INTERVAL 1 SECOND WHERE user_id = ?', [userId]);
+  assert.equal(await resets.verifyPasswordResetCode(pool, { userId, code: second.code }), 'expired');
+});
+
+test('reset code: at most 5 codes per account per hour', opts, async () => {
+  await newResetCode();
+  const more = [];
+  for (let i = 0; i < 5; i += 1) more.push(await resets.createPasswordResetCode(pool, { userId }));
+  assert.equal(more.filter(Boolean).length, 4, 'the sixth request in an hour gets no code');
+  await pool.execute('DELETE FROM password_reset_codes WHERE user_id = ?', [userId]);
 });

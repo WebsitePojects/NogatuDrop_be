@@ -4,9 +4,12 @@
 //   login_events      every sign-in attempt with its risk flags; flagged rows double as the outbox for
 //                     the Super Admin alert email (alert_* columns, lease-claimed by the alert cron).
 //   login_challenges  the 6-digit code emailed when a sign-in is flagged (hash only, 10-minute TTL).
+//   password_reset_codes  the 6-digit password reset code (hash only, 15 minutes, 5 guesses); replaces
+//                     the Redis key, which lived in process memory on prod where Redis is off.
 //
-// Additive and idempotent (CREATE TABLE IF NOT EXISTS). Refuses to run without an env file.
-// Run: node --env-file=.env.dev scripts/addAuthSecurity.js
+// Additive and idempotent (CREATE TABLE IF NOT EXISTS). Dry run by default; --apply creates the tables.
+// Refuses to run without an env file.
+// Run: node --env-file=.env.dev scripts/addAuthSecurity.js [--apply]
 const mysql = require('mysql2/promise');
 
 const STATEMENTS = [
@@ -67,9 +70,23 @@ const STATEMENTS = [
      CONSTRAINT fk_login_challenges_user FOREIGN KEY (user_id) REFERENCES users(id),
      CONSTRAINT fk_login_challenges_event FOREIGN KEY (login_event_id) REFERENCES login_events(id)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS password_reset_codes (
+     id CHAR(36) NOT NULL,
+     user_id BIGINT UNSIGNED NOT NULL,
+     code_hash CHAR(64) NOT NULL,
+     attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+     expires_at DATETIME NOT NULL,
+     consumed_at DATETIME NULL,
+     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     KEY idx_password_reset_codes_user (user_id, created_at),
+     CONSTRAINT fk_password_reset_codes_user FOREIGN KEY (user_id) REFERENCES users(id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ];
 
 async function main() {
+  const apply = process.argv.includes('--apply');
   if (!process.env.DB_NAME) {
     throw new Error('DB_NAME is not set. Run with --env-file=<.env.dev|.env.prod>.');
   }
@@ -81,15 +98,23 @@ async function main() {
     database: process.env.DB_NAME,
   });
   try {
+    console.log(`Database: ${process.env.DB_NAME}  mode: ${apply ? 'APPLY' : 'dry run'}`);
     for (const sql of STATEMENTS) {
       const table = /CREATE TABLE IF NOT EXISTS (\w+)/.exec(sql)[1];
       const [existing] = await conn.execute(
         'SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1',
         [table]
       );
-      await conn.query(sql);
-      console.log(existing.length ? `${table} already exists — skipping` : `Created ${table}`);
+      if (existing.length) {
+        console.log(`${table} already exists — skipping`);
+      } else if (apply) {
+        await conn.query(sql);
+        console.log(`Created ${table}`);
+      } else {
+        console.log(`would create ${table}`);
+      }
     }
+    if (!apply) console.log('Dry run only: nothing changed. Re-run with --apply.');
   } finally {
     await conn.end();
   }

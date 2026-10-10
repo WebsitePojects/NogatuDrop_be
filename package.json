@@ -64,5 +64,10 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
+  },
+  "overrides": {
+    "geoip-country": {
+      "ip-address": "^10.7.3"
+    }
   }
 }
