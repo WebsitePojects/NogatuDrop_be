@@ -1,5 +1,5 @@
-const env = require('../config/env');
-const { escapeHtml } = require('../utils/escapeHtml');
+const { renderEmail, siteUrl } = require('./email/layout');
+const { ORDER_STEPS } = require('./email/templates');
 const { courierTrackingUrl } = require('../utils/courierTracking');
 const { orderCustomerJoins, orderCustomerNameSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
 
@@ -56,67 +56,82 @@ const manilaTime = (value) => (value ? new Date(value).toLocaleString('en-PH', {
 }) : null);
 
 function trackingPageUrl(orderNumber) {
-  return `${String(env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')}/track/${encodeURIComponent(orderNumber)}`;
+  return siteUrl(`/track/${encodeURIComponent(orderNumber)}`);
 }
 
-function button(href, label) {
-  return `<p style="margin:20px 0"><a href="${escapeHtml(href)}" style="background:#B85C00;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold;display:inline-block">${escapeHtml(label)}</a></p>`;
-}
+const BUYER_FOOTER = 'You get this email because you ordered from the Nogatu Alliance Official Store. Replies to this address are not read.';
+const firstName = (order) => order.customer_first_name || String(order.customer_name || '').split(' ')[0] || 'there';
+const trackButton = (order, label = 'Track your order') => ({ label, href: trackingPageUrl(order.order_number) });
+const progress = (current, cancelled = false) => ({ steps: { labels: ORDER_STEPS, current, cancelled } });
 
-function layout(order, heading, bodyHtml) {
-  const first = order.customer_first_name || String(order.customer_name || '').split(' ')[0] || 'there';
-  return `<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#1f2937;max-width:560px">
-  <p>Hi ${escapeHtml(first)},</p>
-  <h2 style="color:#3D1800;font-size:20px;margin:16px 0 8px">${escapeHtml(heading)}</h2>
-  ${bodyHtml}
-  ${button(trackingPageUrl(order.order_number), 'Track your order')}
-  <p style="color:#6b7280;font-size:13px">Order #${escapeHtml(order.order_number)}. This email was sent by the Nogatu Alliance Official Store. Please do not reply to it.</p>
-</div>`;
-}
-
-function courierBlock(order) {
-  if (!order.courier_tracking_number) return '';
-  const url = courierTrackingUrl(order.tracking_url_template, order.courier_tracking_number);
+/** Courier blocks for an order shipped with J&T/LBC/Flash; empty when our own rider delivers. */
+function courierBlocks(order) {
+  if (!order.courier_tracking_number) return [];
   const courier = order.courier_name || 'the courier';
-  return `<p>Shipped with <strong>${escapeHtml(courier)}</strong>. Waybill number: <strong>${escapeHtml(order.courier_tracking_number)}</strong>.</p>
-  ${url ? button(url, `Track with ${courier}`) : ''}
-  <p style="color:#6b7280;font-size:13px">If the courier's page asks for it, enter the waybill number above.</p>`;
+  const url = courierTrackingUrl(order.tracking_url_template, order.courier_tracking_number);
+  return [
+    { details: [['Shipped with', courier], ['Waybill number', order.courier_tracking_number, true]] },
+    { actions: [...(url ? [{ label: `Track with ${courier}`, href: url }] : []), trackButton(order, 'Our tracking page')] },
+    { p: "If the courier's page asks for it, enter the waybill number above." },
+  ];
 }
 
-/** Subject and HTML for one buyer email. Every value from the order is escaped. */
+/** Subject, HTML and text for one buyer email (shared designed layout; every value escaped there). */
 function buildBuyerEmail(eventType, order) {
   const num = order.order_number;
+  const base = { eyebrow: `Order #${num}`, greeting: `Hi ${firstName(order)},`, footerNote: BUYER_FOOTER };
   switch (eventType) {
     case BUYER_EVENTS.PLACED:
-      return {
-        subject: `We received your order #${num}`,
-        html: layout(order, 'Thank you for your order', `<p>Your order total is <strong>${peso(order.total_amount)}</strong>. We will email you once it is approved, with how to pay.</p>`),
-      };
+      return renderEmail({
+        ...base, subject: `We received your order #${num}`, preheader: 'We will email you once it is approved, with how to pay.',
+        heading: 'Thank you for your order',
+        blocks: [progress(0), { details: [['Order', `#${num}`, true], ['Total', peso(order.total_amount)]] },
+          { p: 'We will email you once the order is approved, with how to pay.' }, { actions: [trackButton(order)] }],
+      });
     case BUYER_EVENTS.APPROVED: {
       const due = manilaTime(order.payment_deadline);
-      return {
-        subject: `Order #${num} approved: please pay${due ? ` by ${due}` : ''}`,
-        html: layout(order, 'Your order is approved', `<p>Please pay <strong>${peso(order.total_amount)}</strong>${due ? ` by <strong>${escapeHtml(due)}</strong>` : ''}, or the order is cancelled.</p>
-  <p>Open your tracking page, enter the mobile number you used at checkout to see the Nogatu account, then upload a photo of your receipt.</p>`),
-      };
+      return renderEmail({
+        ...base, subject: `Order #${num} approved: please pay${due ? ` by ${due}` : ''}`,
+        preheader: `Pay ${peso(order.total_amount)}${due ? ` by ${due}` : ''} to confirm your order.`,
+        heading: 'Your order is approved',
+        blocks: [progress(1), { highlight: { label: 'Amount to pay', value: peso(order.total_amount) } },
+          ...(due ? [{ notice: { tone: 'warn', text: `Please pay by ${due}, or the order is cancelled.` } }] : []),
+          { p: 'Open your tracking page and enter the mobile number you used at checkout. It shows the Nogatu account to pay; then upload a photo of your receipt there.' },
+          { actions: [trackButton(order, 'Pay and upload receipt')] }],
+      });
     }
     case BUYER_EVENTS.PAID:
-      return { subject: `Payment confirmed for order #${num}`, html: layout(order, 'Payment confirmed', '<p>We received your payment and are preparing your order. We will email you when it is on its way.</p>') };
+      return renderEmail({
+        ...base, subject: `Payment confirmed for order #${num}`, preheader: 'We are preparing your order.',
+        heading: 'Payment confirmed',
+        blocks: [progress(2), { p: 'We received your payment and are preparing your order. We will email you when it is on its way.' }, { actions: [trackButton(order)] }],
+      });
     case BUYER_EVENTS.ON_THE_WAY:
-      return {
-        subject: `Your order #${num} is on its way`,
-        html: layout(order, 'Your order is on its way', `${courierBlock(order) || '<p>Our rider has your order. Follow the rider on the map from your tracking page.</p>'}`),
-      };
+      return renderEmail({
+        ...base, subject: `Your order #${num} is on its way`,
+        preheader: order.courier_name && order.courier_tracking_number ? `Shipped with ${order.courier_name}.` : 'Follow the rider on the map.',
+        heading: 'Your order is on its way',
+        blocks: [progress(3), ...(courierBlocks(order).length ? courierBlocks(order)
+          : [{ p: 'Our rider has your order. Follow the rider on the map from your tracking page.' }, { actions: [trackButton(order, 'Follow the rider')] }])],
+      });
     case BUYER_EVENTS.COURIER:
-      return { subject: `Courier tracking for order #${num}`, html: layout(order, 'Track your parcel', courierBlock(order)) };
+      return renderEmail({
+        ...base, subject: `Track your parcel: order #${num}`, preheader: `Waybill ${order.courier_tracking_number || ''}`.trim(),
+        heading: 'Track your parcel', blocks: [progress(3), ...courierBlocks(order)],
+      });
     case BUYER_EVENTS.DELIVERED:
-      return { subject: `Order #${num} delivered`, html: layout(order, 'Your order was delivered', '<p>Thank you for shopping with Nogatu Alliance.</p>') };
+      return renderEmail({
+        ...base, subject: `Order #${num} delivered`, preheader: 'Thank you for shopping with Nogatu Alliance.',
+        heading: 'Your order was delivered',
+        blocks: [progress(4), { p: 'Thank you for shopping with Nogatu Alliance. We hope you enjoy your order.' }, { actions: [{ label: 'Shop again', href: siteUrl('/shop') }] }],
+      });
     case BUYER_EVENTS.CANCELLED:
-      return {
-        subject: `Order #${num} cancelled`,
-        html: layout(order, 'Your order was cancelled', `<p>${order.cancellation_reason ? `Reason: ${escapeHtml(order.cancellation_reason)}` : 'This order will not be shipped.'}</p>
-  <p>If you already paid, please contact us with your order number.</p>`),
-      };
+      return renderEmail({
+        ...base, subject: `Order #${num} cancelled`, preheader: 'This order will not be shipped.',
+        heading: 'Your order was cancelled',
+        blocks: [progress(0, true), { notice: { tone: 'bad', text: order.cancellation_reason ? `Reason: ${order.cancellation_reason}` : 'This order will not be shipped.' } },
+          { p: 'If you already paid, please contact us with your order number.' }, { actions: [{ label: 'Shop again', href: siteUrl('/shop') }] }],
+      });
     default:
       throw new Error(`Unknown buyer email event "${eventType}"`);
   }

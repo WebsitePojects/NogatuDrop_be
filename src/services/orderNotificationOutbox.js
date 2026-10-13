@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const env = require('../config/env');
 const { sendEmail, EMAIL } = require('./emailService');
 const crypto = require('crypto');
 const { orderCustomerNameSql } = require('../utils/orderCustomerSql');
@@ -12,13 +13,17 @@ async function sendQueuedEmail(conn, job, sendEmailFn) {
     const order = await loadBuyerEmailOrder(conn, job.order_id);
     if (!order) throw new Error('Order for buyer email is missing');
     const template = buildBuyerEmail(job.event_type, order);
-    return sendEmailFn({ to: job.recipient_email, toName: order.customer_name, ...template, throwOnFailure: true });
+    return sendEmailFn({ to: job.recipient_email, toName: order.customer_name, ...template, idempotencyKey: outboxKey(job), throwOnFailure: true });
   }
   const [users] = await conn.execute('SELECT email, name FROM users WHERE id = ? LIMIT 1', [job.user_id]);
   if (!users.length || !users[0].email) throw new Error('Notification recipient is unavailable');
   const template = EMAIL.orderPlaced(job.order_number, job.customer_name || 'customer');
-  return sendEmailFn({ to: users[0].email, toName: users[0].name, ...template, throwOnFailure: true });
+  return sendEmailFn({ to: users[0].email, toName: users[0].name, ...template, idempotencyKey: outboxKey(job), throwOnFailure: true });
 }
+
+// The same key on every retry of one row, so the provider sends it at most once.
+const outboxKey = (job) => `ncdms-outbox-${job.id}`;
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 async function enqueueOrderNotifications(conn, { orderId, orderNumber, users, eventType = 'public_order_placed' }) {
   for (const user of users) {
@@ -32,7 +37,10 @@ async function enqueueOrderNotifications(conn, { orderId, orderNumber, users, ev
   }
 }
 
-async function processOrderNotificationOutbox({ batchSize = 25, maxAttempts = 5, connectionFactory = () => pool.getConnection(), sendEmailFn = sendEmail } = {}) {
+async function processOrderNotificationOutbox({
+  batchSize = 25, maxAttempts = 5, connectionFactory = () => pool.getConnection(), sendEmailFn = sendEmail,
+  spacingMs = env.EMAIL_SEND_SPACING_MS,
+} = {}) {
   const conn = await connectionFactory();
   let processed = 0;
   try {
@@ -62,9 +70,12 @@ async function processOrderNotificationOutbox({ batchSize = 25, maxAttempts = 5,
         await conn.execute(`UPDATE order_notification_outbox SET status = 'sent', sent_at = NOW(), last_error = ?, locked_at = NULL, lease_token = NULL WHERE id = ? AND lease_token = ?`, [note, job.id, leaseToken]);
         processed += 1;
       } catch (error) {
-        const terminal = Number(job.attempts) + 1 >= maxAttempts;
-        await conn.execute(`UPDATE order_notification_outbox SET status = ?, available_at = DATE_ADD(NOW(), INTERVAL LEAST(60 * POW(2, attempts), 3600) SECOND), last_error = ?, locked_at = NULL, lease_token = NULL WHERE id = ? AND lease_token = ?`, [terminal ? 'failed' : 'retry', 'notification delivery failed', job.id, leaseToken]);
+        // An error the provider marks as not retryable (bad request, unverified domain) ends the row now.
+        const terminal = Number(job.attempts) + 1 >= maxAttempts || error.retryable === false;
+        const reason = `delivery failed${error.status ? ` (${error.status}${error.code ? ` ${error.code}` : ''})` : ''}`;
+        await conn.execute(`UPDATE order_notification_outbox SET status = ?, available_at = DATE_ADD(NOW(), INTERVAL LEAST(60 * POW(2, attempts), 3600) SECOND), last_error = ?, locked_at = NULL, lease_token = NULL WHERE id = ? AND lease_token = ?`, [terminal ? 'failed' : 'retry', reason, job.id, leaseToken]);
       }
+      if (spacingMs > 0) await sleep(spacingMs);
     }
     return processed;
   } finally {

@@ -1263,7 +1263,7 @@ const approveOrder = asyncHandler(async (req, res) => {
     );
     if (banks.length > 0) {
       const b = banks[0];
-      bankDetails = `${b.bank_name} — ${b.account_name} — ${b.account_number}`;
+      bankDetails = `${b.bank_name} · ${b.account_name} · ${b.account_number}`;
     }
   }
 

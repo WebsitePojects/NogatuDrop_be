@@ -64,7 +64,7 @@ test('the outbox emails the buyer, and an allowlist skip is final', opts, async 
     return msg.subject.includes('approved') ? { sent: false, skipped: true } : { sent: true };
   };
   // The worker takes 25 rows a run, oldest first; other queued rows in the local copy may come first.
-  for (let run = 0; run < 20 && (await outbox.processOrderNotificationOutbox({ sendEmailFn })) > 0; run += 1);
+  for (let run = 0; run < 20 && (await outbox.processOrderNotificationOutbox({ sendEmailFn, spacingMs: 0 })) > 0; run += 1);
   const mine = sent.filter((m) => m.to === 'buyer.test@example.com');
   assert.equal(mine.length, 2, 'approved + delivered');
   assert.ok(mine.some((m) => /delivered/i.test(m.subject)));

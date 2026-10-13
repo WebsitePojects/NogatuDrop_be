@@ -40,11 +40,12 @@ const order = {
   courier_name: 'J&T Express', tracking_url_template: 'https://www.jtexpress.ph/q?bills={tracking_number}', courier_tracking_number: 'JT0001',
 };
 
-test('every buyer event has a subject and a tracking-page button', () => {
+test('every buyer event has a subject, a plain-text part and a link back to the store', () => {
   for (const event of Object.values(BUYER_EVENTS)) {
     const email = buildBuyerEmail(event, order);
     assert.ok(email.subject.includes('PUB-1'), event);
-    assert.match(email.html, /\/track\/PUB-1/, event);
+    assert.match(email.html, /\/track\/PUB-1|\/shop"/, event);
+    assert.ok(email.text.includes('PUB-1') && !/<[a-z]/i.test(email.text), `${event} text part`);
   }
 });
 
@@ -61,7 +62,7 @@ test('buyer-typed text is escaped in the email', () => {
   const email = buildBuyerEmail(BUYER_EVENTS.CANCELLED, {
     ...order, customer_first_name: '<img src=x onerror=alert(1)>', cancellation_reason: '<a href="http://evil">x</a>',
   });
-  assert.doesNotMatch(email.html, /<img|<a href="http:\/\/evil/);
+  assert.doesNotMatch(email.html, /<img src=x|<a href="http:\/\/evil/);
   assert.match(email.html, /&lt;img src=x/);
 });
 
