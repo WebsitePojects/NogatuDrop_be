@@ -10,7 +10,9 @@
 //   2. stock: every active product reaches at least DEMO_STOCK available units in the TEST Provincial
 //      and TEST City warehouses; each top-up is logged as a stock movement (reference walkthrough_prep).
 //   3. payment accounts whose warehouse is deleted or missing are deactivated (is_active = 0).
-//   4. the TEST demo records get short names (the old ones, like "TEST — City Stockist — orders from
+//   4. each demo warehouse without a payment account gets one, clearly marked DEMO. Without it, a demo
+//      Stockist order falls back to the company default account, which on this copy is a placeholder.
+//   5. the TEST demo records get short names (the old ones, like "TEST — City Stockist — orders from
 //      parent Provincial (40% discount)", wrapped over eight lines in lists). Only names starting with
 //      "TEST" are renamed.
 //
@@ -174,6 +176,16 @@ async function main() {
     if (staleBanks.length === 0) console.log('  none');
     for (const b of staleBanks) console.log(`  #${b.id} ${b.bank_name} (${b.account_name}), warehouse #${b.warehouse_id}`);
 
+    const [banklessWarehouses] = warehouses.length ? await conn.execute(
+      `SELECT w.id, w.name FROM warehouses w
+       WHERE w.id IN (${warehouses.map(() => '?').join(', ')})
+         AND NOT EXISTS (SELECT 1 FROM bank_accounts b WHERE b.warehouse_id = w.id AND b.is_active = 1 AND b.is_deleted = 0)`,
+      warehouses.map((w) => w.id)
+    ) : [[]];
+    console.log('\nDemo payment accounts:');
+    if (banklessWarehouses.length === 0) console.log('  none needed');
+    for (const w of banklessWarehouses) console.log(`  ${w.name}: add "DEMO BANK"`);
+
     const renames = await planRenames(conn);
     console.log('\nShorter demo names:');
     if (renames.length === 0) console.log('  none needed');
@@ -233,13 +245,22 @@ async function main() {
       );
     }
 
+    for (const w of banklessWarehouses) {
+      await conn.execute(
+        `INSERT INTO bank_accounts (warehouse_id, bank_name, account_name, account_number, account_type, is_default, is_active)
+         SELECT ?, 'DEMO BANK', 'Demo account (walkthrough only)', ?, 'Savings', 0, 1 FROM DUAL
+         WHERE NOT EXISTS (SELECT 1 FROM bank_accounts WHERE warehouse_id = ? AND is_active = 1 AND is_deleted = 0)`,
+        [w.id, `DEMO-${String(w.id).padStart(4, '0')}`, w.id]
+      );
+    }
+
     for (const r of renames) {
       const column = RENAME_COLUMN[r.table];
       await conn.execute(`UPDATE ${r.table} SET ${column} = ? WHERE id = ? AND ${column} LIKE 'TEST%'`, [r.to, r.id]);
     }
 
     await conn.commit();
-    console.log(`\nDone: ${accounts.length + existingDemo.length} demo sign-ins ready, ${stockPlan.length} stock top-ups, ${staleBanks.length} payment accounts deactivated, ${renames.length} names shortened.`);
+    console.log(`\nDone: ${accounts.length + existingDemo.length} demo sign-ins ready, ${stockPlan.length} stock top-ups, ${staleBanks.length} payment accounts deactivated, ${banklessWarehouses.length} demo payment accounts added, ${renames.length} names shortened.`);
   } catch (err) {
     await conn.rollback().catch(() => {});
     throw err;
