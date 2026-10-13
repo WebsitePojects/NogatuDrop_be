@@ -20,6 +20,8 @@
 // Refuses any database whose name does not contain "staging" unless --allow-db=<exact name> is passed,
 // so it cannot run against the live store. The password comes from WALKTHROUGH_PASSWORD (never stored).
 // Run: WALKTHROUGH_PASSWORD='…' node --env-file=.env.prod scripts/prepareWalkthroughDemo.js [--apply]
+//      node --env-file=.env.prod scripts/prepareWalkthroughDemo.js --disable [--apply]
+//        switches every demo sign-in off after the meeting; the next --apply switches them back on.
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const { insertStockMovement } = require('../src/utils/stockMovementLogger');
@@ -42,6 +44,27 @@ const DEMO_ACCOUNTS = [
   { username: 'demo.provincial', name: 'Demo Provincial Stockist', role: 'provincial_stockist', partner: 'TYCOON PS', level: 'regional', location: 'Demo Province' },
 ];
 const EXISTING_DEMO_USERNAMES = ['test.city', 'test.mobile', 'test.staff'];
+// Management chose a short shared password for the demo sign-ins (2026-10-13). Staging holds a copy of real
+// customer details, so turn the accounts off with --disable when the walkthrough is over.
+const MIN_PASSWORD_LENGTH = 6;
+const ALL_DEMO_USERNAMES = [...DEMO_ACCOUNTS.map((a) => a.username), ...EXISTING_DEMO_USERNAMES];
+
+/** Switches every demo sign-in off (status inactive). Dry run unless apply. */
+async function disableDemoSignIns(conn, apply) {
+  const ph = ALL_DEMO_USERNAMES.map(() => '?').join(', ');
+  const [rows] = await conn.execute(`SELECT username, status FROM users WHERE username IN (${ph}) AND is_deleted = 0`, ALL_DEMO_USERNAMES);
+  const active = rows.filter((r) => r.status === 'active');
+  console.log(`Demo sign-ins to switch off: ${active.length ? active.map((r) => r.username).join(', ') : 'none (already off)'}`);
+  if (!apply) {
+    console.log('Dry run only: nothing changed. Re-run with --disable --apply.');
+    return;
+  }
+  const [result] = await conn.execute(
+    `UPDATE users SET status = 'inactive' WHERE username IN (${ph}) AND is_deleted = 0 AND status = 'active'`,
+    ALL_DEMO_USERNAMES
+  );
+  console.log(`Done: ${result.affectedRows} demo sign-ins switched off.`);
+}
 const DEMO_USER_NAMES = { 'test.city': 'TEST City Stockist', 'test.mobile': 'TEST Mobile Stockist', 'test.staff': 'TEST City Staff' };
 
 /** Short names for the TEST demo records; each entry only touches a row whose name starts with "TEST". */
@@ -135,14 +158,22 @@ async function main() {
   if (!/staging/i.test(dbName) && argValue('allow-db') !== dbName) {
     throw new Error(`Refusing to run on "${dbName}": this script is for the staging copy only. Nothing changed.`);
   }
+  const disable = process.argv.includes('--disable');
   const password = process.env.WALKTHROUGH_PASSWORD || '';
-  if (apply && password.length < 10) throw new Error('Set WALKTHROUGH_PASSWORD (10+ characters) for --apply. Nothing changed.');
+  if (apply && !disable && password.length < MIN_PASSWORD_LENGTH) {
+    throw new Error(`Set WALKTHROUGH_PASSWORD (${MIN_PASSWORD_LENGTH}+ characters) for --apply. Nothing changed.`);
+  }
 
   const conn = await mysql.createConnection({
     host: process.env.DB_HOST || 'localhost', port: Number(process.env.DB_PORT) || 3306,
     user: process.env.DB_USER, password: process.env.DB_PASSWORD || '', database: dbName, timezone: '+08:00',
   });
   try {
+    if (disable) {
+      console.log(`Database: ${dbName}  mode: ${apply ? 'DISABLE' : 'disable dry run'}`);
+      await disableDemoSignIns(conn, apply);
+      return;
+    }
     await conn.beginTransaction();
     console.log(`Database: ${dbName}  mode: ${apply ? 'APPLY' : 'dry run'}\n`);
 
@@ -215,7 +246,7 @@ async function main() {
     }
     if (existingDemo.length) {
       await conn.execute(
-        `UPDATE users SET password = ? WHERE id IN (${existingDemo.map(() => '?').join(', ')})`,
+        `UPDATE users SET password = ?, status = 'active' WHERE id IN (${existingDemo.map(() => '?').join(', ')})`,
         [hash, ...existingDemo.map((u) => u.id)]
       );
     }
