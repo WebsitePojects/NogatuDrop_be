@@ -6,6 +6,7 @@ const { insertStockMovement } = require('../utils/stockMovementLogger');
 const { insertNotification } = require('../utils/notificationWriter');
 const { runWithCronLeaderLock } = require('./cronLeaderLock');
 const { releaseStock } = require('./batchStock');
+const { BUYER_EVENTS, enqueueBuyerEmail } = require('./buyerEmails');
 
 const isMissingColumn = (err, columnName) => (
   err &&
@@ -51,6 +52,7 @@ async function runPaymentDeadlineCheck() {
           await conn.rollback();
           continue;
         }
+        await enqueueBuyerEmail(conn, { orderId: order.id, eventType: BUYER_EVENTS.CANCELLED });
 
         let items = [];
         try {

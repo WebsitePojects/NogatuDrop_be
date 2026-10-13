@@ -19,8 +19,10 @@ r.post(
     body('order_id').isInt({ min: 1 }).withMessage('order_id is required').toInt(),
     body('vehicle_type').optional({ values: 'falsy' }).isIn(VEHICLE_TYPES)
       .withMessage(`Vehicle must be one of: ${VEHICLE_TYPES.join(', ')}`),
-    body('courier_id').optional({ values: 'falsy' }).isInt({ min: 1 }).toInt(),
-    body('courier_tracking_number').optional({ values: 'falsy' }).isString().trim().isLength({ max: 100 }),
+    body('courier_id').optional({ values: 'falsy' }).isInt({ min: 1 }).withMessage('Choose a courier from the list').toInt(),
+    // A waybill is letters, digits and dashes; it is shown to the buyer and put in the courier's link.
+    body('courier_tracking_number').optional({ values: 'falsy' }).isString().trim()
+      .matches(/^[A-Za-z0-9-]{4,40}$/).withMessage('Waybill number: 4 to 40 letters, digits or dashes'),
   ],
   validate,
   c.generateDeliveryLink

@@ -57,8 +57,9 @@ const publicOrderValidation = [
   // The optional delivery pin must be a lat/lng pair inside the Philippines (400 with the shared message).
   coordinatePairValidator('customer_lat', 'customer_lng'),
   bodyValidator('customer_phone').optional().isString().isLength({ max: 30 }),
-  // Blank means "not given": the checkout labels email as optional and may send an empty string.
-  bodyValidator('customer_email').optional({ values: 'falsy' }).isEmail().withMessage('Please enter a valid email address, or leave it blank').normalizeEmail(),
+  // Required (management, 2026-10-14): the buyer's status emails go to this address.
+  bodyValidator('customer_email').trim().notEmpty().withMessage('Please enter your email address so we can send your order updates')
+    .bail().isEmail().withMessage('Please enter a valid email address').isLength({ max: 150 }).normalizeEmail({ gmail_remove_dots: false }),
   bodyValidator('items').isArray({ min: 1, max: 50 }),
   bodyValidator('items.*.product_id').isInt({ min: 1 }),
   bodyValidator('items.*.quantity').isInt({ min: 1, max: PUBLIC_ORDER_MAX_QUANTITY_PER_LINE })

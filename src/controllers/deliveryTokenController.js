@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { BUYER_EVENTS, enqueueBuyerEmail } = require('../services/buyerEmails');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -280,6 +281,10 @@ async function upsertTracking(conn, orderId, { courier_id, courier_tracking_numb
 const generateDeliveryLink = asyncHandler(async (req, res) => {
   const { order_id, courier_id, courier_tracking_number, vehicle_type } = req.body;
   if (!order_id) throw ApiError.badRequest('order_id is required');
+  if (courier_id) {
+    const [courierRows] = await pool.execute('SELECT id FROM couriers WHERE id = ? AND is_active = 1 LIMIT 1', [courier_id]);
+    if (courierRows.length === 0) throw ApiError.badRequest('Choose a courier from the list');
+  }
 
   let orders;
   try {
@@ -315,7 +320,18 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     const existingToken = await getLatestActiveToken(order_id, conn);
     if (existingToken) {
+      const [[before]] = await conn.execute('SELECT courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1', [order_id]);
       await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: false });
+      // The "on its way" email reads the courier when it is sent; only if it already went out without a
+      // waybill does the buyer get a separate tracking email.
+      if (courier_tracking_number && !(before && before.courier_tracking_number)) {
+        const [[onTheWay]] = await conn.execute(
+          `SELECT COUNT(*) AS sent FROM order_notification_outbox
+           WHERE order_id = ? AND event_type = ? AND user_id IS NULL AND status = 'sent'`,
+          [order_id, BUYER_EVENTS.ON_THE_WAY]
+        );
+        if (Number(onTheWay.sent) > 0) await enqueueBuyerEmail(conn, { orderId: order_id, eventType: BUYER_EVENTS.COURIER });
+      }
       await conn.commit();
       return res.status(200).json({
         success: true,
@@ -341,6 +357,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     // Update order status to 'delivering'
     await conn.execute(`UPDATE orders SET status = 'delivering' WHERE id = ?`, [order_id]);
+    await enqueueBuyerEmail(conn, { orderId: order_id, eventType: BUYER_EVENTS.ON_THE_WAY });
 
     await conn.commit();
 
@@ -416,6 +433,11 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   }
 
   const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token.token}`;
+  // The courier and waybill already saved, so the Delivery section opens with them filled in.
+  const [[shipment]] = await pool.execute(
+    'SELECT courier_id, courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1',
+    [orderId]
+  );
   return res.json({
     success: true,
     data: {
@@ -424,6 +446,8 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
       expires_at: token.expires_at,
       is_used: token.is_used,
       created_at: token.created_at,
+      courier_id: shipment ? shipment.courier_id : null,
+      courier_tracking_number: shipment ? shipment.courier_tracking_number : null,
     },
   });
 });
@@ -841,8 +865,10 @@ const completeDelivery = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Mark token used
-    await conn.execute(`UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE id = ?`, [tokenId]);
+    // Mark the link used. The condition makes this the guard: of two submits at once, only one
+    // confirms the delivery, consumes stock and emails the buyer.
+    const [used] = await conn.execute(`UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE id = ? AND is_used = 0`, [tokenId]);
+    if (used.affectedRows !== 1) throw ApiError.conflict('This delivery was already confirmed');
 
     // Create POD record
     try {
@@ -900,6 +926,7 @@ const completeDelivery = asyncHandler(async (req, res) => {
       `UPDATE orders SET status = 'delivered', delivered_at = NOW() WHERE id = ?`,
       [orderId]
     );
+    await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.DELIVERED });
 
     // Decrement current_stock and reserved_stock
     let items;

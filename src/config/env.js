@@ -31,6 +31,10 @@ const env = {
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',
   EMAIL_FROM: 'noreply@nogatu.store',
   EMAIL_FROM_NAME: 'Nogatu',
+  // When set (comma-separated addresses or @domains), email goes ONLY to these recipients; everyone else
+  // is skipped. Staging holds a copy of real buyers and stockists, so it may send only to testers.
+  // Empty on the live store: everyone gets their email.
+  EMAIL_ALLOWLIST: (process.env.EMAIL_ALLOWLIST || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
 
   // Cloudinary (file storage — replaces local uploads)
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',

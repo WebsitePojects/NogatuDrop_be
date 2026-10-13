@@ -21,16 +21,30 @@ function getBrevoClient() {
   return brevoClient;
 }
 
+/** True when EMAIL_ALLOWLIST is empty, or lists this address or its @domain. */
+function isAllowedRecipient(email, allowlist = env.EMAIL_ALLOWLIST) {
+  if (!allowlist || allowlist.length === 0) return true;
+  const address = String(email || '').trim().toLowerCase();
+  return allowlist.some((entry) => (entry.startsWith('@') ? address.endsWith(entry) : address === entry));
+}
+
+/**
+ * Sends one transactional email. Returns { sent: true } or { sent: false, skipped: true } when every
+ * recipient was filtered out by EMAIL_ALLOWLIST (a skip is final, not a failure to retry).
+ */
 async function sendEmail({ to, toName, subject, html, throwOnFailure = false }) {
+  const recipients = (Array.isArray(to) ? to.map((email) => ({ email })) : [{ email: to, name: toName }])
+    .filter((r) => isAllowedRecipient(r.email));
+  if (recipients.length === 0) {
+    console.log(`[Email] Skipped (recipient not on EMAIL_ALLOWLIST): ${subject}`);
+    return { sent: false, skipped: true };
+  }
+
   if (!hasUsableBrevoKey()) {
     if (throwOnFailure) throw new Error('Email transport is not configured');
     console.log(`[Email] Brevo key is not configured - skipping email subject: ${subject}`);
-    return;
+    return { sent: false };
   }
-
-  const recipients = Array.isArray(to)
-    ? to.map((email) => ({ email }))
-    : [{ email: to, name: toName }];
 
   try {
     const client = getBrevoClient();
@@ -41,15 +55,17 @@ async function sendEmail({ to, toName, subject, html, throwOnFailure = false }) 
       subject,
       htmlContent: html,
     });
+    return { sent: true };
   } catch (err) {
     const message = err?.message || String(err);
     if (env.NODE_ENV !== 'production') {
       console.warn('[Email] Failed to send (non-fatal in development):', message);
       if (throwOnFailure) throw err;
-      return;
+      return { sent: false };
     }
     console.error('[Email] Failed to send:', message);
     if (throwOnFailure) throw err;
+    return { sent: false };
   }
 }
 
@@ -147,4 +163,4 @@ const EMAIL = {
   }),
 };
 
-module.exports = { sendEmail, EMAIL };
+module.exports = { sendEmail, isAllowedRecipient, EMAIL };
