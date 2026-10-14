@@ -36,15 +36,24 @@ test('public fulfillment ranks capable warehouses by distance from the customer'
   assert.deepEqual(ranked.map((candidate) => candidate.warehouse_id), [20, 10, 30]);
 });
 
-test('public pricing persists discount and fee components that reconcile to total', () => {
+test('public pricing persists discount and fee components that reconcile to total, with no VAT line', () => {
   const totals = getPublicOrderPricingTotals(700, { preDiscountSubtotal: 1000 });
 
   assert.deepEqual(totals, {
     merchandiseSubtotal: 700,
     memberDiscountAmount: 300,
     shippingFee: 159,
-    systemFee: 84,
-    totalDue: 943,
+    systemFee: 0,
+    totalDue: 859,
+  });
+});
+
+test('store total is merchandise plus shipping only (VAT removed, management 2026-10-14)', () => {
+  const totals = getPublicOrderPricingTotals(7998);
+  assert.equal(totals.systemFee, 0);
+  assert.equal(totals.totalDue, 8157);
+  assert.deepEqual(getPublicOrderPricingTotals(0), {
+    merchandiseSubtotal: 0, memberDiscountAmount: 0, shippingFee: 0, systemFee: 0, totalDue: 0,
   });
 });
 
