@@ -7,8 +7,8 @@ const { BUYER_EVENTS, buildBuyerEmail } = require('../src/services/buyerEmails')
 
 test('courier link: the waybill fills the pattern, URL-encoded', () => {
   assert.equal(
-    courierTrackingUrl('https://www.jtexpress.ph/index/query/gzquery.html?bills={tracking_number}', 'JT0001234567'),
-    'https://www.jtexpress.ph/index/query/gzquery.html?bills=JT0001234567'
+    courierTrackingUrl('https://www.jtexpress.ph/track-and-trace?waybillNo={tracking_number}', 'JT0001234567'),
+    'https://www.jtexpress.ph/track-and-trace?waybillNo=JT0001234567'
   );
   assert.equal(courierTrackingUrl('https://x.ph/t/{tracking_number}', 'A B&C'), 'https://x.ph/t/A%20B%26C');
 });
