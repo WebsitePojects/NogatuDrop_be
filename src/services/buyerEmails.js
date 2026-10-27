@@ -59,7 +59,7 @@ function trackingPageUrl(orderNumber) {
   return siteUrl(`/track/${encodeURIComponent(orderNumber)}`);
 }
 
-const BUYER_FOOTER = 'You get this email because you ordered from the Nogatu Alliance Official Store. Replies to this address are not read.';
+const BUYER_FOOTER = 'You received this email because you ordered from the Nogatu Alliance Official Store. Replies to this address are not read.';
 const firstName = (order) => order.customer_first_name || String(order.customer_name || '').split(' ')[0] || 'there';
 const trackButton = (order, label = 'Track your order') => ({ label, href: trackingPageUrl(order.order_number) });
 const progress = (current, cancelled = false) => ({ steps: { labels: ORDER_STEPS, current, cancelled } });

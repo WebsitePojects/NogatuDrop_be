@@ -66,6 +66,14 @@ test('buyer-typed text is escaped in the email', () => {
   assert.match(email.html, /&lt;img src=x/);
 });
 
+test('buyer email footer uses the wording management approved (2026-10-27)', () => {
+  const footer = 'You received this email because you ordered from the Nogatu Alliance Official Store. Replies to this address are not read.';
+  for (const event of Object.values(BUYER_EVENTS)) {
+    const email = buildBuyerEmail(event, order);
+    assert.ok(email.text.includes(footer) && email.html.includes(footer), event);
+  }
+});
+
 test('an unknown event fails loudly', () => {
   assert.throws(() => buildBuyerEmail('buyer_unknown', order), /Unknown buyer email event/);
 });

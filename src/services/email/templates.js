@@ -4,7 +4,7 @@ const { renderEmail, siteUrl } = require('./layout');
 // working; the content is now the shared designed layout (escaped, with a plain-text part).
 
 const ORDER_STEPS = ['Placed', 'Approved', 'Paid', 'On the way', 'Delivered'];
-const STAFF_FOOTER = 'You get this email because you have a Nogatu NCDMS account.';
+const STAFF_FOOTER = 'You received this email because you have a Nogatu NCDMS account.';
 const signIn = (label = 'Open Nogatu NCDMS') => ({ actions: [{ label, href: siteUrl('/login') }] });
 const orderSteps = (current, cancelled = false) => ({ steps: { labels: ORDER_STEPS, current, cancelled } });
 
@@ -141,7 +141,7 @@ const EMAIL = {
       { highlight: { label: 'Temporary password', value: tempPassword, mono: true } },
       signIn('Sign in'),
     ],
-    footerNote: 'You get this email because your Stockist application was approved.',
+    footerNote: 'You received this email because your Stockist application was approved.',
   }),
 
   passwordReset: (otp) => renderEmail({
@@ -153,7 +153,7 @@ const EMAIL = {
       { p: 'Enter this code on the reset page. It works for 15 minutes.' },
       { notice: { tone: 'info', text: 'Did not ask for this? Ignore this email; your password stays the same.' } },
     ],
-    footerNote: 'You get this email because someone asked to reset the password of your Nogatu account.',
+    footerNote: 'You received this email because someone asked to reset the password of your Nogatu account.',
   }),
 };
 
