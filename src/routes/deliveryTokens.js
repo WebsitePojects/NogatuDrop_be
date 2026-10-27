@@ -4,7 +4,7 @@ const role = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
 const { podUpload, uploadErrorHandler } = require('../middleware/upload');
 const c = require('../controllers/deliveryTokenController');
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const { VEHICLE_TYPES } = require('../utils/vehicleTypes');
 
@@ -28,6 +28,14 @@ r.post(
   c.generateDeliveryLink
 );
 r.get('/by-order/:orderId', auth, requirePermission(PERMISSIONS.DELIVERY_TOKENS_CREATE), c.getLatestDeliveryLinkForOrder);
+r.post(
+  '/by-order/:orderId/courier-delivered',
+  auth,
+  requirePermission(PERMISSIONS.DELIVERY_TOKENS_CREATE),
+  [param('orderId').isInt({ min: 1 }).withMessage('Order id must be a number').toInt()],
+  validate,
+  c.confirmCourierDelivery
+);
 r.get('/pods', auth, requirePermission(PERMISSIONS.ORDERS_VIEW), c.listDeliveryProofs);
 r.get('/pods/by-order/:orderId', auth, requirePermission(PERMISSIONS.ORDERS_VIEW), c.getDeliveryProofForOrder);
 
