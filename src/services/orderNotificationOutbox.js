@@ -65,8 +65,9 @@ async function processOrderNotificationOutbox({
       if (claimed.affectedRows !== 1) continue;
       try {
         const result = await sendQueuedEmail(conn, job, sendEmailFn);
-        // A recipient filtered out by EMAIL_ALLOWLIST (staging) is final: recorded, never retried.
-        const note = result && result.skipped ? 'skipped: recipient not on EMAIL_ALLOWLIST' : null;
+        // A filtered-out recipient (placeholder address, or not on a staging EMAIL_ALLOWLIST) is final:
+        // recorded with the reason, never retried.
+        const note = result && result.skipped ? `skipped: ${result.reason || 'recipient filtered'}` : null;
         await conn.execute(`UPDATE order_notification_outbox SET status = 'sent', sent_at = NOW(), last_error = ?, locked_at = NULL, lease_token = NULL WHERE id = ? AND lease_token = ?`, [note, job.id, leaseToken]);
         processed += 1;
       } catch (error) {

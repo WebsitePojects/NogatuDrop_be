@@ -41,6 +41,8 @@ const env = {
   // is skipped. Staging holds a copy of real buyers and stockists, so it may send only to testers.
   // Empty on the live store: everyone gets their email.
   EMAIL_ALLOWLIST: (process.env.EMAIL_ALLOWLIST || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
+  // Put in front of every subject, e.g. "[TEST]" on staging, so a staging email is never mistaken for a live order.
+  EMAIL_SUBJECT_PREFIX: (process.env.EMAIL_SUBJECT_PREFIX || '').trim(),
 
   // Cloudinary (file storage — replaces local uploads)
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',

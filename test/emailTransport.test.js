@@ -3,9 +3,13 @@ const assert = require('node:assert/strict');
 const env = require('../src/config/env');
 const { deliver, activeProvider } = require('../src/services/email/transport');
 const { EMAIL } = require('../src/services/email/templates');
+const { sendEmail, isUndeliverableAddress } = require('../src/services/emailService');
 
 const realFetch = global.fetch;
-const saved = { EMAIL_PROVIDER: env.EMAIL_PROVIDER, RESEND_API_KEY: env.RESEND_API_KEY, BREVO_API_KEY: env.BREVO_API_KEY };
+const saved = {
+  EMAIL_PROVIDER: env.EMAIL_PROVIDER, RESEND_API_KEY: env.RESEND_API_KEY, BREVO_API_KEY: env.BREVO_API_KEY,
+  EMAIL_ALLOWLIST: env.EMAIL_ALLOWLIST, EMAIL_SUBJECT_PREFIX: env.EMAIL_SUBJECT_PREFIX,
+};
 test.afterEach(() => { global.fetch = realFetch; Object.assign(env, saved); });
 
 function fakeResend(status, body) {
@@ -80,4 +84,35 @@ test('every staff email renders with subject, HTML and text, and escapes names',
   }
   assert.doesNotMatch(EMAIL.orderPlaced('ORD-1', '<b>Shop</b>').html, /<b>Shop<\/b>/);
   assert.match(EMAIL.passwordReset('123456').text, /123456/);
+});
+
+test('placeholder and malformed addresses are never sent to, on any environment', () => {
+  for (const address of ['demo.admin@example.com', 'x@example.org', 'a@shop.test', 'b@foo.invalid', 'c@host.localhost', 'not-an-email', '']) {
+    assert.equal(isUndeliverableAddress(address), true, address);
+  }
+  for (const address of ['dyno.erfe@gmail.com', 'ana@nogatu.store', 'sam@examples.com', 'kim@example.com.ph']) {
+    assert.equal(isUndeliverableAddress(address), false, address);
+  }
+});
+
+test('with no allowlist everyone gets mail, the staging prefix leads the subject, placeholders are skipped', async () => {
+  Object.assign(env, { EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_test', EMAIL_ALLOWLIST: [], EMAIL_SUBJECT_PREFIX: '[TEST]' });
+  const calls = fakeResend(200, { id: 'm1' });
+  assert.deepEqual(await sendEmail({ to: 'buyer@gmail.com', subject: 'Order #1 delivered', html: '<p>x</p>', text: 'x' }), { sent: true, id: 'm1' });
+  assert.equal(JSON.parse(calls[0].init.body).subject, '[TEST] Order #1 delivered');
+
+  const skipped = await sendEmail({ to: 'demo.admin@example.com', subject: 'Hi', html: '<p>x</p>', text: 'x' });
+  assert.deepEqual(skipped, { sent: false, skipped: true, reason: 'placeholder or invalid address' });
+  assert.equal(calls.length, 1, 'nothing sent to a placeholder address');
+
+  // A mix sends only to the real address.
+  await sendEmail({ to: ['demo@example.com', 'ana@nogatu.store'], subject: 'Hi', html: '<p>x</p>', text: 'x' });
+  assert.deepEqual(JSON.parse(calls[1].init.body).to, ['ana@nogatu.store']);
+});
+
+test('live keeps the subject as written when no prefix is set', async () => {
+  Object.assign(env, { EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_test', EMAIL_ALLOWLIST: [], EMAIL_SUBJECT_PREFIX: '' });
+  const calls = fakeResend(200, { id: 'm2' });
+  await sendEmail({ to: 'buyer@gmail.com', subject: 'Order #1 delivered', html: '<p>x</p>', text: 'x' });
+  assert.equal(JSON.parse(calls[0].init.body).subject, 'Order #1 delivered');
 });

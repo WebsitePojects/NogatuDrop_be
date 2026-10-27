@@ -61,7 +61,7 @@ test('the outbox emails the buyer, and an allowlist skip is final', opts, async 
   const sent = [];
   const sendEmailFn = async (msg) => {
     sent.push(msg);
-    return msg.subject.includes('approved') ? { sent: false, skipped: true } : { sent: true };
+    return msg.subject.includes('approved') ? { sent: false, skipped: true, reason: 'recipient not on EMAIL_ALLOWLIST' } : { sent: true };
   };
   // The worker takes 25 rows a run, oldest first; other queued rows in the local copy may come first.
   for (let run = 0; run < 20 && (await outbox.processOrderNotificationOutbox({ sendEmailFn, spacingMs: 0 })) > 0; run += 1);
