@@ -27,10 +27,22 @@ const env = {
   ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173',
   CORS_ALLOW_ALL: (process.env.CORS_ALLOW_ALL || 'false').toLowerCase() === 'true',
 
-  // Brevo (transactional email — replaces SMS)
+  // Email: Resend (management, 2026-10-14), Brevo kept as the fallback. EMAIL_PROVIDER=resend|brevo picks
+  // one; when unset, Resend is used if RESEND_API_KEY is set. Resend sends from nogatu.store only after
+  // the domain is verified in the Resend dashboard (DNS records).
+  EMAIL_PROVIDER: process.env.EMAIL_PROVIDER || '',
+  RESEND_API_KEY: process.env.RESEND_API_KEY || '',
   BREVO_API_KEY: process.env.BREVO_API_KEY || '',
-  EMAIL_FROM: 'noreply@nogatu.store',
-  EMAIL_FROM_NAME: 'Nogatu',
+  EMAIL_FROM: process.env.EMAIL_FROM || 'noreply@nogatu.store',
+  EMAIL_FROM_NAME: process.env.EMAIL_FROM_NAME || 'Nogatu Alliance',
+  // Pause between queued emails, to stay under the provider's per-second limit.
+  EMAIL_SEND_SPACING_MS: parseInt(process.env.EMAIL_SEND_SPACING_MS, 10) || 600,
+  // When set (comma-separated addresses or @domains), email goes ONLY to these recipients; everyone else
+  // is skipped. Staging holds a copy of real buyers and stockists, so it may send only to testers.
+  // Empty on the live store: everyone gets their email.
+  EMAIL_ALLOWLIST: (process.env.EMAIL_ALLOWLIST || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
+  // Put in front of every subject, e.g. "[TEST]" on staging, so a staging email is never mistaken for a live order.
+  EMAIL_SUBJECT_PREFIX: (process.env.EMAIL_SUBJECT_PREFIX || '').trim(),
 
   // Cloudinary (file storage — replaces local uploads)
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',

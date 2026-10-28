@@ -98,9 +98,10 @@ async function buildOrderRoute(orderId, scope) {
     `SELECT o.id, o.order_number, o.status AS order_status, o.partner_id, o.source_warehouse_id,
             o.customer_lat, o.customer_lng, ${orderIsPublicSql('o')} AS is_public,
             dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type, dt.rider_name,
-            dt.delivered_at
+            dt.delivered_at, dt.courier_tracking_number, c.name AS courier_name
      FROM orders o
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
+     LEFT JOIN couriers c ON c.id = dt.courier_id
      WHERE o.id = ? AND o.is_deleted = 0${scope.clause}
      LIMIT 1`,
     [orderId, ...scope.params]
@@ -132,9 +133,11 @@ async function buildOrderRoute(orderId, scope) {
   const riderPoint = travelled.length ? { lat: travelled.at(-1)[0], lng: travelled.at(-1)[1] } : null;
   const vehicle = row.vehicle_type || 'motorcycle';
   const delivered = row.order_status === 'delivered';
+  // A courier parcel has no rider of ours on the road, so there is nothing to route or map.
+  const courier = row.courier_tracking_number ? { name: row.courier_name || null, waybill: row.courier_tracking_number } : null;
   const from = riderPoint || sourcePoint;
-  const remaining = !delivered && from && destination ? await getRoadRoute(from, destination) : null;
-  const planned = sourcePoint && destination ? await getRoadRoute(sourcePoint, destination) : null;
+  const remaining = !courier && !delivered && from && destination ? await getRoadRoute(from, destination) : null;
+  const planned = !courier && sourcePoint && destination ? await getRoadRoute(sourcePoint, destination) : null;
 
   return {
     order_number: row.order_number,
@@ -152,6 +155,7 @@ async function buildOrderRoute(orderId, scope) {
     // An estimate only means something once a rider is on the way.
     eta: remaining && riderPoint ? estimateArrival(remaining.duration_s, vehicle) : null,
     delivered_at: row.delivered_at || null,
+    courier,
   };
 }
 

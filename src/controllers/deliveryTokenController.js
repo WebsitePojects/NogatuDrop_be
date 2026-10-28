@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { BUYER_EVENTS, enqueueBuyerEmail } = require('../services/buyerEmails');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -280,6 +281,10 @@ async function upsertTracking(conn, orderId, { courier_id, courier_tracking_numb
 const generateDeliveryLink = asyncHandler(async (req, res) => {
   const { order_id, courier_id, courier_tracking_number, vehicle_type } = req.body;
   if (!order_id) throw ApiError.badRequest('order_id is required');
+  if (courier_id) {
+    const [courierRows] = await pool.execute('SELECT id FROM couriers WHERE id = ? AND is_active = 1 LIMIT 1', [courier_id]);
+    if (courierRows.length === 0) throw ApiError.badRequest('Choose a courier from the list');
+  }
 
   let orders;
   try {
@@ -315,7 +320,18 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     const existingToken = await getLatestActiveToken(order_id, conn);
     if (existingToken) {
+      const [[before]] = await conn.execute('SELECT courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1', [order_id]);
       await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: false });
+      // The "on its way" email reads the courier when it is sent; only if it already went out without a
+      // waybill does the buyer get a separate tracking email.
+      if (courier_tracking_number && !(before && before.courier_tracking_number)) {
+        const [[onTheWay]] = await conn.execute(
+          `SELECT COUNT(*) AS sent FROM order_notification_outbox
+           WHERE order_id = ? AND event_type = ? AND user_id IS NULL AND status = 'sent'`,
+          [order_id, BUYER_EVENTS.ON_THE_WAY]
+        );
+        if (Number(onTheWay.sent) > 0) await enqueueBuyerEmail(conn, { orderId: order_id, eventType: BUYER_EVENTS.COURIER });
+      }
       await conn.commit();
       return res.status(200).json({
         success: true,
@@ -341,6 +357,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     // Update order status to 'delivering'
     await conn.execute(`UPDATE orders SET status = 'delivering' WHERE id = ?`, [order_id]);
+    await enqueueBuyerEmail(conn, { orderId: order_id, eventType: BUYER_EVENTS.ON_THE_WAY });
 
     await conn.commit();
 
@@ -416,6 +433,11 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   }
 
   const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token.token}`;
+  // The courier and waybill already saved, so the Delivery section opens with them filled in.
+  const [[shipment]] = await pool.execute(
+    'SELECT courier_id, courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1',
+    [orderId]
+  );
   return res.json({
     success: true,
     data: {
@@ -424,6 +446,8 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
       expires_at: token.expires_at,
       is_used: token.is_used,
       created_at: token.created_at,
+      courier_id: shipment ? shipment.courier_id : null,
+      courier_tracking_number: shipment ? shipment.courier_tracking_number : null,
     },
   });
 });
@@ -794,6 +818,80 @@ const getDeliveryInfo = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * Completes a delivery inside the caller's transaction and returns the Stockist users to email after commit.
+ * The order becomes delivered only once: the conditional UPDATE is the guard, so a Rider Link and a courier
+ * confirmation (or two of either) cannot both take the stock out. Then the tracking row closes, the buyer's
+ * "delivered" email is queued, the reserved stock leaves the warehouse and the Stockist is notified.
+ *
+ * @param {object} order       { id, order_number, partner_id, source_warehouse_id }
+ * @param {string} stockNote   why the stock left, shown in Stock Movements
+ * @param {number} [actorUserId] staff member who confirmed it (null for the rider's link)
+ */
+async function finishDelivery(conn, order, { stockNote, actorUserId = null }) {
+  const orderId = order.id;
+  const [closed] = await conn.execute(
+    `UPDATE orders SET status = 'delivered', delivered_at = NOW()
+     WHERE id = ? AND status NOT IN ('delivered', 'cancelled', 'rejected')`,
+    [orderId]
+  );
+  if (closed.affectedRows !== 1) throw ApiError.conflict('This order is already delivered or closed');
+
+  const [trackingRows] = await conn.execute('SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1', [orderId]);
+  if (trackingRows.length === 0) {
+    await conn.execute(`INSERT INTO delivery_tracking (order_id, status, delivered_at) VALUES (?, 'delivered', NOW())`, [orderId]);
+  } else {
+    await conn.execute(
+      `UPDATE delivery_tracking SET status = 'delivered', delivered_at = NOW(), updated_at = NOW() WHERE order_id = ?`,
+      [orderId]
+    );
+  }
+  await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.DELIVERED });
+
+  let items;
+  try {
+    [items] = await conn.execute('SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?', [orderId]);
+  } catch (err) {
+    if (!isMissingColumn(err, 'source_warehouse_id')) throw err;
+    const [rows] = await conn.execute('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+    items = rows.map((row) => ({ ...row, source_warehouse_id: null }));
+  }
+
+  const fallbackWarehouseId = order.source_warehouse_id || await resolveSourceWarehouseIdForPartner(conn, order.partner_id);
+  for (const item of items) {
+    const wid = item.source_warehouse_id || fallbackWarehouseId;
+    if (!wid) continue;
+    const delivered = await consumeReservedStock(conn, { productId: item.product_id, warehouseId: wid, quantity: item.quantity });
+    if (!delivered) throw ApiError.conflict('Reserved stock is no longer sufficient to complete this delivery');
+    await insertStockMovement(conn, {
+      productId: item.product_id,
+      warehouseId: wid,
+      movementType: 'out',
+      quantity: item.quantity,
+      referenceType: 'order',
+      referenceId: orderId,
+      notes: stockNote,
+      createdBy: actorUserId,
+    });
+  }
+
+  const [partnerUsers] = await conn.execute(
+    `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,
+    [order.partner_id]
+  );
+  for (const pu of partnerUsers) {
+    await insertNotification(conn, {
+      userId: pu.id,
+      type: 'order_delivered',
+      title: `Order Delivered: #${order.order_number}`,
+      message: `Order #${order.order_number} has been delivered.`,
+      entityType: 'order',
+      entityId: orderId,
+    });
+  }
+  return partnerUsers;
+}
+
 // POST /deliver/:token/complete — rider submits POD photo, marks delivery complete
 const completeDelivery = asyncHandler(async (req, res) => {
   const { token } = req.params;
@@ -841,8 +939,10 @@ const completeDelivery = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Mark token used
-    await conn.execute(`UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE id = ?`, [tokenId]);
+    // Mark the link used. The condition makes this the guard: of two submits at once, only one
+    // confirms the delivery, consumes stock and emails the buyer.
+    const [used] = await conn.execute(`UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE id = ? AND is_used = 0`, [tokenId]);
+    if (used.affectedRows !== 1) throw ApiError.conflict('This delivery was already confirmed');
 
     // Create POD record
     try {
@@ -878,88 +978,7 @@ const completeDelivery = asyncHandler(async (req, res) => {
       );
     }
 
-    const [trackingRows] = await conn.execute(
-      'SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1',
-      [orderId]
-    );
-    if (trackingRows.length === 0) {
-      await conn.execute(
-        `INSERT INTO delivery_tracking (order_id, status, delivered_at)
-         VALUES (?, 'delivered', NOW())`,
-        [orderId]
-      );
-    } else {
-      await conn.execute(
-        `UPDATE delivery_tracking SET status = 'delivered', delivered_at = NOW(), updated_at = NOW() WHERE order_id = ?`,
-        [orderId]
-      );
-    }
-
-    // Update order
-    await conn.execute(
-      `UPDATE orders SET status = 'delivered', delivered_at = NOW() WHERE id = ?`,
-      [orderId]
-    );
-
-    // Decrement current_stock and reserved_stock
-    let items;
-    try {
-      [items] = await conn.execute(
-        'SELECT product_id, quantity, source_warehouse_id FROM order_items WHERE order_id = ?',
-        [orderId]
-      );
-    } catch (err) {
-      if (isMissingColumn(err, 'source_warehouse_id')) {
-        const [rows] = await conn.execute(
-          'SELECT product_id, quantity FROM order_items WHERE order_id = ?',
-          [orderId]
-        );
-        items = rows.map((row) => ({ ...row, source_warehouse_id: null }));
-      } else {
-        throw err;
-      }
-    }
-
-    let fallbackWarehouseId = order.source_warehouse_id || null;
-    if (!fallbackWarehouseId) {
-      fallbackWarehouseId = await resolveSourceWarehouseIdForPartner(conn, order.partner_id);
-    }
-
-    for (const item of items) {
-      const wid = item.source_warehouse_id || fallbackWarehouseId;
-      if (wid) {
-        const delivered = await consumeReservedStock(conn, {
-          productId: item.product_id, warehouseId: wid, quantity: item.quantity,
-        });
-        if (!delivered) {
-          throw ApiError.conflict('Reserved stock is no longer sufficient to complete this delivery');
-        }
-        await insertStockMovement(conn, {
-          productId: item.product_id,
-          warehouseId: wid,
-          movementType: 'out',
-          quantity: item.quantity,
-          referenceType: 'order',
-          referenceId: orderId,
-          notes: 'Stock out on delivery confirmation',
-        });
-      }
-    }
-    // Notify Stockist
-    const [partnerUsers] = await conn.execute(
-      `SELECT id, email, name FROM users WHERE partner_id = ? AND is_deleted = 0 AND status = 'active'`,
-      [order.partner_id]
-    );
-    for (const pu of partnerUsers) {
-      await insertNotification(conn, {
-        userId: pu.id,
-        type: 'order_delivered',
-        title: `Order Delivered: #${order.order_number}`,
-        message: `Order #${order.order_number} has been delivered.`,
-        entityType: 'order',
-        entityId: orderId,
-      });
-    }
+    const partnerUsers = await finishDelivery(conn, order, { stockNote: 'Stock out on delivery confirmation' });
 
     await conn.commit();
 
@@ -978,6 +997,58 @@ const completeDelivery = asyncHandler(async (req, res) => {
   }
 });
 
+// POST /api/v1/delivery-tokens/by-order/:orderId/courier-delivered
+// A courier's rider (J&T, LBC, Flash) never opens our Rider Link, so staff close the order once the
+// courier's own page shows it delivered (management, 2026-10-27). Same people as the Rider Link.
+const confirmCourierDelivery = asyncHandler(async (req, res) => {
+  const orderId = req.params.orderId;
+  const [rows] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.placed_by_type, o.status, o.source_warehouse_id,
+            r.slug AS placed_by_role_slug, dt.courier_tracking_number, c.name AS courier_name
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
+     LEFT JOIN couriers c ON c.id = dt.courier_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
+    [orderId]
+  );
+  if (rows.length === 0) throw ApiError.notFound('Order not found');
+  const order = rows[0];
+
+  assertCanManageDeliveryLink(await resolveAffiliationContext(pool, req.user), order);
+  if (!order.courier_tracking_number) {
+    throw ApiError.badRequest('Save the courier and waybill first. Rider deliveries are confirmed by the rider on the Rider Link.');
+  }
+  if (order.status === 'delivered') throw ApiError.conflict('This order is already delivered');
+  if (order.status !== 'delivering') throw ApiError.conflict('Only orders that are on the way can be marked delivered');
+
+  const conn = await pool.getConnection();
+  let partnerUsers;
+  try {
+    await conn.beginTransaction();
+    partnerUsers = await finishDelivery(conn, order, {
+      stockNote: `Delivered by ${order.courier_name || 'courier'} (waybill ${order.courier_tracking_number}), confirmed by staff`,
+      actorUserId: req.user.id,
+    });
+    // An unused Rider Link for this order would otherwise still open a delivery page.
+    await conn.execute('UPDATE delivery_tokens SET is_used = 1, used_at = NOW() WHERE order_id = ? AND is_used = 0', [orderId]);
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  for (const pu of partnerUsers) {
+    const tmpl = EMAIL.orderDelivered(order.order_number);
+    await sendEmail({ to: pu.email, toName: pu.name, ...tmpl });
+  }
+  res.json({ success: true, message: `Order #${order.order_number} marked delivered.` });
+});
+
 module.exports = {
   generateDeliveryLink,
   getLatestDeliveryLinkForOrder,
@@ -985,6 +1056,7 @@ module.exports = {
   listDeliveryProofs,
   getDeliveryInfo,
   completeDelivery,
+  confirmCourierDelivery,
   __testables: {
     canAccessDeliveryProof,
     buildDeliveryProofScope,

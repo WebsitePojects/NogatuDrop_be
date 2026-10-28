@@ -24,6 +24,7 @@ const {
 } = require('../services/publicCheckoutPricing');
 const { getPaymentVerificationDecision } = require('../services/paymentVerification');
 const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
+const { BUYER_EVENTS, enqueueBuyerEmail } = require('../services/buyerEmails');
 const { reserveStock, releaseStock } = require('../services/batchStock');
 const { lookupMlmMember } = require('../services/mlmBridge');
 const { readPublicCustomer, assertBarangayExists } = require('../services/publicCustomerInput');
@@ -1188,6 +1189,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       orderId
     );
     await enqueueOrderNotifications(conn, { orderId, orderNumber, users: [...partnerUsers, ...admins] });
+    await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.PLACED });
 
     const responseBody = {
       success: true,
@@ -1261,7 +1263,7 @@ const approveOrder = asyncHandler(async (req, res) => {
     );
     if (banks.length > 0) {
       const b = banks[0];
-      bankDetails = `${b.bank_name} — ${b.account_name} — ${b.account_number}`;
+      bankDetails = `${b.bank_name} · ${b.account_name} · ${b.account_number}`;
     }
   }
 
@@ -1280,6 +1282,7 @@ const approveOrder = asyncHandler(async (req, res) => {
     if (approved.affectedRows !== 1) {
       throw ApiError.conflict('This order was already handled. Refresh to see its current status.');
     }
+    await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.APPROVED });
 
     // The Stockist who placed an order is told to pay. A public order's partner is the center
     // that just approved it, so there is no one to notify (the buyer sees it on the tracking page).
@@ -1345,6 +1348,7 @@ const rejectOrder = asyncHandler(async (req, res) => {
     if (rejected.affectedRows !== 1) {
       throw ApiError.conflict('This order was already handled. Refresh to see its current status.');
     }
+    await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.CANCELLED });
 
     // Release reserved stock
     const items = await getOrderItemsWithOptionalSourceColumn(conn, orderId);
@@ -1412,10 +1416,15 @@ const cancelOrder = asyncHandler(async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await conn.execute(
-      `UPDATE orders SET status = 'cancelled', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW() WHERE id = ?`,
+    const [cancelled] = await conn.execute(
+      `UPDATE orders SET status = 'cancelled', cancellation_reason = ?, cancelled_by = ?, updated_at = NOW()
+       WHERE id = ? AND status = 'pending' AND is_deleted = 0`,
       [reason || 'Cancelled by Stockist', req.user.id, orderId]
     );
+    // Only the request that actually cancelled releases stock; a double click gets a clean 409.
+    if (cancelled.affectedRows !== 1) {
+      throw ApiError.conflict('This order was already handled. Refresh to see its current status.');
+    }
 
     // Release reserved stock
     const items = await getOrderItemsWithOptionalSourceColumn(conn, orderId);
@@ -1630,6 +1639,7 @@ const verifyPayment = asyncHandler(async (req, res) => {
       `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW() WHERE id = ?`,
       [req.user.id, orderId]
     );
+    await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.PAID });
     await createPendingSettlementForOrder(conn, {
       orderId,
       partnerId: orders[0].partner_id,
