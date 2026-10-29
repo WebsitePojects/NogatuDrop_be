@@ -5,6 +5,7 @@ const pool = require('../config/db');
 const ApiError = require('../utils/ApiError');
 const { orderIsPublicSql } = require('../utils/orderCustomerSql');
 const { getRoadRoute, estimateArrival } = require('./routeService');
+const { isCourierShipment } = require('../utils/courierTracking');
 
 const isMissingColumn = (err, columnName) => (
   err && err.code === 'ER_BAD_FIELD_ERROR' && String(err.message || '').includes(`'${columnName}'`)
@@ -98,7 +99,7 @@ async function buildOrderRoute(orderId, scope) {
     `SELECT o.id, o.order_number, o.status AS order_status, o.partner_id, o.source_warehouse_id,
             o.customer_lat, o.customer_lng, ${orderIsPublicSql('o')} AS is_public,
             dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type, dt.rider_name,
-            dt.delivered_at, dt.courier_tracking_number, c.name AS courier_name
+            dt.delivered_at, dt.courier_tracking_number, dt.courier_tracking_link, c.name AS courier_name
      FROM orders o
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
      LEFT JOIN couriers c ON c.id = dt.courier_id
@@ -134,7 +135,9 @@ async function buildOrderRoute(orderId, scope) {
   const vehicle = row.vehicle_type || 'motorcycle';
   const delivered = row.order_status === 'delivered';
   // A courier parcel has no rider of ours on the road, so there is nothing to route or map.
-  const courier = row.courier_tracking_number ? { name: row.courier_name || null, waybill: row.courier_tracking_number } : null;
+  const courier = isCourierShipment(row)
+    ? { name: row.courier_name || null, waybill: row.courier_tracking_number || null, link: row.courier_tracking_link || null }
+    : null;
   const from = riderPoint || sourcePoint;
   const remaining = !courier && !delivered && from && destination ? await getRoadRoute(from, destination) : null;
   const planned = !courier && sourcePoint && destination ? await getRoadRoute(sourcePoint, destination) : null;

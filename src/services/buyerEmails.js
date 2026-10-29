@@ -1,6 +1,6 @@
 const { renderEmail, siteUrl } = require('./email/layout');
 const { ORDER_STEPS } = require('./email/templates');
-const { courierTrackingUrl } = require('../utils/courierTracking');
+const { isCourierShipment, shipmentTrackingUrl } = require('../utils/courierTracking');
 const { orderCustomerJoins, orderCustomerNameSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
 
 // Status emails to store buyers (management, 2026-10-14). Each one is queued in order_notification_outbox
@@ -39,7 +39,7 @@ async function loadBuyerEmailOrder(db, orderId) {
   const [rows] = await db.execute(
     `SELECT o.order_number, o.customer_first_name, ${orderCustomerNameSql('o')} AS customer_name,
             o.total_amount, o.payment_deadline, o.cancellation_reason, o.status,
-            c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number
+            c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number, dt.courier_tracking_link
      FROM orders o
      ${orderCustomerJoins('o')}
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
@@ -64,15 +64,16 @@ const firstName = (order) => order.customer_first_name || String(order.customer_
 const trackButton = (order, label = 'Track your order') => ({ label, href: trackingPageUrl(order.order_number) });
 const progress = (current, cancelled = false) => ({ steps: { labels: ORDER_STEPS, current, cancelled } });
 
-/** Courier blocks for an order shipped with J&T/LBC/Flash; empty when our own rider delivers. */
+/** Courier blocks for an order shipped with J&T/LBC/Flash (waybill) or Grab/Lalamove (link); empty for our rider. */
 function courierBlocks(order) {
-  if (!order.courier_tracking_number) return [];
+  if (!isCourierShipment(order)) return [];
   const courier = order.courier_name || 'the courier';
-  const url = courierTrackingUrl(order.tracking_url_template, order.courier_tracking_number);
+  const url = shipmentTrackingUrl(order);
+  const waybill = order.courier_tracking_number;
   return [
-    { details: [['Shipped with', courier], ['Waybill number', order.courier_tracking_number, true]] },
+    { details: [['Shipped with', courier], ...(waybill ? [['Waybill number', waybill, true]] : [])] },
     { actions: [...(url ? [{ label: `Track with ${courier}`, href: url }] : []), trackButton(order, 'Our tracking page')] },
-    { p: "If the courier's page asks for it, enter the waybill number above." },
+    { p: waybill ? "If the courier's page asks for it, enter the waybill number above." : `${courier}'s page shows the delivery live while it is on the way.` },
   ];
 }
 
@@ -109,14 +110,15 @@ function buildBuyerEmail(eventType, order) {
     case BUYER_EVENTS.ON_THE_WAY:
       return renderEmail({
         ...base, subject: `Your order #${num} is on its way`,
-        preheader: order.courier_name && order.courier_tracking_number ? `Shipped with ${order.courier_name}.` : 'Follow the rider on the map.',
+        preheader: order.courier_name && isCourierShipment(order) ? `Shipped with ${order.courier_name}.` : 'Follow the rider on the map.',
         heading: 'Your order is on its way',
         blocks: [progress(3), ...(courierBlocks(order).length ? courierBlocks(order)
           : [{ p: 'Our rider has your order. Follow the rider on the map from your tracking page.' }, { actions: [trackButton(order, 'Follow the rider')] }])],
       });
     case BUYER_EVENTS.COURIER:
       return renderEmail({
-        ...base, subject: `Track your parcel: order #${num}`, preheader: `Waybill ${order.courier_tracking_number || ''}`.trim(),
+        ...base, subject: `Track your parcel: order #${num}`,
+        preheader: order.courier_tracking_number ? `Waybill ${order.courier_tracking_number}` : `Follow it live with ${order.courier_name || 'the courier'}.`,
         heading: 'Track your parcel', blocks: [progress(3), ...courierBlocks(order)],
       });
     case BUYER_EVENTS.DELIVERED:

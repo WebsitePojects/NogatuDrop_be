@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { courierTrackingUrl } = require('../src/utils/courierTracking');
+const { courierTrackingUrl, safeTrackingLink, isCourierShipment, shipmentTrackingUrl } = require('../src/utils/courierTracking');
 const { escapeHtml } = require('../src/utils/escapeHtml');
 const { isAllowedRecipient } = require('../src/services/emailService');
 const { BUYER_EVENTS, buildBuyerEmail } = require('../src/services/buyerEmails');
@@ -18,6 +18,25 @@ test('courier link: no link without an http(s) pattern containing the placeholde
   assert.equal(courierTrackingUrl('https://x.ph/track', 'JT1'), null, 'pattern without placeholder');
   assert.equal(courierTrackingUrl('javascript:alert(1)//{tracking_number}', 'JT1'), null);
   assert.equal(courierTrackingUrl('https://x.ph/{tracking_number}', ''), null);
+});
+
+test('Grab/Lalamove share link: only a plain https link is accepted', () => {
+  assert.equal(safeTrackingLink('https://share.lalamove.com/?PH1234&lang=en_PH'), 'https://share.lalamove.com/?PH1234&lang=en_PH');
+  assert.equal(safeTrackingLink('  https://express.grab.com/track/ABC  '), 'https://express.grab.com/track/ABC');
+  for (const bad of ['http://grab.com/t/1', 'javascript:alert(1)', 'https://user:pw@grab.com/t', 'grab.com/t/1', 'https://localhost/x', `https://a.com/${'x'.repeat(500)}`, '', null]) {
+    assert.equal(safeTrackingLink(bad), null, String(bad).slice(0, 40));
+  }
+});
+
+test('a courier shipment is a waybill or a pasted link; the pasted link wins for the Track button', () => {
+  const jt = { tracking_url_template: 'https://www.jtexpress.ph/track-and-trace?waybillNo={tracking_number}', courier_tracking_number: 'JT1' };
+  const grab = { tracking_url_template: null, courier_tracking_number: null, courier_tracking_link: 'https://express.grab.com/track/XYZ' };
+  assert.equal(isCourierShipment(jt), true);
+  assert.equal(isCourierShipment(grab), true);
+  assert.equal(isCourierShipment({ courier_tracking_number: null, courier_tracking_link: null }), false);
+  assert.equal(shipmentTrackingUrl(jt), 'https://www.jtexpress.ph/track-and-trace?waybillNo=JT1');
+  assert.equal(shipmentTrackingUrl(grab), 'https://express.grab.com/track/XYZ');
+  assert.equal(shipmentTrackingUrl({ ...grab, courier_tracking_link: 'javascript:alert(1)' }), null, 'a bad stored link is never shown');
 });
 
 test('escapeHtml turns markup into text', () => {
@@ -56,6 +75,16 @@ test('on-its-way email shows the courier, waybill and a Track button', () => {
   assert.match(email.html, /Track with J&amp;T Express/);
   const ownRider = buildBuyerEmail(BUYER_EVENTS.ON_THE_WAY, { ...order, courier_tracking_number: null });
   assert.match(ownRider.html, /Our rider has your order/);
+});
+
+test('Grab order: on-its-way email has Track with Grab and no waybill row', () => {
+  const grab = { ...order, courier_name: 'Grab Express', tracking_url_template: null, courier_tracking_number: null, courier_tracking_link: 'https://express.grab.com/track/XYZ' };
+  const email = buildBuyerEmail(BUYER_EVENTS.ON_THE_WAY, grab);
+  assert.match(email.html, /href="https:\/\/express\.grab\.com\/track\/XYZ"/);
+  assert.match(email.html, /Track with Grab Express/);
+  assert.doesNotMatch(email.html, /Waybill number/);
+  assert.doesNotMatch(email.html, /Our rider has your order/);
+  assert.match(buildBuyerEmail(BUYER_EVENTS.COURIER, grab).text, /Grab Express/);
 });
 
 test('buyer-typed text is escaped in the email', () => {

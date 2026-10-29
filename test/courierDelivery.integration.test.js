@@ -12,7 +12,7 @@ const opts = { skip: !enabled && 'set NCDMS_DB_TESTS=1 (needs the local database
 let pool;
 let controller;
 let batchStock;
-let base; // { partnerId, otherPartnerId, adminId, courierId, productId, warehouseId }
+let base; // { partnerId, otherPartnerId, adminId, courierId, grabId, productId, warehouseId }
 let inventorySnapshot = [];
 const createdOrderIds = [];
 
@@ -30,7 +30,7 @@ function call(handler, req) {
 
 const adminReq = (orderId) => ({ params: { orderId }, user: { id: base.adminId, role_slug: 'super_admin', partner_id: null } });
 
-async function makeCourierOrder({ status = 'delivering', waybill = 'JT0000000001' } = {}) {
+async function makeCourierOrder({ status = 'delivering', waybill = 'JT0000000001', link = null } = {}) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -49,8 +49,9 @@ async function makeCourierOrder({ status = 'delivering', waybill = 'JT0000000001
     // order must be stopped by the order guard, not by the reservation happening to run out.
     assert.ok(await batchStock.reserveStock(conn, { productId: base.productId, warehouseId: base.warehouseId, quantity: 3 }), 'reserve 3 boxes');
     await conn.execute(
-      `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number) VALUES (?, 'out_for_delivery', ?, ?)`,
-      [orderId, waybill ? base.courierId : null, waybill]
+      `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number, courier_tracking_link)
+       VALUES (?, 'out_for_delivery', ?, ?, ?)`,
+      [orderId, link ? base.grabId : (waybill ? base.courierId : null), link ? null : waybill, link]
     );
     await conn.execute(
       'INSERT INTO delivery_tokens (order_id, token, expires_at, is_used, created_by) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 1 DAY), 0, ?)',
@@ -86,13 +87,14 @@ test.before(async () => {
     `SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.slug = 'super_admin' AND u.is_deleted = 0 LIMIT 1`
   );
   const [[courier]] = await pool.execute("SELECT id FROM couriers WHERE name LIKE 'J&T%' LIMIT 1");
+  const [[grab]] = await pool.execute("SELECT id FROM couriers WHERE name LIKE 'Grab%' LIMIT 1");
   const [[stock]] = await pool.execute(
     'SELECT product_id, warehouse_id FROM inventories WHERE current_stock - reserved_stock >= 10 ORDER BY id LIMIT 1'
   );
-  assert.ok(store && other && admin && courier && stock, 'local database needs a store order, two partners, an admin, J&T and stock');
+  assert.ok(store && other && admin && courier && grab && stock, 'local database needs a store order, two partners, an admin, J&T, Grab and stock');
   base = {
     partnerId: store.partner_id, otherPartnerId: other.id, adminId: admin.id,
-    courierId: courier.id, productId: stock.product_id, warehouseId: stock.warehouse_id,
+    courierId: courier.id, grabId: grab.id, productId: stock.product_id, warehouseId: stock.warehouse_id,
   };
   [inventorySnapshot] = await pool.execute(
     'SELECT id, current_stock, reserved_stock FROM inventories WHERE product_id = ? AND warehouse_id = ?',
@@ -164,4 +166,36 @@ test('refused: no waybill saved (400), not on the way yet (409), another partner
   });
   assert.equal(outsider.status, 403);
   for (const orderId of [noWaybill, notShipped, ok]) assert.equal(await stockOutCount(orderId), 0);
+});
+
+const GRAB_LINK = 'https://express.grab.com/track/TEST123';
+const saveCourierReq = (orderId, body) => ({
+  body: { order_id: orderId, ...body }, user: { id: base.adminId, role_slug: 'super_admin', partner_id: null }, get: () => undefined,
+});
+
+test('a Grab order with only a share link is marked delivered once', opts, async () => {
+  const orderId = await makeCourierOrder({ link: GRAB_LINK });
+  const results = await Promise.all([1, 2].map(() => call(controller.confirmCourierDelivery, adminReq(orderId))));
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409]);
+  assert.equal(await stockOutCount(orderId), 1);
+  const [[movement]] = await pool.execute("SELECT notes FROM stock_movements WHERE reference_type = 'order' AND reference_id = ?", [orderId]);
+  assert.match(movement.notes, /Grab.*tracking link/);
+});
+
+test('saving a Grab link replaces the earlier J&T waybill (no stale half left)', opts, async () => {
+  const orderId = await makeCourierOrder();
+  const saved = await call(controller.generateDeliveryLink, saveCourierReq(orderId, { courier_id: base.grabId, courier_tracking_link: GRAB_LINK }));
+  assert.equal(saved.status, 200, saved.body.message);
+  const [[row]] = await pool.execute('SELECT courier_id, courier_tracking_number, courier_tracking_link FROM delivery_tracking WHERE order_id = ?', [orderId]);
+  assert.equal(Number(row.courier_id), Number(base.grabId));
+  assert.equal(row.courier_tracking_number, null);
+  assert.equal(row.courier_tracking_link, GRAB_LINK);
+});
+
+test('a courier with neither a waybill nor a link is refused (400)', opts, async () => {
+  const orderId = await makeCourierOrder();
+  const res = await call(controller.generateDeliveryLink, saveCourierReq(orderId, { courier_id: base.grabId }));
+  assert.equal(res.status, 400);
+  const [[row]] = await pool.execute('SELECT courier_tracking_number FROM delivery_tracking WHERE order_id = ?', [orderId]);
+  assert.equal(row.courier_tracking_number, 'JT0000000001', 'nothing changed');
 });

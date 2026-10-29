@@ -10,6 +10,7 @@ const { insertNotification } = require('../utils/notificationWriter');
 const { consumeReservedStock } = require('../services/batchStock');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql } = require('../utils/orderCustomerSql');
 const { buildOrderRoute, UNSCOPED } = require('../services/orderRouteService');
+const { isCourierShipment } = require('../utils/courierTracking');
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
@@ -252,35 +253,50 @@ async function getDeliveryProofOwnership(orderId) {
 }
 
 /**
- * Creates or updates the order's delivery_tracking row. A vehicle or courier left out keeps the
- * stored value, so regenerating a link without picking again does not reset it.
+ * Creates or updates the order's delivery_tracking row. Saving a courier replaces the whole shipment (courier,
+ * waybill and pasted link), so switching from a J&T waybill to a Grab link leaves no stale half behind. A
+ * vehicle-only update keeps the stored courier, so regenerating a link without picking again resets nothing.
  */
-async function upsertTracking(conn, orderId, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery }) {
+async function upsertTracking(conn, orderId, { courier_id, courier_tracking_number, courier_tracking_link, vehicle_type, setOutForDelivery }) {
+  const waybill = courier_tracking_number || null;
+  const link = courier_tracking_link || null;
   const [trackingRows] = await conn.execute('SELECT id FROM delivery_tracking WHERE order_id = ? LIMIT 1', [orderId]);
   if (trackingRows.length === 0) {
     await conn.execute(
-      `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number, vehicle_type)
-       VALUES (?, 'out_for_delivery', ?, ?, ?)`,
-      [orderId, courier_id || null, courier_tracking_number || null, vehicle_type || 'motorcycle']
+      `INSERT INTO delivery_tracking (order_id, status, courier_id, courier_tracking_number, courier_tracking_link, vehicle_type)
+       VALUES (?, 'out_for_delivery', ?, ?, ?, ?)`,
+      [orderId, courier_id || null, waybill, link, vehicle_type || 'motorcycle']
+    );
+    return;
+  }
+  if (courier_id) {
+    await conn.execute(
+      `UPDATE delivery_tracking
+       SET status = IF(?, 'out_for_delivery', status), courier_id = ?, courier_tracking_number = ?, courier_tracking_link = ?,
+           vehicle_type = COALESCE(?, vehicle_type), updated_at = NOW()
+       WHERE order_id = ?`,
+      [setOutForDelivery ? 1 : 0, courier_id, waybill, link, vehicle_type || null, orderId]
     );
     return;
   }
   await conn.execute(
     `UPDATE delivery_tracking
-     SET status = IF(?, 'out_for_delivery', status),
-         courier_id = COALESCE(?, courier_id),
-         courier_tracking_number = COALESCE(?, courier_tracking_number),
-         vehicle_type = COALESCE(?, vehicle_type),
-         updated_at = NOW()
+     SET status = IF(?, 'out_for_delivery', status), vehicle_type = COALESCE(?, vehicle_type), updated_at = NOW()
      WHERE order_id = ?`,
-    [setOutForDelivery ? 1 : 0, courier_id || null, courier_tracking_number || null, vehicle_type || null, orderId]
+    [setOutForDelivery ? 1 : 0, vehicle_type || null, orderId]
   );
 }
 
 // POST /api/v1/delivery-tokens — create the Rider Link for an order (body validated in routes)
 const generateDeliveryLink = asyncHandler(async (req, res) => {
-  const { order_id, courier_id, courier_tracking_number, vehicle_type } = req.body;
+  const { order_id, courier_id, courier_tracking_number, courier_tracking_link, vehicle_type } = req.body;
   if (!order_id) throw ApiError.badRequest('order_id is required');
+  if ((courier_tracking_number || courier_tracking_link) && !courier_id) {
+    throw ApiError.badRequest('Choose the courier for this waybill or tracking link');
+  }
+  if (courier_id && !courier_tracking_number && !courier_tracking_link) {
+    throw ApiError.badRequest('Type the waybill number (J&T, LBC, Flash) or paste the tracking link (Grab, Lalamove)');
+  }
   if (courier_id) {
     const [courierRows] = await pool.execute('SELECT id FROM couriers WHERE id = ? AND is_active = 1 LIMIT 1', [courier_id]);
     if (courierRows.length === 0) throw ApiError.badRequest('Choose a courier from the list');
@@ -320,11 +336,13 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
 
     const existingToken = await getLatestActiveToken(order_id, conn);
     if (existingToken) {
-      const [[before]] = await conn.execute('SELECT courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1', [order_id]);
-      await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: false });
+      const [[before]] = await conn.execute(
+        'SELECT courier_tracking_number, courier_tracking_link FROM delivery_tracking WHERE order_id = ? LIMIT 1', [order_id]
+      );
+      await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, courier_tracking_link, vehicle_type, setOutForDelivery: false });
       // The "on its way" email reads the courier when it is sent; only if it already went out without a
-      // waybill does the buyer get a separate tracking email.
-      if (courier_tracking_number && !(before && before.courier_tracking_number)) {
+      // waybill or link does the buyer get a separate tracking email.
+      if ((courier_tracking_number || courier_tracking_link) && !isCourierShipment(before)) {
         const [[onTheWay]] = await conn.execute(
           `SELECT COUNT(*) AS sent FROM order_notification_outbox
            WHERE order_id = ? AND event_type = ? AND user_id IS NULL AND status = 'sent'`,
@@ -353,7 +371,7 @@ const generateDeliveryLink = asyncHandler(async (req, res) => {
       [order_id, token, expiresAt, req.user.id]
     );
 
-    await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, vehicle_type, setOutForDelivery: true });
+    await upsertTracking(conn, order_id, { courier_id, courier_tracking_number, courier_tracking_link, vehicle_type, setOutForDelivery: true });
 
     // Update order status to 'delivering'
     await conn.execute(`UPDATE orders SET status = 'delivering' WHERE id = ?`, [order_id]);
@@ -433,9 +451,9 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
   }
 
   const magicLink = `${resolveFrontendBaseUrl(req)}/deliver/${token.token}`;
-  // The courier and waybill already saved, so the Delivery section opens with them filled in.
+  // The courier and waybill (or pasted link) already saved, so the Delivery section opens with them filled in.
   const [[shipment]] = await pool.execute(
-    'SELECT courier_id, courier_tracking_number FROM delivery_tracking WHERE order_id = ? LIMIT 1',
+    'SELECT courier_id, courier_tracking_number, courier_tracking_link FROM delivery_tracking WHERE order_id = ? LIMIT 1',
     [orderId]
   );
   return res.json({
@@ -448,6 +466,7 @@ const getLatestDeliveryLinkForOrder = asyncHandler(async (req, res) => {
       created_at: token.created_at,
       courier_id: shipment ? shipment.courier_id : null,
       courier_tracking_number: shipment ? shipment.courier_tracking_number : null,
+      courier_tracking_link: shipment ? shipment.courier_tracking_link : null,
     },
   });
 });
@@ -1004,7 +1023,7 @@ const confirmCourierDelivery = asyncHandler(async (req, res) => {
   const orderId = req.params.orderId;
   const [rows] = await pool.execute(
     `SELECT o.id, o.order_number, o.partner_id, o.placed_by, o.placed_by_type, o.status, o.source_warehouse_id,
-            r.slug AS placed_by_role_slug, dt.courier_tracking_number, c.name AS courier_name
+            r.slug AS placed_by_role_slug, dt.courier_tracking_number, dt.courier_tracking_link, c.name AS courier_name
      FROM orders o
      LEFT JOIN users u ON u.id = o.placed_by
      LEFT JOIN roles r ON r.id = u.role_id
@@ -1018,8 +1037,8 @@ const confirmCourierDelivery = asyncHandler(async (req, res) => {
   const order = rows[0];
 
   assertCanManageDeliveryLink(await resolveAffiliationContext(pool, req.user), order);
-  if (!order.courier_tracking_number) {
-    throw ApiError.badRequest('Save the courier and waybill first. Rider deliveries are confirmed by the rider on the Rider Link.');
+  if (!isCourierShipment(order)) {
+    throw ApiError.badRequest('Save the courier with its waybill or tracking link first. Rider deliveries are confirmed by the rider on the Rider Link.');
   }
   if (order.status === 'delivered') throw ApiError.conflict('This order is already delivered');
   if (order.status !== 'delivering') throw ApiError.conflict('Only orders that are on the way can be marked delivered');
@@ -1029,7 +1048,7 @@ const confirmCourierDelivery = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
     partnerUsers = await finishDelivery(conn, order, {
-      stockNote: `Delivered by ${order.courier_name || 'courier'} (waybill ${order.courier_tracking_number}), confirmed by staff`,
+      stockNote: `Delivered by ${order.courier_name || 'courier'} (${order.courier_tracking_number ? `waybill ${order.courier_tracking_number}` : 'tracking link'}), confirmed by staff`,
       actorUserId: req.user.id,
     });
     // An unused Rider Link for this order would otherwise still open a delivery page.

@@ -1,5 +1,5 @@
 const { amountStillOwed } = require('../services/orderBalance');
-const { courierTrackingUrl } = require('../utils/courierTracking');
+const { shipmentTrackingUrl } = require('../utils/courierTracking');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -126,7 +126,7 @@ const getPublicTracking = asyncHandler(async (req, res) => {
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type,
             dt.est_delivery_at,
-            c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number
+            c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number, dt.courier_tracking_link
      FROM orders o
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
      LEFT JOIN couriers c ON c.id = dt.courier_id
@@ -189,9 +189,10 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       // second upload. Only a yes/no here; the amount needs the phone check.
       extra_payment_due: isPaymentDue(row) && Boolean(row.owes_more),
       courier: row.courier_name || null,
-      // Shipped with a courier (J&T, LBC, Flash): the waybill and the courier's own tracking page.
+      // Shipped with a courier: the waybill (J&T, LBC, Flash) and the courier's own tracking page, which for
+      // Grab / Lalamove is the share link staff pasted.
       courier_tracking_number: row.courier_tracking_number || null,
-      courier_tracking_url: courierTrackingUrl(row.tracking_url_template, row.courier_tracking_number),
+      courier_tracking_url: shipmentTrackingUrl(row),
       gps,
       source_warehouse: sourceWarehouse,
       eta: row.est_delivery_at || null,

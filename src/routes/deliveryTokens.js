@@ -7,6 +7,7 @@ const c = require('../controllers/deliveryTokenController');
 const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
 const { VEHICLE_TYPES } = require('../utils/vehicleTypes');
+const { safeTrackingLink, TRACKING_LINK_MAX } = require('../utils/courierTracking');
 
 const r = Router();
 const { requirePermission } = role;
@@ -23,6 +24,10 @@ r.post(
     // A waybill is letters, digits and dashes; it is shown to the buyer and put in the courier's link.
     body('courier_tracking_number').optional({ values: 'falsy' }).isString().trim()
       .matches(/^[A-Za-z0-9-]{4,40}$/).withMessage('Waybill number: 4 to 40 letters, digits or dashes'),
+    // Grab / Lalamove: the share link from the courier's app. It is sent to the buyer, so only plain https links.
+    body('courier_tracking_link').optional({ values: 'falsy' }).isString().trim()
+      .isLength({ max: TRACKING_LINK_MAX }).withMessage(`Tracking link: at most ${TRACKING_LINK_MAX} characters`)
+      .custom((value) => safeTrackingLink(value) !== null).withMessage('Paste the full tracking link from the courier app (it starts with https://)'),
   ],
   validate,
   c.generateDeliveryLink
