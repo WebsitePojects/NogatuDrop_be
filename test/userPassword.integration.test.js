@@ -12,6 +12,8 @@ const opts = { skip: !enabled && 'set NCDMS_DB_TESTS=1 (needs the local database
 
 let pool;
 let users;
+let auth;
+let testEmail;
 let redis;
 let env;
 let userId;
@@ -25,6 +27,7 @@ function call(handler, req) {
     const res = {
       statusCode: 200,
       status(code) { this.statusCode = code; return this; },
+      cookie() { return this; },
       json(body) { resolve({ status: this.statusCode, body }); },
     };
     handler(req, res, (err) => resolve({ status: err?.statusCode || 500, body: { message: err?.message } }));
@@ -50,6 +53,7 @@ test.before(async () => {
   if (!enabled) return;
   pool = require('../src/config/db');
   users = require('../src/controllers/userController');
+  auth = require('../src/controllers/authController');
   redis = require('../src/config/redis');
   env = require('../src/config/env');
   savedEnv = { EMAIL_PROVIDER: env.EMAIL_PROVIDER, RESEND_API_KEY: env.RESEND_API_KEY, EMAIL_ALLOWLIST: env.EMAIL_ALLOWLIST };
@@ -60,10 +64,11 @@ test.before(async () => {
   adminUser.id = admin.id;
   const [[role]] = await pool.execute("SELECT id FROM roles WHERE slug = 'super_admin' LIMIT 1");
   const stamp = Date.now();
+  testEmail = `pwtest.${stamp}@gmail.com`;
   const [created] = await pool.execute(
     `INSERT INTO users (name, email, username, password, role_id, level, location, status)
      VALUES ('Password Test', ?, ?, ?, ?, 'main', 'Test', 'active')`,
-    [`pwtest.${stamp}@gmail.com`, `pwtest${stamp}`, await bcrypt.hash('OldPass123', 12), role.id]
+    [testEmail, `pwtest${stamp}`, await bcrypt.hash('OldPass123', 12), role.id]
   );
   userId = created.insertId;
 });
@@ -77,12 +82,16 @@ test.after(async () => {
   await pool.end();
 });
 
+const login = (password) => call(auth.login, { body: { email: testEmail, password }, headers: {}, ip: '127.0.0.1', get: () => '' });
+
 const editReq = (body) => ({ params: { id: String(userId) }, body, user: adminUser });
 
 test('Edit User: a new password is saved; blank keeps it; a short one is refused', opts, async () => {
   const saved = await call(users.updateUser, editReq({ password: 'NewPass456' }));
   assert.equal(saved.status, 200, saved.body.message);
   assert.equal(await bcrypt.compare('NewPass456', await storedHash()), true);
+  assert.equal((await login('NewPass456')).status, 200, 'the user signs in with the new password');
+  assert.equal((await login('OldPass123')).status, 401, 'the old password no longer works');
 
   const before = await storedHash();
   assert.equal((await call(users.updateUser, editReq({ name: 'Password Test 2', password: '' }))).status, 200);
