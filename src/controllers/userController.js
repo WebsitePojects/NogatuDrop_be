@@ -6,6 +6,10 @@ const paginate = require('../utils/paginate');
 const { resolveUserAssignment } = require('../rbac/userAssignments');
 const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 const { normalizeUsername, isValidUsername } = require('../utils/username');
+const redis = require('../config/redis');
+const { sendPasswordResetCode } = require('../services/passwordResetCode');
+
+const MIN_PASSWORD_LENGTH = 8;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isMissingColumnError = (err) => err && err.code === 'ER_BAD_FIELD_ERROR';
@@ -323,7 +327,7 @@ const createUser = asyncHandler(async (req, res) => {
 
 // PUT /api/v1/users/:id
 const updateUser = asyncHandler(async (req, res) => {
-  const { name, email, phone, role_id, role_slug, partner_id, warehouse_id, level, location, status } = req.body;
+  const { name, email, phone, role_id, role_slug, partner_id, warehouse_id, level, location, status, password } = req.body;
   const userId = req.params.id;
 
   const normalizedEmail = typeof email === 'string' ? email.trim() : email;
@@ -444,6 +448,16 @@ const updateUser = asyncHandler(async (req, res) => {
     values.push(clearWarehouse ? null : warehouseRow.id);
   }
 
+  // A new password typed in Edit User; blank keeps the current one (the screen sends nothing then).
+  const passwordChanged = typeof password === 'string' && password !== '';
+  if (password !== undefined && password !== null && password !== '') {
+    if (!passwordChanged || password.length < MIN_PASSWORD_LENGTH) {
+      throw ApiError.badRequest(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+    }
+    fields.push('password = ?');
+    values.push(await bcrypt.hash(password, 12));
+  }
+
   if (fields.length === 0) throw ApiError.badRequest('No fields to update');
 
   values.push(userId);
@@ -476,6 +490,8 @@ const updateUser = asyncHandler(async (req, res) => {
     [userId]
   );
 
+  // A changed password ends the user's existing sessions: their saved refresh token no longer works.
+  if (passwordChanged) await redis.del(`refresh:${userId}`);
   res.json({ success: true, message: 'User updated', data: updated[0] });
 });
 
@@ -491,27 +507,20 @@ const resetUserPassword = asyncHandler(async (req, res) => {
   }
 
   const [existing] = await pool.execute(
-    `SELECT id FROM users ${checkWhere} LIMIT 1`,
+    `SELECT id, name, email, status FROM users ${checkWhere} LIMIT 1`,
     checkParams
   );
   if (existing.length === 0) throw ApiError.notFound('User not found');
+  const user = existing[0];
+  if (user.status !== 'active') throw ApiError.badRequest('This account is not active. Set it to Active first.');
 
-  // Generate a strong random temporary password (16 hex chars = 64 bits entropy)
-  const crypto = require('crypto');
-  const temporaryPassword = crypto.randomBytes(8).toString('hex');
-
-  const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
-
-  await pool.execute(
-    'UPDATE users SET password = ? WHERE id = ? AND is_deleted = 0',
-    [hashedPassword, userId]
-  );
-
-  res.json({
-    success: true,
-    data: { temporary_password: temporaryPassword },
-    message: 'Password reset',
-  });
+  // The password itself is not touched: the user gets a reset code by email and chooses the new password
+  // (it used to be replaced by a random one that nobody was ever shown, which locked the user out).
+  const result = await sendPasswordResetCode(user);
+  if (!result || !result.sent) {
+    throw new ApiError(502, `The reset email to ${user.email} could not be sent. The password was not changed.`);
+  }
+  res.json({ success: true, message: `A reset code was emailed to ${user.email}. The password stays the same until they use it.` });
 });
 
 // DELETE /api/v1/users/:id (soft delete)

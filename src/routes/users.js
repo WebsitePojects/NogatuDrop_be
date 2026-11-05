@@ -65,6 +65,8 @@ router.put(
     body('email').optional().isEmail(),
     body('username').optional({ values: 'null' }).isString().withMessage('Username must be text'),
     body('status').optional().isIn(['active', 'inactive', 'suspended']),
+    body('password').optional({ values: 'falsy' }).isString().isLength({ min: 8 })
+      .withMessage('Password must be at least 8 characters'),
     body('level').optional().isIn(['main', 'regional', 'city']),
   ],
   validate,

@@ -2,10 +2,10 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const redis = require('../config/redis');
+const { sendPasswordResetCode } = require('../services/passwordResetCode');
 const env = require('../config/env');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
-const { sendEmail, EMAIL } = require('../services/emailService');
 const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 
 function parseExpiry(str) {
@@ -270,14 +270,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
     return res.json({ success: true, message: 'If that email exists, a reset code has been sent.' });
   }
 
-  const user = users[0];
-  const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit OTP
-  const ttlSeconds = 15 * 60; // 15 minutes
-
-  await redis.setex(`otp:reset:${user.id}`, ttlSeconds, otp);
-
-  const tmpl = EMAIL.passwordReset(otp);
-  await sendEmail({ to: user.email, toName: user.name, ...tmpl });
+  await sendPasswordResetCode(users[0]);
 
   res.json({ success: true, message: 'If that email exists, a reset code has been sent.' });
 });
