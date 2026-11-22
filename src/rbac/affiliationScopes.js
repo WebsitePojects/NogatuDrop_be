@@ -223,11 +223,30 @@ function canApproveOrderFromContext(context, order) {
   return false;
 }
 
+/**
+ * SQL for the Stockist that owns the account an order was told to pay into (bank_accounts -> warehouses), or
+ * NULL for a company account. `orderAlias` is a plain identifier from code.
+ */
+function paymentReceiverPartnerSql(orderAlias = 'o') {
+  if (!/^[a-z_]+$/i.test(orderAlias)) throw new Error('paymentReceiverPartnerSql needs a plain table alias');
+  return `(SELECT rw.partner_id FROM bank_accounts rba JOIN warehouses rw ON rw.id = rba.warehouse_id
+           WHERE rba.id = ${orderAlias}.payment_account_id)`;
+}
+
+/**
+ * Who confirms an order's payment. Store orders: whoever received the money. A Stockist shipping to its own
+ * territory is paid into its own account and verifies it (Sir Dino, 2026-11-23); money paid into a Nogatu
+ * account is verified by Super Admin (2026-10-08). `order.payment_received_by_partner_id` must be selected with
+ * paymentReceiverPartnerSql. Super Admin may always verify.
+ */
 function canVerifyPaymentFromContext(context, order) {
-  // Store-order money goes to the company account, so Super Admin confirms it (management, 2026-10-08),
-  // whoever ships the order. Centers verify nothing until management hands it to staff.
-  if (order?.placed_by_type === 'public' && canonicalRole(context?.role) !== ROLES.SUPER_ADMIN) {
-    return false;
+  if (canonicalRole(context?.role) === ROLES.SUPER_ADMIN) return true;
+  if (order?.placed_by_type === 'public') {
+    const receiverPartnerId = Number(order?.payment_received_by_partner_id || 0);
+    return receiverPartnerId > 0
+      && receiverPartnerId === Number(order?.partner_id || 0)
+      && [ROLES.PROVINCIAL_STOCKIST, ROLES.CITY_STOCKIST].includes(canonicalRole(context?.partnerLevel))
+      && canApproveOrderFromContext(context, order);
   }
   if (canonicalRole(context?.partnerLevel) === PARTNER_LEVELS.CENTER) {
     return false;
@@ -249,6 +268,7 @@ module.exports = {
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
   canVerifyPaymentFromContext,
+  paymentReceiverPartnerSql,
   canManageDeliveryLinkFromContext,
   canChangeShippingFeeFromContext,
   __testables: {

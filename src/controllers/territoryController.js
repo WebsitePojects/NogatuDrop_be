@@ -50,6 +50,42 @@ function suggestedArea(stockist) {
   return null;
 }
 
+/**
+ * A deleted Stockist no longer serves anyone, but its row would hold the area forever (one Stockist per area,
+ * unique key). Clearing old test Stockists (meeting 2026-11-10) must not lock their provinces, so claiming
+ * an area first drops a deleted holder's row. Inactive Stockists keep theirs: they may be switched back on.
+ */
+async function releaseAreaFromDeletedStockist(conn, area) {
+  await conn.execute(
+    `DELETE t FROM stockist_territories t JOIN partners p ON p.id = t.partner_id
+     WHERE t.area_type = ? AND t.area_code = ? AND p.is_deleted = 1`,
+    [area.area_type, area.area_code]
+  );
+}
+
+/**
+ * Gives a new Stockist its home area as territory: a Provincial Stockist its province, a City Stockist its
+ * city, read from the Stockist's own address ("detected", Sir Dino 2026-11-10). Store orders from there then
+ * go to this Stockist. Skipped, never taken over, when another Stockist already serves the area.
+ * Runs on the caller's transaction. Returns { assigned, area_name, held_by } for the screen's message.
+ */
+async function assignHomeTerritory(conn, partnerId, userId) {
+  const area = suggestedArea(await loadStockist(conn, partnerId));
+  if (!area) return { assigned: false, area_name: null, held_by: null };
+  await releaseAreaFromDeletedStockist(conn, area);
+  const [holder] = await conn.execute(
+    `SELECT p.business_name FROM stockist_territories t JOIN partners p ON p.id = t.partner_id
+     WHERE t.area_type = ? AND t.area_code = ? LIMIT 1`,
+    [area.area_type, area.area_code]
+  );
+  if (holder.length > 0) return { assigned: false, area_name: area.area_name, held_by: holder[0].business_name };
+  await conn.execute(
+    'INSERT INTO stockist_territories (partner_id, area_type, area_code, created_by) VALUES (?, ?, ?, ?)',
+    [partnerId, area.area_type, area.area_code, userId]
+  );
+  return { assigned: true, area_name: area.area_name, held_by: null };
+}
+
 // GET /api/v1/partners/:id/territories
 const getTerritories = asyncHandler(async (req, res) => {
   const stockist = await loadStockist(pool, req.params.id);
@@ -79,6 +115,7 @@ const setTerritories = asyncHandler(async (req, res) => {
     for (const area of areas) {
       const [found] = await conn.execute(`SELECT code FROM ${AREA_TABLE[area.area_type]} WHERE code = ? LIMIT 1`, [area.area_code]);
       if (found.length === 0) throw ApiError.badRequest(`Unknown ${area.area_type} code ${area.area_code}`);
+      await releaseAreaFromDeletedStockist(conn, area);
       const [holder] = await conn.execute(
         `SELECT p.business_name FROM stockist_territories t JOIN partners p ON p.id = t.partner_id
          WHERE t.area_type = ? AND t.area_code = ? AND t.partner_id <> ? LIMIT 1`,
@@ -110,4 +147,4 @@ const setTerritories = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { getTerritories, setTerritories };
+module.exports = { getTerritories, setTerritories, assignHomeTerritory };

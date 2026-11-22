@@ -86,3 +86,22 @@ test('center staff approve and ship the public orders routed to their own center
   assert.equal(canApproveOrderFromContext(tycoonStaff, { partner_id: 16, placed_by_role_slug: null }), false, 'unknown origin fails closed');
   assert.equal(canVerifyPaymentFromContext(tycoonStaff, ownPublic), false, 'payment checks stay with Super Admin');
 });
+
+test('store-order payment is verified by whoever received the money (2026-11-23)', () => {
+  const { canVerifyPaymentFromContext, paymentReceiverPartnerSql } = require('../src/rbac/affiliationScopes');
+  const davao = { role: 'provincial_stockist', partnerId: 20, partnerLevel: 'provincial_stockist', childCityPartnerIds: [] };
+  const otherStockist = { ...davao, partnerId: 16 };
+  const center = { role: 'staff', partnerId: 18, partnerLevel: 'center', childCityPartnerIds: [] };
+  const superAdmin = { role: 'super_admin', partnerId: null, partnerLevel: null };
+  const paidToDavao = { placed_by_type: 'public', partner_id: 20, payment_received_by_partner_id: 20 };
+  const paidToNogatu = { placed_by_type: 'public', partner_id: 20, payment_received_by_partner_id: null };
+
+  assert.equal(canVerifyPaymentFromContext(davao, paidToDavao), true, 'the Stockist paid into its own account verifies');
+  assert.equal(canVerifyPaymentFromContext(davao, paidToNogatu), false, 'money paid to Nogatu is not the Stockist\'s to confirm');
+  assert.equal(canVerifyPaymentFromContext(otherStockist, paidToDavao), false);
+  assert.equal(canVerifyPaymentFromContext(center, { ...paidToDavao, partner_id: 18, payment_received_by_partner_id: 18 }), false,
+    'centers do not verify; Nogatu money stays with Super Admin');
+  assert.equal(canVerifyPaymentFromContext(superAdmin, paidToDavao), true);
+  assert.equal(canVerifyPaymentFromContext(superAdmin, paidToNogatu), true);
+  assert.throws(() => paymentReceiverPartnerSql('o; DROP'), /plain table alias/);
+});

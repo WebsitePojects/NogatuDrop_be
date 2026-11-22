@@ -74,7 +74,7 @@ test('every staff email renders with subject, HTML and text, and escapes names',
     orderPlaced: ['ORD-1', '<b>Shop</b>'], orderApproved: ['ORD-1', 24, 'BDO · Nogatu · 0065'], paymentProofUploaded: ['ORD-1', 'City'],
     paymentVerified: ['ORD-1'], riderDispatched: ['ORD-1', 'J&T', 'JT1'], orderDelivered: ['ORD-1'], orderCancelledDeadline: ['ORD-1'],
     orderRejected: ['ORD-1', 'Out of stock'], lowStock: ['Berry', 'TYCOON', 4], autoPO: ['PO-1', 'Berry'], grnDiscrepancy: ['G-1', 'Berry', 10, 8],
-    batchExpiry: ['Berry', '2026-11-01', 'TYCOON'], dtaReceived: ['Ana', 'Ana Store'], dtaApproved: ['Ana', 'ana@example.com', 'Temp#123'],
+    batchExpiry: ['Berry', '2026-11-01', 'TYCOON'], dtaReceived: ['Ana', 'Ana Store'], dtaApproved: ['Ana', 'ana@example.com'],
     passwordReset: ['123456'],
   };
   assert.deepEqual(Object.keys(samples).sort(), Object.keys(EMAIL).sort(), 'a sample for every template');

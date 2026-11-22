@@ -74,3 +74,52 @@ test('browsing the influencer page and payment options does not spend the order 
   const order = await viaNginx('/api/v1/orders/public', shopper);
   assert.notEqual(order.status, 429, 'shopper can still submit an order after browsing');
 });
+
+// Working-day budgets (2026-11-23): staff counted per user, riders per Rider Link, member sign-in per username.
+function call(path, { forwardedFor, method = 'GET', token, body } = {}) {
+  return fetch(`${baseUrl}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Forwarded-For': forwardedFor,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    ...(method === 'POST' ? { body: JSON.stringify(body || {}) } : {}),
+  });
+}
+
+test('signed-in staff in one office each get their own budget, separate from the office IP', async () => {
+  const jwt = require('jsonwebtoken');
+  const env = require('../src/config/env');
+  const office = '203.0.113.60';
+  const anonymous = await statuses(601, () => call('/api/health', { forwardedFor: office }));
+  assert.equal(anonymous.slice(0, 600).includes(429), false, 'anonymous callers get 600 per window');
+  assert.equal(anonymous[600], 429, 'the 601st anonymous call from one IP is limited');
+
+  const staff = jwt.sign({ id: 990001, role_slug: 'staff' }, env.JWT_SECRET, { expiresIn: '5m' });
+  const res = await call('/api/health', { forwardedFor: office, token: staff });
+  assert.equal(res.status, 200, 'a signed-in user behind the same IP is not blocked by it');
+  assert.equal(res.headers.get('ratelimit-limit'), '900');
+
+  const forged = await call('/api/health', { forwardedFor: office, token: `${staff}x` });
+  assert.equal(forged.status, 429, 'a forged token counts against the IP');
+});
+
+test('rider pings are counted per Rider Link, not per (shared mobile) IP', async () => {
+  const carrier = '203.0.113.70';
+  const first = await statuses(121, () => call('/api/v1/tracking/ping/link-aaaaaaaa', { forwardedFor: carrier, method: 'POST' }));
+  assert.equal(first.slice(0, 120).includes(429), false);
+  assert.equal(first[120], 429, 'the 121st ping for one link is limited');
+  const otherRider = await call('/api/v1/tracking/ping/link-bbbbbbbb', { forwardedFor: carrier, method: 'POST' });
+  assert.notEqual(otherRider.status, 429, 'another rider on the same carrier IP still pings');
+});
+
+test('member sign-in: five failed tries lock that username, not the next member', async () => {
+  const tries = await statuses(6, (i) => call('/api/v1/members/verify', {
+    forwardedFor: `203.0.113.${80 + i}`, method: 'POST', body: { username: 'Juan01', password: `guess${i}` },
+  }));
+  assert.equal(tries.slice(0, 5).includes(429), false, `limited early: ${tries}`);
+  assert.equal(tries[5], 429, 'a 6th try for the same username from any IP is limited');
+  const other = await call('/api/v1/members/verify', { forwardedFor: '203.0.113.90', method: 'POST', body: { username: 'maria02', password: 'x' } });
+  assert.notEqual(other.status, 429);
+});

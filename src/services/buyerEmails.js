@@ -39,6 +39,7 @@ async function loadBuyerEmailOrder(db, orderId) {
   const [rows] = await db.execute(
     `SELECT o.order_number, o.customer_first_name, ${orderCustomerNameSql('o')} AS customer_name,
             o.total_amount, o.payment_deadline, o.cancellation_reason, o.status,
+            o.delivery_eta_from, o.delivery_eta_to, o.payment_status,
             c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number, dt.courier_tracking_link
      FROM orders o
      ${orderCustomerJoins('o')}
@@ -54,6 +55,20 @@ const peso = (value) => `PHP ${Number(value || 0).toLocaleString('en-PH', { mini
 const manilaTime = (value) => (value ? new Date(value).toLocaleString('en-PH', {
   timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
 }) : null);
+
+// 'YYYY-MM-DD' dates quoted at checkout -> "Nov 18 to Nov 23". Read as UTC so the day never shifts.
+const calendarDay = (isoDate) => new Date(`${isoDate}T00:00:00Z`).toLocaleDateString('en-PH', {
+  timeZone: 'UTC', month: 'short', day: 'numeric',
+});
+const deliveryWindow = (order) => (order.delivery_eta_from && order.delivery_eta_to
+  ? `${calendarDay(order.delivery_eta_from)} to ${calendarDay(order.delivery_eta_to)}`
+  : null);
+// Before payment the dates assume it is paid today; verifying payment recounts them from that day.
+const deliveryRow = (order) => {
+  const dates = deliveryWindow(order);
+  if (!dates) return [];
+  return [[order.payment_status === 'paid' ? 'Estimated delivery' : 'Estimated delivery (if paid today)', dates]];
+};
 
 function trackingPageUrl(orderNumber) {
   return siteUrl(`/track/${encodeURIComponent(orderNumber)}`);
@@ -86,7 +101,8 @@ function buildBuyerEmail(eventType, order) {
       return renderEmail({
         ...base, subject: `We received your order #${num}`, preheader: 'We will email you once it is approved, with how to pay.',
         heading: 'Thank you for your order',
-        blocks: [progress(0), { details: [['Order', `#${num}`, true], ['Total', peso(order.total_amount)]] },
+        blocks: [progress(0), { details: [['Order', `#${num}`, true], ['Total', peso(order.total_amount)],
+          ...deliveryRow(order)] },
           { p: 'We will email you once the order is approved, with how to pay.' }, { actions: [trackButton(order)] }],
       });
     case BUYER_EVENTS.APPROVED: {
@@ -96,6 +112,7 @@ function buildBuyerEmail(eventType, order) {
         preheader: `Pay ${peso(order.total_amount)}${due ? ` by ${due}` : ''} to confirm your order.`,
         heading: 'Your order is approved',
         blocks: [progress(1), { highlight: { label: 'Amount to pay', value: peso(order.total_amount) } },
+          ...(deliveryRow(order).length ? [{ details: deliveryRow(order) }] : []),
           ...(due ? [{ notice: { tone: 'warn', text: `Please pay by ${due}, or the order is cancelled.` } }] : []),
           { p: 'Open your tracking page and enter the mobile number you used at checkout. It shows the Nogatu account to pay; then upload a photo of your receipt there.' },
           { actions: [trackButton(order, 'Pay and upload receipt')] }],
@@ -105,7 +122,8 @@ function buildBuyerEmail(eventType, order) {
       return renderEmail({
         ...base, subject: `Payment confirmed for order #${num}`, preheader: 'We are preparing your order.',
         heading: 'Payment confirmed',
-        blocks: [progress(2), { p: 'We received your payment and are preparing your order. We will email you when it is on its way.' }, { actions: [trackButton(order)] }],
+        blocks: [progress(2), { p: 'We received your payment and are preparing your order. We will email you when it is on its way.' },
+          ...(deliveryRow(order).length ? [{ details: deliveryRow(order) }] : []), { actions: [trackButton(order)] }],
       });
     case BUYER_EVENTS.ON_THE_WAY:
       return renderEmail({

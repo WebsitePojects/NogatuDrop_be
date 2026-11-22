@@ -6,6 +6,8 @@ const paginate = require('../utils/paginate');
 const { PARTNER_LEVELS, STOCKIST_LEVELS } = require('../rbac/roles');
 const { resolveAddress, hasAddressParts } = require('../services/addressInput');
 const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
+const { assignHomeTerritory } = require('./territoryController');
+const { assertNewPasswordAllowed } = require('../utils/passwordPolicy');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
@@ -100,9 +102,9 @@ const createPartner = asyncHandler(async (req, res) => {
   if (!['provincial_stockist', 'city_stockist'].includes(stockist_level)) {
     throw ApiError.badRequest('stockist_level must be provincial_stockist or city_stockist');
   }
-  if (admin_password && admin_password.length < 8) {
-    throw ApiError.badRequest('Password must be at least 8 characters');
-  }
+  // The Stockist's login password is typed by Super Admin (meeting 2026-11-10). It used to be random and
+  // shown to nobody, so the new login could not sign in until a reset.
+  assertNewPasswordAllowed(admin_password);
   if (parent_partner_id) await assertProvincialParent(parent_partner_id);
   const place = await resolveAddress(pool, req.body);
 
@@ -150,8 +152,7 @@ const createPartner = asyncHandler(async (req, res) => {
     const [roleRow] = await conn.execute('SELECT id FROM roles WHERE slug = ? LIMIT 1', [stockist_level]);
     if (roleRow.length === 0) throw ApiError.serverError('Role not found for stockist_level');
 
-    const tempPassword = admin_password || `Nogatu@${Date.now().toString(36)}`;
-    const hashed = await bcrypt.hash(tempPassword, 12);
+    const hashed = await bcrypt.hash(admin_password, 12);
 
     await conn.execute(
       `INSERT INTO users (name, email, password, phone, role_id, partner_id)
@@ -159,14 +160,21 @@ const createPartner = asyncHandler(async (req, res) => {
       [admin_name || normalizedBusinessName, adminMail, hashed, phone || null, roleRow[0].id, partnerId]
     );
 
+    const territory = await assignHomeTerritory(conn, partnerId, req.user.id);
     await conn.commit();
+
+    let territoryNote = '';
+    if (territory.assigned) territoryNote = ` Store orders from ${territory.area_name} now go to this Stockist.`;
+    else if (territory.held_by) territoryNote = ` ${territory.area_name} stays with ${territory.held_by}.`;
 
     res.status(201).json({
       success: true,
-      message: 'Stockist created with user account',
+      message: `Stockist created with user account.${territoryNote}`,
       data: {
         partner_id: partnerId,
-        admin_credentials: { email: adminMail, temporary_password: tempPassword },
+        territory,
+        // Never the password: the admin typed it, and an API never sends a password back.
+        login_email: adminMail,
       },
     });
   } catch (err) {

@@ -1,6 +1,8 @@
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
+const { generateTemporaryPassword } = require('../utils/passwordPolicy');
+const { sendPasswordResetCode } = require('../services/passwordResetCode');
 const paginate = require('../utils/paginate');
 const bcrypt = require('bcryptjs');
 const { sendEmail, EMAIL } = require('../services/emailService');
@@ -138,9 +140,10 @@ const approveApplication = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('Application has no valid Stockist level (provincial_stockist or city_stockist)');
   }
 
-  // Generate a temporary password
-  const tempPassword = Math.random().toString(36).slice(-8) + 'N1!';
-  const hashed = await bcrypt.hash(tempPassword, 12);
+  // A random password nobody is told: the new Stockist chooses their own with an emailed reset code, so no
+  // password ever travels by email (2026-11-23; the welcome email used to carry a temporary one).
+  const hashed = await bcrypt.hash(generateTemporaryPassword(), 12);
+  let newUserId;
 
   const conn = await pool.getConnection();
   try {
@@ -162,11 +165,12 @@ const approveApplication = asyncHandler(async (req, res) => {
     if (roleRow.length === 0) throw ApiError.serverError('Role not found for stockist level');
 
     // Create user account
-    await conn.execute(
+    const [userResult] = await conn.execute(
       `INSERT INTO users (name, email, phone, password, role_id, partner_id, status)
        VALUES (?, ?, ?, ?, ?, ?, 'active')`,
       [fullName, app.email, app.phone, hashed, roleRow[0].id, partnerId]
     );
+    newUserId = userResult.insertId;
 
     // Mark application approved
     try {
@@ -186,11 +190,16 @@ const approveApplication = asyncHandler(async (req, res) => {
 
     await conn.commit();
 
-    // Send welcome email with credentials
-    const tmpl = EMAIL.dtaApproved(fullName, app.email, tempPassword);
-    await sendEmail({ to: app.email, toName: fullName, ...tmpl });
+    // Welcome email (no password) and a separate set-password code, the same one Forgot password sends.
+    await sendEmail({ to: app.email, toName: fullName, ...EMAIL.dtaApproved(fullName, app.email) });
+    const codeEmail = await sendPasswordResetCode({ id: newUserId, name: fullName, email: app.email });
 
-    res.json({ success: true, message: 'Application approved. Account created and credentials sent via email.' });
+    res.json({
+      success: true,
+      message: codeEmail.sent === false
+        ? 'Application approved and account created, but the set-password email could not be sent. Use Reset Password on the Users screen.'
+        : 'Application approved. The new Stockist got an email with a code to set their password.',
+    });
   } catch (err) {
     await conn.rollback();
     throw err;

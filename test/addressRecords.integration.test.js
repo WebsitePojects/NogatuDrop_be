@@ -66,6 +66,8 @@ test.after(async () => {
     await pool.execute("UPDATE mobile_stockists SET is_deleted = 1, status = 'inactive' WHERE id = ?", [id]);
   }
   for (const id of created.partners) {
+    // Creating a Stockist gives it its home territory (2026-11-10); hand the area back.
+    await pool.execute('DELETE FROM stockist_territories WHERE partner_id = ?', [id]);
     await pool.execute("UPDATE partners SET is_deleted = 1, status = 'inactive' WHERE id = ?", [id]);
   }
   await pool.execute("UPDATE users SET is_deleted = 1, status = 'inactive' WHERE email LIKE ?", [`qa.addr.${stamp}.%`]);

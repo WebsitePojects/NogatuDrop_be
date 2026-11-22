@@ -9,13 +9,14 @@ test('public order creation has a tighter abuse limit than the shared API budget
   assert.equal(appSource.includes('Too many public order attempts, please try again later.'), true);
   // Submissions only; behaviour is exercised end-to-end in rateLimitBehindProxy.test.js.
   assert.match(appSource, /app\.use\('\/api\/v1\/orders\/public', \(req, res, next\) => \(\s*req\.method === 'POST' \? publicOrderLimiter\(req, res, next\) : next\(\)/);
-  assert.match(appSource, /const publicOrderLimiter = createRateLimiter\(\{[\s\S]*max:\s*10,/);
+  assert.match(appSource, /const publicOrderLimiter = createRateLimiter\(\{[\s\S]*max: RATE_LIMITS\.publicOrder,/);
+  assert.match(appSource, /publicOrder: 10,/);
 });
 
 test('public tracking lookups have a dedicated limiter to reduce enumeration pressure', () => {
   assert.equal(appSource.includes('Too many tracking lookups, please try again later.'), true);
   assert.equal(appSource.includes("app.use('/api/v1/tracking/public', publicTrackingLimiter);"), true);
-  assert.match(appSource, /const publicTrackingLimiter = createRateLimiter\(\{[\s\S]*max:\s*60,/);
+  assert.match(appSource, /const publicTrackingLimiter = createRateLimiter\(\{[\s\S]*max: RATE_LIMITS\.publicTracking,/);
 });
 
 test('rate limiter creation keeps redis prefixes isolated per limiter family', () => {
@@ -24,4 +25,10 @@ test('rate limiter creation keeps redis prefixes isolated per limiter family', (
   assert.equal(appSource.includes("}, 'rl:auth:');"), true);
   assert.equal(appSource.includes("}, 'rl:public-order:');"), true);
   assert.equal(appSource.includes("}, 'rl:public-tracking:');"), true);
+});
+
+test('every limiter family keeps its own redis prefix (2026-11-23 additions)', () => {
+  for (const prefix of ["'rl:shipping-quote:'", "'rl:member-ip:'", "'rl:member-user:'", "'rl:rider-ping:'"]) {
+    assert.equal(appSource.includes(`}, ${prefix});`), true, prefix);
+  }
 });

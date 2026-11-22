@@ -28,6 +28,9 @@ router.post(
     body('category').optional().trim(),
     body('unit').optional().trim(),
     body('description').optional().trim(),
+    // Grams of one unit as packed; checkout prices shipping from it (a product without it cannot be checked out).
+    body('weight_grams').optional({ values: 'falsy' }).isInt({ min: 1, max: 50000 })
+      .withMessage('Weight must be a whole number of grams from 1 to 50,000').toInt(),
   ],
   validate,
   createProduct
@@ -44,6 +47,9 @@ router.put(
     body('sku').optional().trim().notEmpty(),
     body('retail_price').optional().isFloat({ min: 0 }),
     body('partner_price').optional().isFloat({ min: 0 }),
+    // Grams of one unit as packed; checkout prices shipping from it (a product without it cannot be checked out).
+    body('weight_grams').optional({ values: 'falsy' }).isInt({ min: 1, max: 50000 })
+      .withMessage('Weight must be a whole number of grams from 1 to 50,000').toInt(),
   ],
   validate,
   updateProduct

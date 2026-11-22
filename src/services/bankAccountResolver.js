@@ -172,6 +172,7 @@ async function resolveOrderPaymentAccount(db, { paymentAccountId, sourceWarehous
 }
 
 module.exports = {
+  executeSoftDeleteAware,
   getBankAccountForWarehouseOrDefault,
   resolveOrderPaymentAccount,
   toBuyerFacingAccount,

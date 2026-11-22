@@ -18,7 +18,7 @@ const {
 } = require('../services/bankAccountResolver');
 const { getIdempotencyKey, claimPublicOrderIntent, completePublicOrderIntent } = require('../services/publicOrderIdempotency');
 const {
-  PUBLIC_ORDER_SHIPPING_FEE,
+  LEGACY_FLAT_SHIPPING_FEE,
   getPublicOrderPricingTotals,
   reconcilePublicOrderPricing,
 } = require('../services/publicCheckoutPricing');
@@ -26,22 +26,24 @@ const { getPaymentVerificationDecision } = require('../services/paymentVerificat
 const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
 const { BUYER_EVENTS, enqueueBuyerEmail } = require('../services/buyerEmails');
 const { reserveStock, releaseStock } = require('../services/batchStock');
-const { lookupMlmMember } = require('../services/mlmBridge');
+const { MEMBER_DISCOUNT_PCT, readMemberPass } = require('../services/memberDiscount');
 const { readPublicCustomer, assertBarangayExists } = require('../services/publicCustomerInput');
 const { readCoordinates } = require('../services/addressInput');
 const { publicPaymentDeadline } = require('../services/publicOrderPayment');
 const { phonesMatch } = require('../utils/phoneMatch');
 const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, orderIsPublicSql } = require('../utils/orderCustomerSql');
-const MEMBER_DISCOUNT_PCT = 30; // Nogatu member discount (off the public price)
 const {
   resolveAffiliationContext,
   buildOrderScopeFromContext,
   canApproveOrderFromContext,
   canVerifyPaymentFromContext,
+  paymentReceiverPartnerSql,
   canChangeShippingFeeFromContext,
 } = require('../rbac/affiliationScopes');
 const { PARTNER_LEVELS } = require('../rbac/roles');
-const { findTerritoryStockists } = require('../services/territoryRouting');
+const { resolvePublicFulfillmentRoute, rankPublicFulfillmentCandidates } = require('../services/publicFulfillmentRoute');
+const { quoteShipping, deliveryWindow } = require('../services/shippingService');
+const { assertWithinPublicItemLimit } = require('../services/publicOrderLimits');
 const { toCents, totalWithShippingFee, amountStillOwed, amountOverpaid } = require('../services/orderBalance');
 
 const isMissingSoftDeleteColumn = (err) => (
@@ -207,152 +209,6 @@ async function resolveSourceWarehouseIdForPartner(db, partnerId) {
   return getWarehouseIdByPartner(db, partner.id);
 }
 
-// Company fulfillment centers. They take every store order outside a Stockist territory, every order a
-// territory Stockist cannot fill from stock, and every affiliate-link order (management, 2026-10-08).
-async function listPublicFulfillmentCandidates(db) {
-  const [rows] = await db.execute(
-    `SELECT p.id AS partner_id, w.id AS warehouse_id, w.lat, w.lng
-     FROM partners p
-     JOIN warehouses w ON w.partner_id = p.id
-     WHERE p.stockist_level = 'center'
-       AND p.status = 'active' AND p.is_deleted = 0
-       AND w.is_deleted = 0 AND w.is_active = 1
-     ORDER BY w.id ASC`
-  );
-  return rows;
-}
-
-// Checks every requested line against one warehouse with a single query. Returns
-// `totalAvailable` (sum of available units over the requested products) so callers can prefer
-// the center holding the most stock.
-async function canWarehouseFulfillItems(db, warehouseId, items) {
-  const requestedByProduct = new Map();
-  const nameByProduct = new Map();
-  for (const item of items) {
-    const productId = Number(item.product_id);
-    requestedByProduct.set(productId, (requestedByProduct.get(productId) || 0) + item.quantity);
-    nameByProduct.set(productId, item.name);
-  }
-
-  const productIds = [...requestedByProduct.keys()];
-  const placeholders = productIds.map(() => '?').join(', ');
-  // Same soft-delete-aware shape as reserveInventoryOrThrow: some deployments' inventories table has
-  // no is_deleted column, and the availability check must count exactly the rows reservation locks.
-  const [inventoryRows] = await executeSoftDeleteAware(
-    db,
-    `SELECT product_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
-     FROM inventories
-     WHERE warehouse_id = ? AND product_id IN (${placeholders}) AND is_deleted = 0
-     GROUP BY product_id`,
-    [warehouseId, ...productIds],
-    `SELECT product_id, SUM(current_stock) AS current_stock, SUM(reserved_stock) AS reserved_stock
-     FROM inventories
-     WHERE warehouse_id = ? AND product_id IN (${placeholders})
-     GROUP BY product_id`
-  );
-
-  const availableByProduct = new Map(inventoryRows.map((row) => [
-    Number(row.product_id),
-    Number(row.current_stock || 0) - Number(row.reserved_stock || 0),
-  ]));
-
-  let totalAvailable = 0;
-  for (const [productId, requestedQty] of requestedByProduct) {
-    const availableQty = availableByProduct.get(productId) || 0;
-    if (availableQty < requestedQty) {
-      return { ok: false, productName: nameByProduct.get(productId), availableQty };
-    }
-    totalAvailable += availableQty;
-  }
-
-  return { ok: true, totalAvailable };
-}
-
-function haversineDistanceKm(originLat, originLng, targetLat, targetLng) {
-  const toRadians = (value) => Number(value) * Math.PI / 180;
-  const lat1 = toRadians(originLat);
-  const lat2 = toRadians(targetLat);
-  const deltaLat = toRadians(Number(targetLat) - Number(originLat));
-  const deltaLng = toRadians(Number(targetLng) - Number(originLng));
-  const a = Math.sin(deltaLat / 2) ** 2
-    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLng / 2) ** 2;
-  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-const hasCoordinates = (lat, lng) => lat != null && lng != null
-  && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng));
-
-// Orders capable centers best-first. With a customer pin: nearest first, centers without
-// coordinates last. Without one: most available stock first. Warehouse id is always the final
-// tie-break so the same inputs pick the same center on every request.
-function rankPublicFulfillmentCandidates(candidates, { customerLat, customerLng } = {}) {
-  const hasCustomerLocation = hasCoordinates(customerLat, customerLng);
-  const distanceKm = (candidate) => (
-    hasCustomerLocation && hasCoordinates(candidate.lat, candidate.lng)
-      ? haversineDistanceKm(customerLat, customerLng, candidate.lat, candidate.lng)
-      : Number.POSITIVE_INFINITY
-  );
-
-  return candidates
-    .map((candidate) => ({ candidate, distance: distanceKm(candidate) }))
-    .sort((left, right) => {
-      if (left.distance !== right.distance) return left.distance < right.distance ? -1 : 1;
-      const leftStock = Number(left.candidate.available_qty || 0);
-      const rightStock = Number(right.candidate.available_qty || 0);
-      if (!hasCustomerLocation && leftStock !== rightStock) return rightStock - leftStock;
-      return Number(left.candidate.warehouse_id) - Number(right.candidate.warehouse_id);
-    })
-    .map(({ candidate }) => candidate);
-}
-
-/**
- * Who fulfils a store order. The Stockist whose territory holds the buyer's barangay, when it has every
- * item in stock; otherwise (and always for affiliate-link orders, `centersOnly`) the best center.
- * `payment_warehouse_id` is whose accounts the buyer pays: always a center's, because store-order money goes
- * to Nogatu even when a Stockist ships it (management, 2026-10-08).
- */
-async function resolvePublicFulfillmentRoute(db, items, location = {}) {
-  const candidates = await listPublicFulfillmentCandidates(db);
-  if (candidates.length === 0) {
-    throw ApiError.serviceUnavailable('No fulfillment center is available to handle this order');
-  }
-  const nearestCenter = rankPublicFulfillmentCandidates(candidates, location)[0];
-
-  if (!location.centersOnly) {
-    for (const stockist of await findTerritoryStockists(db, location.barangayCode)) {
-      if ((await canWarehouseFulfillItems(db, stockist.warehouse_id, items)).ok) {
-        return {
-          partner_id: stockist.partner_id,
-          warehouse_id: stockist.warehouse_id,
-          payment_warehouse_id: nearestCenter.warehouse_id,
-          routed_by: 'territory',
-        };
-      }
-    }
-  }
-
-  const capable = [];
-  let firstShortage = null;
-
-  for (const candidate of candidates) {
-    const fulfillmentCheck = await canWarehouseFulfillItems(db, candidate.warehouse_id, items);
-    if (fulfillmentCheck.ok) {
-      capable.push({ ...candidate, available_qty: fulfillmentCheck.totalAvailable });
-    } else if (!firstShortage) {
-      firstShortage = fulfillmentCheck;
-    }
-  }
-
-  if (capable.length === 0) {
-    throw ApiError.conflict(
-      `Not enough stock at our fulfillment centers for ${firstShortage.productName || 'this product'}`
-    );
-  }
-
-  const center = rankPublicFulfillmentCandidates(capable, location)[0];
-  return { ...center, payment_warehouse_id: center.warehouse_id, routed_by: 'center' };
-}
-
 // ─── Helper: notify users of a partner ───────────────────────────────────────
 async function notifyPartnerUsers(conn, partnerId, type, title, message, entityId) {
   const [users] = await executeSoftDeleteAware(
@@ -496,8 +352,8 @@ function buildOrderPricingBreakdown(order, items = []) {
     : Number(order.merchandise_subtotal);
   const isPublic = order?.placed_by_type === 'public' || Boolean(order?.is_public);
   const shippingFee = order?.shipping_fee == null
-    ? (isPublic && totalAmount - merchandiseSubtotal >= PUBLIC_ORDER_SHIPPING_FEE
-      ? PUBLIC_ORDER_SHIPPING_FEE
+    ? (isPublic && totalAmount - merchandiseSubtotal >= LEGACY_FLAT_SHIPPING_FEE
+      ? LEGACY_FLAT_SHIPPING_FEE
       : 0)
     : Number(order.shipping_fee);
   const systemFee = order?.system_fee == null
@@ -631,6 +487,7 @@ const getOrder = asyncHandler(async (req, res) => {
             u.email AS placed_by_email, ur.slug AS placed_by_role_slug,
             a.name AS approved_by_name, verifier.name AS payment_verified_by_name,
             ${orderIsPublicSql('o')} AS is_public,
+            ${paymentReceiverPartnerSql('o')} AS payment_received_by_partner_id,
             ${orderCustomerNameSql('o')} AS customer_display_name,
             ${orderCustomerAddressSql('o')} AS customer_display_address
      FROM orders o
@@ -663,6 +520,10 @@ const getOrder = asyncHandler(async (req, res) => {
   order.amount_overpaid = amountOverpaid(order);
   order.can_change_shipping_fee = canChangeShippingFeeFromContext(affiliationContext, order)
     && ['pending', 'approved'].includes(order.status) && order.payment_status !== 'paid';
+  // The screens show "Verify Payment" from this, so the rule lives in one place (affiliationScopes).
+  order.can_verify_payment = canVerifyPaymentFromContext(affiliationContext, order);
+  order.payment_received_by_stockist = Boolean(order.payment_received_by_partner_id)
+    && Number(order.payment_received_by_partner_id) === Number(order.partner_id);
 
   const [[proofs], [feeChanges]] = await Promise.all([
     pool.execute(
@@ -977,6 +838,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
   const customer = readPublicCustomer(req.body);
 
   if (!items || items.length === 0) throw ApiError.badRequest('items are required');
+  assertWithinPublicItemLimit(items);
 
   // Optional pinned delivery coordinates (consent-gated on the client). Stored
   // as sensitive data — never returned by the public tracking endpoint.
@@ -998,48 +860,42 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     await assertBarangayExists(conn, customer.barangayCode);
     const publicPlacedByUserId = await getPublicOrderPlacedByUserId(conn);
 
+    // Every product in one query (a cart has at most PUBLIC_ORDER_MAX_ITEMS lines).
+    const productIds = [...new Set(items.map((item) => Number(item.product_id)))];
+    const [productRows] = await conn.execute(
+      `SELECT id, name, retail_price, partner_price FROM products
+       WHERE id IN (${productIds.map(() => '?').join(', ')}) AND is_deleted = 0 AND is_active = 1`,
+      productIds
+    );
+    const productsById = new Map(productRows.map((row) => [Number(row.id), row]));
+
     let merchandiseSubtotal = 0;
     let preDiscountSubtotal = 0;
     const resolvedItems = [];
-
     for (const item of items) {
       const quantity = Number(item.quantity);
       if (!Number.isInteger(quantity) || quantity <= 0) {
         throw ApiError.badRequest(`Invalid quantity for product ${item.product_id}`);
       }
-
-      const [products] = await executeSoftDeleteAware(
-        conn,
-        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_deleted = 0 AND is_active = 1 LIMIT 1',
-        [item.product_id],
-        'SELECT id, name, retail_price, partner_price FROM products WHERE id = ? AND is_active = 1 LIMIT 1'
-      );
-      if (products.length === 0) throw ApiError.badRequest(`Product ${item.product_id} not found`);
-      const price = getPublicOrderUnitPrice(products[0]);
-      resolvedItems.push({ ...item, quantity, name: products[0].name, unit_price: price });
+      const product = productsById.get(Number(item.product_id));
+      if (!product) throw ApiError.badRequest(`Product ${item.product_id} not found`);
+      const price = getPublicOrderUnitPrice(product);
+      resolvedItems.push({ ...item, quantity, name: product.name, unit_price: price });
       merchandiseSubtotal += quantity * price;
       preDiscountSubtotal += quantity * price;
     }
 
-    // Member discount: a valid ACTIVE Nogatu MLM member gets MEMBER_DISCOUNT_PCT
-    // off. Verified live against the MLM bridge; falls back to no discount when
-    // the bridge isn't configured/reachable, so checkout never breaks.
-    const memberUsername = String(req.body.member_username || '').trim();
-    let memberDiscountPct = 0;
-    if (memberUsername) {
-      const member = await lookupMlmMember(memberUsername);
-      if (member && String(member.account_status || '').toLowerCase() === 'active') {
-        memberDiscountPct = MEMBER_DISCOUNT_PCT;
-        merchandiseSubtotal = 0;
-        for (const it of resolvedItems) {
-          it.unit_price = Math.round(it.unit_price * (1 - memberDiscountPct / 100) * 100) / 100;
-          merchandiseSubtotal += it.quantity * it.unit_price;
-        }
+    // Member discount only for a signed member pass from POST /members/verify (username + password checked
+    // by nogatualliance.com). An expired or forged pass is refused, never silently priced in full.
+    const member = req.body.member_pass ? readMemberPass(req.body.member_pass) : null;
+    const memberDiscountPct = member ? MEMBER_DISCOUNT_PCT : 0;
+    if (member) {
+      merchandiseSubtotal = 0;
+      for (const it of resolvedItems) {
+        it.unit_price = Math.round(it.unit_price * (1 - memberDiscountPct / 100) * 100) / 100;
+        merchandiseSubtotal += it.quantity * it.unit_price;
       }
     }
-
-    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal, { preDiscountSubtotal });
-    const totalAmount = pricingTotals.totalDue;
 
     const fulfillmentRoute = await resolvePublicFulfillmentRoute(conn, resolvedItems, {
       customerLat: custLat,
@@ -1047,6 +903,17 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       barangayCode: customer.barangayCode,
       centersOnly: Boolean(req.influencerContext), // affiliate-link sales are always Caloocan or Tycoon
     });
+    // The fee the checkout showed, computed again here from the warehouse that ships it: the client never sets it.
+    const shippingQuote = await quoteShipping(conn, {
+      barangayCode: customer.barangayCode,
+      items: resolvedItems,
+      originWarehouseId: fulfillmentRoute.warehouse_id,
+    });
+    const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal, {
+      preDiscountSubtotal,
+      shippingFee: shippingQuote.fee,
+    });
+    const totalAmount = pricingTotals.totalDue;
     const partnerId = fulfillmentRoute.partner_id;
     const sourceWarehouseId = fulfillmentRoute.warehouse_id;
     const paymentWarehouseId = fulfillmentRoute.payment_warehouse_id;
@@ -1086,27 +953,34 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     }
     const orderId = orderResult.insertId;
 
-    if (req.body.payment_provider) {
-      try {
-        await conn.execute(
-          'UPDATE orders SET payment_provider = ?, payment_account_id = ? WHERE id = ?',
-          [String(req.body.payment_provider).toUpperCase(), bankAccount.id, orderId],
-        );
-      } catch (err) {
-        if (!isMissingColumn(err, 'payment_provider') && !isMissingColumn(err, 'payment_account_id')) throw err;
-      }
+    // Always saved: whose account the buyer was told to pay decides who verifies the payment (2026-11-23).
+    try {
+      await conn.execute(
+        'UPDATE orders SET payment_provider = ?, payment_account_id = ? WHERE id = ?',
+        [req.body.payment_provider ? String(req.body.payment_provider).toUpperCase() : null, bankAccount.id, orderId],
+      );
+    } catch (err) {
+      if (!isMissingColumn(err, 'payment_provider') && !isMissingColumn(err, 'payment_account_id')) throw err;
     }
 
     try {
       await conn.execute(
         `UPDATE orders
-         SET merchandise_subtotal = ?, member_discount_amount = ?, shipping_fee = ?, system_fee = ?
+         SET merchandise_subtotal = ?, member_discount_amount = ?, shipping_fee = ?, system_fee = ?,
+             shipping_zone = ?, shipping_weight_grams = ?, delivery_eta_from = ?, delivery_eta_to = ?,
+             delivery_eta_min_days = ?, delivery_eta_max_days = ?
          WHERE id = ?`,
         [
           pricingTotals.merchandiseSubtotal,
           pricingTotals.memberDiscountAmount,
           pricingTotals.shippingFee,
           pricingTotals.systemFee,
+          shippingQuote.zone_code,
+          shippingQuote.weight_grams,
+          shippingQuote.eta_from,
+          shippingQuote.eta_to,
+          shippingQuote.eta_min_days,
+          shippingQuote.eta_max_days,
           orderId,
         ]
       );
@@ -1115,11 +989,11 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       if (!pricingColumns.some((column) => isMissingColumn(err, column))) throw err;
     }
 
-    if (memberUsername) {
+    if (member) {
       try {
         await conn.execute(
           'UPDATE orders SET member_username = ?, member_discount_pct = ? WHERE id = ?',
-          [memberUsername, memberDiscountPct, orderId]
+          [member.username, memberDiscountPct, orderId]
         );
       } catch (err) {
         if (!isMissingColumn(err, 'member_username') && !isMissingColumn(err, 'member_discount_pct')) throw err;
@@ -1207,6 +1081,14 @@ const createPublicOrder = asyncHandler(async (req, res) => {
           bankAccount,
           paymentDeadline: paymentDeadline.toISOString(),
         }),
+        // Counted as if paid today; recounted from the day payment is confirmed.
+        delivery_estimate: {
+          zone_name: shippingQuote.zone_name,
+          area_name: shippingQuote.area_name,
+          eta_from: shippingQuote.eta_from,
+          eta_to: shippingQuote.eta_to,
+          if_paid_today: true,
+        },
       },
     };
     await completePublicOrderIntent(conn, idempotency.id, orderId, responseBody);
@@ -1527,6 +1409,7 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
   const [orders] = await pool.execute(
     `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status, o.payment_proof_url,
             o.total_amount, o.payment_covered_total,
+            ${paymentReceiverPartnerSql('o')} AS payment_received_by_partner_id,
             ${orderCustomerNameSql('o')} AS customer_name, o.customer_phone
      FROM orders o
      WHERE o.order_number = ?
@@ -1576,17 +1459,20 @@ const uploadPublicPaymentProof = asyncHandler(async (req, res) => {
       [proofUrl, isAdditional ? 'additional' : 'payment', orderId]
     );
 
-    const admins = await notifySuperAdmins(
-      conn, 'payment_proof_uploaded',
-      `${isAdditional ? 'Extra payment proof' : 'Payment Proof'}: #${orders[0].order_number}`,
-      isAdditional
-        ? `The buyer uploaded a receipt for the delivery fee difference on order #${orders[0].order_number}. Please verify.`
-        : `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`,
-      orderId
-    );
+    const proofTitle = `${isAdditional ? 'Extra payment proof' : 'Payment Proof'}: #${orders[0].order_number}`;
+    const proofMessage = isAdditional
+      ? `The buyer uploaded a receipt for the delivery fee difference on order #${orders[0].order_number}. Please verify.`
+      : `Payment proof uploaded for public order #${orders[0].order_number}. Please verify.`;
+    const admins = await notifySuperAdmins(conn, 'payment_proof_uploaded', proofTitle, proofMessage, orderId);
+    // Paid into the shipping Stockist's own account: that Stockist checks its bank and verifies (2026-11-23).
+    const receiverPartnerId = Number(orders[0].payment_received_by_partner_id || 0);
+    const stockistUsers = receiverPartnerId && receiverPartnerId === Number(orders[0].partner_id)
+      ? await notifyPartnerUsers(conn, receiverPartnerId, 'payment_proof_uploaded', proofTitle,
+        `${proofMessage} The buyer paid into your account.`, orderId)
+      : [];
     await conn.commit();
 
-    for (const admin of admins) {
+    for (const admin of [...admins, ...stockistUsers]) {
       const tmpl = EMAIL.paymentProofUploaded(orders[0].order_number, orders[0].customer_name || 'Public customer');
       await sendEmail({ to: admin.email, toName: admin.name, ...tmpl });
     }
@@ -1614,6 +1500,8 @@ const verifyPayment = asyncHandler(async (req, res) => {
     const [orders] = await conn.execute(
       `SELECT o.id, o.order_number, o.partner_id, o.status, o.payment_status,
               o.payment_proof_url, o.total_amount, o.payment_covered_total, o.placed_by_type,
+              o.delivery_eta_min_days, o.delivery_eta_max_days,
+              ${paymentReceiverPartnerSql('o')} AS payment_received_by_partner_id,
               r.slug AS placed_by_role_slug
        FROM orders o
        LEFT JOIN users u ON u.id = o.placed_by
@@ -1625,7 +1513,7 @@ const verifyPayment = asyncHandler(async (req, res) => {
     if (orders.length === 0) throw ApiError.notFound('Order not found');
 
     const affiliationContext = await resolveAffiliationContext(conn, req.user);
-    if (req.user.role_slug !== 'super_admin' && !canVerifyPaymentFromContext(affiliationContext, orders[0])) {
+    if (!canVerifyPaymentFromContext(affiliationContext, orders[0])) {
       throw ApiError.forbidden('You do not have permission to verify payment for this order');
     }
 
@@ -1635,9 +1523,16 @@ const verifyPayment = asyncHandler(async (req, res) => {
       return res.json({ success: true, message: 'Payment already verified', data: { already_paid: true } });
     }
 
+    // The delivery window was "if paid today" at checkout; from now it counts from the day payment is confirmed.
+    const order = orders[0];
+    const paidWindow = order.delivery_eta_min_days != null && order.delivery_eta_max_days != null
+      ? deliveryWindow(order.delivery_eta_min_days, order.delivery_eta_max_days)
+      : null;
     await conn.execute(
-      `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW() WHERE id = ?`,
-      [req.user.id, orderId]
+      `UPDATE orders SET payment_status = 'paid', payment_proof_verified_by = ?, payment_proof_verified_at = NOW(),
+              delivery_eta_from = COALESCE(?, delivery_eta_from), delivery_eta_to = COALESCE(?, delivery_eta_to)
+       WHERE id = ? AND payment_status <> 'paid'`,
+      [req.user.id, paidWindow ? paidWindow.eta_from : null, paidWindow ? paidWindow.eta_to : null, orderId]
     );
     await enqueueBuyerEmail(conn, { orderId, eventType: BUYER_EVENTS.PAID });
     await createPendingSettlementForOrder(conn, {

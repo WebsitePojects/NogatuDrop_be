@@ -211,7 +211,7 @@ const getProducts = asyncHandler(async (req, res) => {
     params.push(category);
   }
 
-  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, is_active, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
+  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, is_active, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
   const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
@@ -311,7 +311,7 @@ const getPublicProducts = asyncHandler(async (req, res) => {
 // GET /api/v1/products/:id
 const getProduct = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, is_active, created_at, updated_at
+    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, is_active, created_at, updated_at
      FROM products WHERE id = ? AND is_deleted = 0 LIMIT 1`,
     [req.params.id]
   );
@@ -324,6 +324,7 @@ const getProduct = asyncHandler(async (req, res) => {
 // POST /api/v1/products
 const createProduct = asyncHandler(async (req, res) => {
   const { name, retail_price, partner_price, unit, description } = req.body;
+  const weightGrams = req.body.weight_grams || null;
   let { sku, category } = req.body;
 
   // SKU = Stock Keeping Unit: the product's unique code used for inventory tracking.
@@ -351,11 +352,11 @@ const createProduct = asyncHandler(async (req, res) => {
       // re-creating a deleted SKU should just work.
       const fields = [
         'name = ?', 'category = ?', 'retail_price = ?', 'partner_price = ?',
-        'unit = ?', 'description = ?', 'is_deleted = 0', 'is_active = 1',
+        'unit = ?', 'description = ?', 'weight_grams = ?', 'is_deleted = 0', 'is_active = 1',
       ];
       const values = [
         name, category || 'Drink Mixes', retail_price, partner_price,
-        unit || '420g Boxes', description || null,
+        unit || '420g Boxes', description || null, weightGrams,
       ];
       if (image_url) {
         fields.push('image_url = ?');
@@ -383,9 +384,9 @@ const createProduct = asyncHandler(async (req, res) => {
   }
 
   const [result] = await pool.execute(
-    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url]
+    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url, weightGrams]
   );
 
   const [created] = await pool.execute('SELECT * FROM products WHERE id = ?', [result.insertId]);
@@ -429,6 +430,7 @@ const updateProduct = asyncHandler(async (req, res) => {
   if (partner_price !== undefined) { fields.push('partner_price = ?'); values.push(partner_price); }
   if (unit) { fields.push('unit = ?'); values.push(unit); }
   if (description !== undefined) { fields.push('description = ?'); values.push(description || null); }
+  if (req.body.weight_grams) { fields.push('weight_grams = ?'); values.push(req.body.weight_grams); }
   // Only update is_active when explicitly provided; never let undefined/null flip it.
   if (is_active !== undefined) { fields.push('is_active = ?'); values.push(is_active); }
 

@@ -13,7 +13,8 @@ test('public and influencer routes require idempotency and enforce boundary fiel
   assert.match(ordersSource, /router\.post\('\/public\/influencer\/:slug', publicOrderValidation, prepareInfluencerOrder, createPublicOrder\)/);
   assert.match(ordersSource, /bodyValidator\('items'\)\.isArray/);
   assert.match(orderSource, /getIdempotencyKey\(req\)/);
-  assert.match(influencerSource, /member_username[\s\S]*not supported/);
+  assert.match(influencerSource, /member_pass[\s\S]*not available on influencer links/);
+  assert.match(ordersSource, /bodyValidator\('member_username'\)\.not\(\)\.exists\(\)/, 'a bare username never reaches the order');
   assert.match(influencerSource, /items: \[\{ product_id: products\[0\]\.id, quantity \}\]/);
   assert.match(ordersSource, /items\.\*\.quantity'\)\.isInt\(\{ min: 1, max: PUBLIC_ORDER_MAX_QUANTITY_PER_LINE \}\)/);
 });
@@ -24,9 +25,9 @@ test('influencer identity is configured by canonical SKU and fails closed when u
   assert.match(influencerSource, /Influencer product configuration is unavailable/);
 });
 
-test('influencer checkout permits an omitted member username and rejects a supplied one', () => {
+test('influencer checkout permits no member pass and rejects a supplied one', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/controllers/influencerController.js'), 'utf8');
-  assert.match(source, /req\.body\.member_username != null/);
+  assert.match(source, /if \(req\.body\.member_pass\)/);
   assert.match(source, /Influencer checkout requires exactly one item with a quantity from 1 to/);
 });
 

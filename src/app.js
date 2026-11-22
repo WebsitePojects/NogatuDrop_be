@@ -4,6 +4,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 const { RedisStore } = require('rate-limit-redis');
 const env = require('./config/env');
 const redis = require('./config/redis');
@@ -116,12 +117,50 @@ app.use(express.urlencoded({ extended: true }));
 // Cookies
 app.use(cookieParser());
 
-// Rate limiting
+// Rate limiting, sized for a working day (2026-11-23). Every window is 15 minutes.
+//  - Signed-in staff are counted per USER, not per IP: one open tab already polls notifications and orders
+//    about 90 times per window, and a whole office shares one IP. 900 = one call per second on average.
+//  - Everyone else is counted per IP with room for a shop or mobile network where many buyers share one.
+//  - Each public action that can be abused gets its own tighter budget on top.
+//  - Rider pings are counted per Rider Link: riders on mobile data share carrier IPs.
+const RATE_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMITS = Object.freeze({
+  signedIn: 900,
+  anonymous: 600,
+  login: 20,
+  publicOrder: 10,
+  publicTracking: 120, // the tracking page refreshes every 20 s (45 per window) plus the payment check
+  shippingQuote: 120, // checkout asks again on each address or cart change, debounced
+  memberVerifyPerIp: 10,
+  memberVerifyFailuresPerUsername: 5,
+  riderPingsPerLink: 120, // one ping every 15 s is 60
+});
+
+/** `user:<id>` for a valid staff token, else the client IP (behind nginx: the X-Forwarded-For client). */
+function signedInUserKey(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    try {
+      const claims = jwt.verify(header.slice(7), env.JWT_SECRET);
+      if (claims && claims.id) return `user:${claims.id}`;
+    } catch {
+      // An expired or forged token is counted against the IP like any anonymous call.
+    }
+  }
+  return `ip:${req.ip}`;
+}
+
 if (env.RATE_LIMIT_ENABLED) {
+  const limited = (message) => ({ success: false, message });
+  const isRiderPing = (req) => req.path.startsWith('/v1/tracking/ping/');
+
   const limiter = createRateLimiter({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: { success: false, message: 'Too many requests, please try again later.' },
+    windowMs: RATE_WINDOW_MS,
+    max: (req) => (signedInUserKey(req).startsWith('user:') ? RATE_LIMITS.signedIn : RATE_LIMITS.anonymous),
+    keyGenerator: signedInUserKey,
+    // Rider pings have their own per-link budget below.
+    skip: isRiderPing,
+    message: limited('Too many requests, please try again later.'),
     standardHeaders: true,
     legacyHeaders: false,
   }, 'rl:api:');
@@ -129,17 +168,17 @@ if (env.RATE_LIMIT_ENABLED) {
 
   // Stricter limit on auth endpoints
   const authLimiter = createRateLimiter({
-    windowMs: 15 * 60 * 1000,
-    max: 20,
-    message: { success: false, message: 'Too many auth attempts, please try again later.' },
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.login,
+    message: limited('Too many auth attempts, please try again later.'),
   }, 'rl:auth:');
   app.use('/api/v1/auth/login', authLimiter);
   app.use('/api/v1/auth/forgot-password', authLimiter);
 
   const publicOrderLimiter = createRateLimiter({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
-    message: { success: false, message: 'Too many public order attempts, please try again later.' },
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.publicOrder,
+    message: limited('Too many public order attempts, please try again later.'),
     standardHeaders: true,
     legacyHeaders: false,
   }, 'rl:public-order:');
@@ -150,13 +189,52 @@ if (env.RATE_LIMIT_ENABLED) {
   ));
 
   const publicTrackingLimiter = createRateLimiter({
-    windowMs: 15 * 60 * 1000,
-    max: 60,
-    message: { success: false, message: 'Too many tracking lookups, please try again later.' },
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.publicTracking,
+    message: limited('Too many tracking lookups, please try again later.'),
     standardHeaders: true,
     legacyHeaders: false,
   }, 'rl:public-tracking:');
   app.use('/api/v1/tracking/public', publicTrackingLimiter);
+
+  const shippingQuoteLimiter = createRateLimiter({
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.shippingQuote,
+    message: limited('Too many shipping checks, please wait a few minutes and try again.'),
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:shipping-quote:');
+  app.use('/api/v1/shipping/quote', shippingQuoteLimiter);
+
+  // Member sign-in guards nogatualliance.com passwords: few tries per IP, and few FAILED tries per username
+  // from anywhere, so nobody can guess a member's password from many addresses.
+  const memberVerifyIpLimiter = createRateLimiter({
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.memberVerifyPerIp,
+    message: limited('Too many member sign-in attempts. Please wait 15 minutes.'),
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:member-ip:');
+  const memberVerifyUsernameLimiter = createRateLimiter({
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.memberVerifyFailuresPerUsername,
+    keyGenerator: (req) => `member:${String(req.body?.username || '').trim().toLowerCase()}`,
+    skipSuccessfulRequests: true,
+    message: limited('Too many wrong passwords for this member. Please wait 15 minutes.'),
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:member-user:');
+  app.use('/api/v1/members/verify', memberVerifyIpLimiter, memberVerifyUsernameLimiter);
+
+  const riderPingLimiter = createRateLimiter({
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_LIMITS.riderPingsPerLink,
+    keyGenerator: (req) => `link:${req.path.split('/').filter(Boolean).pop() || req.ip}`,
+    message: limited('Too many location updates for this Rider Link.'),
+    standardHeaders: true,
+    legacyHeaders: false,
+  }, 'rl:rider-ping:');
+  app.use('/api/v1/tracking/ping', riderPingLimiter);
 }
 
 // Health check

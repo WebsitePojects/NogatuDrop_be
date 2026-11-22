@@ -8,8 +8,8 @@ const normalizeRoleSlug = require('../utils/normalizeRoleSlug');
 const { normalizeUsername, isValidUsername } = require('../utils/username');
 const redis = require('../config/redis');
 const { sendPasswordResetCode } = require('../services/passwordResetCode');
+const { assertNewPasswordAllowed } = require('../utils/passwordPolicy');
 
-const MIN_PASSWORD_LENGTH = 8;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isMissingColumnError = (err) => err && err.code === 'ER_BAD_FIELD_ERROR';
@@ -227,12 +227,7 @@ const createUser = asyncHandler(async (req, res) => {
   if (!EMAIL_RE.test(normalizedEmail)) {
     throw ApiError.badRequest('Email must be a valid email address');
   }
-  if (!password || typeof password !== 'string') {
-    throw ApiError.badRequest('Password is required');
-  }
-  if (password.length < 8) {
-    throw ApiError.badRequest('Password must be at least 8 characters');
-  }
+  assertNewPasswordAllowed(password);
 
   // Check duplicate email across ALL rows (including soft-deleted) — the DB
   // unique index on users.email is not filtered by is_deleted, so a
@@ -451,9 +446,7 @@ const updateUser = asyncHandler(async (req, res) => {
   // A new password typed in Edit User; blank keeps the current one (the screen sends nothing then).
   const passwordChanged = typeof password === 'string' && password !== '';
   if (password !== undefined && password !== null && password !== '') {
-    if (!passwordChanged || password.length < MIN_PASSWORD_LENGTH) {
-      throw ApiError.badRequest(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
-    }
+    assertNewPasswordAllowed(password);
     fields.push('password = ?');
     values.push(await bcrypt.hash(password, 12));
   }

@@ -3,8 +3,8 @@
 //    make exactly one change and one log row; the total moves by the fee difference only;
 //  - after a fee increase the buyer can send ONE extra receipt (two at once: one accepted, one 409), and
 //    payment cannot be verified while money is still owed;
-//  - routing: a buyer inside a Stockist's territory goes to that Stockist, not when it lacks stock, and
-//    never for an affiliate-link order.
+//  - routing: a buyer inside a Stockist's territory goes to that Stockist only (refused when it lacks stock,
+//    never handed to a center; Sir Dino 2026-11-10), and never for an affiliate-link order.
 // Every row the test touches is restored afterwards.
 // Run: NCDMS_DB_TESTS=1 node --env-file=<env of a LOCAL copy> --test --test-force-exit test/feeReceiptTerritory.integration.test.js
 const test = require('node:test');
@@ -142,7 +142,7 @@ test('extra receipt: after a fee increase the buyer sends one extra receipt; two
   assert.equal(again.status, 409, 'nothing owed, so no third receipt');
 });
 
-test('routing: a buyer in a Stockist territory goes to that Stockist; no stock or an affiliate order goes to a center', opts, async () => {
+test('routing: a buyer in a Stockist territory goes to that Stockist only (hands off, 2026-11-10); an affiliate order goes to a center', opts, async () => {
   const { resolvePublicFulfillmentRoute } = orders.__testables;
   const [[stockist]] = await pool.execute(
     `SELECT p.id AS partner_id, w.id AS warehouse_id, i.product_id,
@@ -167,12 +167,13 @@ test('routing: a buyer in a Stockist territory goes to that Stockist; no stock o
   const routed = await resolvePublicFulfillmentRoute(pool, one, { barangayCode: stockist.barangay });
   assert.equal(routed.routed_by, 'territory');
   assert.equal(Number(routed.partner_id), Number(stockist.partner_id));
-  assert.notEqual(Number(routed.payment_warehouse_id), Number(stockist.warehouse_id), 'the buyer pays a Nogatu center account');
+  assert.equal(Number(routed.payment_warehouse_id), Number(stockist.warehouse_id), "the buyer pays the Stockist's own account");
 
   const affiliate = await resolvePublicFulfillmentRoute(pool, one, { barangayCode: stockist.barangay, centersOnly: true });
   assert.equal(affiliate.routed_by, 'center');
 
   const tooMany = [{ product_id: stockist.product_id, quantity: Number(stockist.available) + 1, name: 'QA' }];
-  const fallback = await resolvePublicFulfillmentRoute(pool, tooMany, { barangayCode: stockist.barangay }).catch((e) => e);
-  assert.ok(fallback.routed_by === 'center' || fallback.statusCode === 409, 'short on stock: a center takes it (or nobody has enough)');
+  const refused = await resolvePublicFulfillmentRoute(pool, tooMany, { barangayCode: stockist.barangay }).catch((e) => e);
+  assert.equal(refused.statusCode, 409, 'short on stock: refused, a center does not take a territory order');
+  assert.match(refused.message, /Stockist serving your area does not have enough/);
 });

@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
+const { newPasswordValidator } = require('../utils/passwordPolicy');
 const auth = require('../middleware/authMiddleware');
 const roleGuard = require('../middleware/roleGuard');
 const { PERMISSIONS } = require('../rbac/permissions');
@@ -41,11 +42,7 @@ router.post(
     body('email').isEmail().withMessage('Valid email is required'),
     // Format and uniqueness are enforced in the controller (utils/username.js).
     body('username').optional({ values: 'null' }).isString().withMessage('Username must be text'),
-    body('password')
-      .isString()
-      .withMessage('Password is required')
-      .isLength({ min: 6 })
-      .withMessage('Password must be at least 6 characters'),
+    body('password').custom(newPasswordValidator),
     body('role_id').not().exists().withMessage('Use role_slug instead of role_id'),
     body('role_slug').optional().isIn(['super_admin', 'provincial_stockist', 'city_stockist', 'mobile_stockist', 'staff']),
     body('partner_id').optional().isInt(),
@@ -65,8 +62,7 @@ router.put(
     body('email').optional().isEmail(),
     body('username').optional({ values: 'null' }).isString().withMessage('Username must be text'),
     body('status').optional().isIn(['active', 'inactive', 'suspended']),
-    body('password').optional({ values: 'falsy' }).isString().isLength({ min: 8 })
-      .withMessage('Password must be at least 8 characters'),
+    body('password').optional({ values: 'falsy' }).custom(newPasswordValidator),
     body('level').optional().isIn(['main', 'regional', 'city']),
   ],
   validate,

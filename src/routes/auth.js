@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const { body } = require('express-validator');
 const validate = require('../middleware/validate');
+const { newPasswordValidator } = require('../utils/passwordPolicy');
 const auth = require('../middleware/authMiddleware');
 const { login, logout, refresh, me, forgotPassword, resetPassword } = require('../controllers/authController');
 
@@ -32,7 +33,7 @@ router.post(
   [
     body('email').isEmail(),
     body('otp').notEmpty().withMessage('OTP is required'),
-    body('new_password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
+    body('new_password').custom(newPasswordValidator),
   ],
   validate,
   resetPassword

@@ -86,11 +86,11 @@ const login = (password) => call(auth.login, { body: { email: testEmail, passwor
 
 const editReq = (body) => ({ params: { id: String(userId) }, body, user: adminUser });
 
-test('Edit User: a new password is saved; blank keeps it; a short one is refused', opts, async () => {
-  const saved = await call(users.updateUser, editReq({ password: 'NewPass456' }));
+test('Edit User: a new password is saved; blank keeps it; a short or symbol-less one is refused', opts, async () => {
+  const saved = await call(users.updateUser, editReq({ password: 'NewPass456!' }));
   assert.equal(saved.status, 200, saved.body.message);
-  assert.equal(await bcrypt.compare('NewPass456', await storedHash()), true);
-  assert.equal((await login('NewPass456')).status, 200, 'the user signs in with the new password');
+  assert.equal(await bcrypt.compare('NewPass456!', await storedHash()), true);
+  assert.equal((await login('NewPass456!')).status, 200, 'the user signs in with the new password');
   assert.equal((await login('OldPass123')).status, 401, 'the old password no longer works');
 
   const before = await storedHash();
@@ -99,6 +99,10 @@ test('Edit User: a new password is saved; blank keeps it; a short one is refused
 
   const short = await call(users.updateUser, editReq({ password: 'short' }));
   assert.equal(short.status, 400);
+  // New passwords need a letter, a number and a symbol (2026-11-10).
+  const noSymbol = await call(users.updateUser, editReq({ password: 'NewPass4567' }));
+  assert.equal(noSymbol.status, 400);
+  assert.match(noSymbol.body?.message || noSymbol.error?.message || '', /symbol/);
   assert.equal(await storedHash(), before);
 });
 

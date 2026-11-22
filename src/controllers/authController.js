@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const redis = require('../config/redis');
 const { sendPasswordResetCode } = require('../services/passwordResetCode');
+const { assertNewPasswordAllowed } = require('../utils/passwordPolicy');
 const env = require('../config/env');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
@@ -279,7 +280,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
 const resetPassword = asyncHandler(async (req, res) => {
   const { email, otp, new_password } = req.body;
   if (!email || !otp || !new_password) throw ApiError.badRequest('email, otp, and new_password are required');
-  if (new_password.length < 8) throw ApiError.badRequest('Password must be at least 8 characters');
+  assertNewPasswordAllowed(new_password);
 
   const [users] = await pool.execute(
     'SELECT id FROM users WHERE email = ? AND is_deleted = 0 AND status = \'active\' LIMIT 1',

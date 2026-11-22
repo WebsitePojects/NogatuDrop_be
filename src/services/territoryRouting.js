@@ -1,10 +1,12 @@
 // Store-order territories (management, 2026-10-08): a Stockist fulfils store orders from the provinces and
 // cities Super Admin assigned to it (stockist_territories). Everything else, and every affiliate-link order,
-// goes to the nearer of the company centers (Caloocan, Tycoon).
+// goes to the nearer of the company centers (Caloocan, Tycoon). Inside a territory the centers stay out
+// ("hands off", Sir Dino 2026-11-10): the order is the Stockist's or it is not placed.
 
 /**
  * Stockists whose territory contains the buyer's barangay, city territory before province territory
- * (the more specific assignment wins), each with its active warehouse. Empty when nobody covers the area.
+ * (the more specific assignment wins), each with its active warehouse, or warehouse_id null when the
+ * Stockist has none yet. Empty when nobody covers the area.
  * One indexed lookup: barangay -> city -> (city | province) territory -> active partner -> warehouse.
  */
 async function findTerritoryStockists(db, barangayCode) {
@@ -17,11 +19,10 @@ async function findTerritoryStockists(db, barangayCode) {
        ON (t.area_type = 'city' AND t.area_code = c.code)
        OR (t.area_type = 'province' AND t.area_code = c.province_code)
      JOIN partners p ON p.id = t.partner_id
-     JOIN warehouses w ON w.partner_id = p.id
+     LEFT JOIN warehouses w ON w.partner_id = p.id AND w.is_deleted = 0 AND w.is_active = 1
      WHERE b.code = ?
        AND p.is_deleted = 0 AND p.status = 'active'
        AND p.stockist_level IN ('provincial_stockist', 'city_stockist')
-       AND w.is_deleted = 0 AND w.is_active = 1
      ORDER BY (t.area_type = 'city') DESC, w.id ASC`,
     [barangayCode]
   );

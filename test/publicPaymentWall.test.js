@@ -6,6 +6,7 @@ const { join } = require('node:path');
 const orderControllerSource = readFileSync(join(__dirname, '../src/controllers/orderController.js'), 'utf8');
 const trackingControllerSource = readFileSync(join(__dirname, '../src/controllers/trackingController.js'), 'utf8');
 const orderRoutesSource = readFileSync(join(__dirname, '../src/routes/orders.js'), 'utf8');
+const fulfillmentRouteSource = readFileSync(join(__dirname, '../src/services/publicFulfillmentRoute.js'), 'utf8');
 const { __testables } = require('../src/controllers/orderController');
 const {
   getPublicOrderPricingTotals,
@@ -17,13 +18,15 @@ test('public order creation responds with immediate payment instructions and pro
   assert.equal(orderControllerSource.includes('order_number: orderNumber'), true);
   assert.equal(orderControllerSource.includes('total_amount: totalAmount'), true);
   assert.equal(orderControllerSource.includes('payment: buildPublicPaymentContext({'), true);
-  assert.equal(orderControllerSource.includes('const pricingTotals = getPublicOrderPricingTotals(merchandiseSubtotal, { preDiscountSubtotal });'), true);
+  // The fee is the server's own quote for the buyer's zone and cart weight, never a client value.
+  assert.match(orderControllerSource, /const shippingQuote = await quoteShipping\(conn, \{\s+barangayCode: customer\.barangayCode,\s+items: resolvedItems,\s+originWarehouseId: fulfillmentRoute\.warehouse_id,/);
+  assert.match(orderControllerSource, /getPublicOrderPricingTotals\(merchandiseSubtotal, \{\s+preDiscountSubtotal,\s+shippingFee: shippingQuote\.fee,/);
 });
 
 test('public orders pick a warehouse that can fulfill the requested items instead of the first stockist route', () => {
   assert.equal(orderControllerSource.includes('resolvePublicFulfillmentRoute(conn, resolvedItems, {'), true);
-  assert.equal(orderControllerSource.includes('async function resolvePublicFulfillmentRoute(db, items, location'), true);
-  assert.equal(orderControllerSource.includes('canWarehouseFulfillItems(db, candidate.warehouse_id, items)'), true);
+  assert.equal(fulfillmentRouteSource.includes('async function resolvePublicFulfillmentRoute(db, items, location'), true);
+  assert.equal(fulfillmentRouteSource.includes('canWarehouseFulfillItems(db, candidate.warehouse_id, items)'), true);
 });
 
 test('public fulfillment ranks capable warehouses by distance from the customer', () => {
@@ -37,24 +40,26 @@ test('public fulfillment ranks capable warehouses by distance from the customer'
 });
 
 test('public pricing persists discount and fee components that reconcile to total, with no VAT line', () => {
-  const totals = getPublicOrderPricingTotals(700, { preDiscountSubtotal: 1000 });
+  const totals = getPublicOrderPricingTotals(700, { preDiscountSubtotal: 1000, shippingFee: 188 });
 
   assert.deepEqual(totals, {
     merchandiseSubtotal: 700,
     memberDiscountAmount: 300,
-    shippingFee: 159,
+    shippingFee: 188,
     systemFee: 0,
-    totalDue: 859,
+    totalDue: 888,
   });
 });
 
 test('store total is merchandise plus shipping only (VAT removed, management 2026-10-14)', () => {
-  const totals = getPublicOrderPricingTotals(7998);
+  const totals = getPublicOrderPricingTotals(7998, { shippingFee: 335 });
   assert.equal(totals.systemFee, 0);
-  assert.equal(totals.totalDue, 8157);
-  assert.deepEqual(getPublicOrderPricingTotals(0), {
-    merchandiseSubtotal: 0, memberDiscountAmount: 0, shippingFee: 0, systemFee: 0, totalDue: 0,
-  });
+  assert.equal(totals.totalDue, 8333);
+});
+
+test('pricing refuses to total an order without a quoted shipping fee (no silent flat fee)', () => {
+  assert.throws(() => getPublicOrderPricingTotals(7998), /needs the quoted shippingFee/);
+  assert.throws(() => getPublicOrderPricingTotals(7998, { shippingFee: null }), /needs the quoted shippingFee/);
 });
 
 test('historical public pricing exposes an explicit adjustment when components do not match stored total', () => {

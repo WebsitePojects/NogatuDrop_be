@@ -130,16 +130,15 @@ const EMAIL = {
     footerNote: STAFF_FOOTER,
   }),
 
-  dtaApproved: (applicantName, email, tempPassword) => renderEmail({
+  dtaApproved: (applicantName, email) => renderEmail({
     subject: 'Welcome to Nogatu: your Stockist account is ready',
-    preheader: 'Sign in and change your temporary password.',
+    preheader: 'Choose your password with the code we sent in a separate email.',
     eyebrow: 'Welcome', heading: 'Your Stockist account is ready',
     greeting: `Hi ${applicantName},`,
     blocks: [
-      { p: 'Your Stockist application was approved. Sign in with the details below and change the password straight away.' },
+      { p: 'Your Stockist application was approved. We sent a 6-digit code in a separate email: open the link below, enter your email and the code, and choose your password. The code works for 15 minutes; the same page sends a new one if it runs out.' },
       { details: [['Sign-in email', email]] },
-      { highlight: { label: 'Temporary password', value: tempPassword, mono: true } },
-      signIn('Sign in'),
+      { actions: [{ label: 'Choose my password', href: siteUrl('/forgot-password') }] },
     ],
     footerNote: 'You received this email because your Stockist application was approved.',
   }),

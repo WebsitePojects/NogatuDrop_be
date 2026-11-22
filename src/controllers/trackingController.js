@@ -13,7 +13,7 @@ const { orderCustomerJoins, orderCustomerNameSql, orderCustomerAddressSql, order
 const { buildOrderRoute, fetchWarehouseRowsByIds, fetchPrimaryWarehouseRowsByPartnerIds, UNSCOPED } = require('../services/orderRouteService');
 const { isInsidePhilippines, OUTSIDE_PH_MESSAGE } = require('../utils/phBounds');
 const {
-  PUBLIC_ORDER_SHIPPING_FEE,
+  LEGACY_FLAT_SHIPPING_FEE,
   reconcilePublicOrderPricing,
 } = require('../services/publicCheckoutPricing');
 
@@ -45,7 +45,7 @@ function buildTrackingPricingBreakdown(row) {
   const merchandiseSubtotal = Number(row.merchandise_subtotal ?? row.item_subtotal ?? 0);
   const totalAmount = Number(row.total_amount || 0);
   const shippingFee = row.shipping_fee == null
-    ? (totalAmount - merchandiseSubtotal >= PUBLIC_ORDER_SHIPPING_FEE ? PUBLIC_ORDER_SHIPPING_FEE : 0)
+    ? (totalAmount - merchandiseSubtotal >= LEGACY_FLAT_SHIPPING_FEE ? LEGACY_FLAT_SHIPPING_FEE : 0)
     : Number(row.shipping_fee);
   const systemFee = row.system_fee == null
     ? Math.max(totalAmount - merchandiseSubtotal - shippingFee, 0)
@@ -126,6 +126,8 @@ const getPublicTracking = asyncHandler(async (req, res) => {
             o.source_warehouse_id,
             dt.id AS tracking_id, dt.status AS tracking_status, dt.vehicle_type,
             dt.est_delivery_at,
+            o.delivery_eta_from,
+            o.delivery_eta_to,
             c.name AS courier_name, c.tracking_url_template, dt.courier_tracking_number, dt.courier_tracking_link
      FROM orders o
      LEFT JOIN delivery_tracking dt ON dt.order_id = o.id
@@ -196,6 +198,11 @@ const getPublicTracking = asyncHandler(async (req, res) => {
       gps,
       source_warehouse: sourceWarehouse,
       eta: row.est_delivery_at || null,
+      // Calendar dates quoted at checkout from the buyer's shipping zone (null for orders placed before 2026-11-15).
+      // Before payment the dates assume payment today; verifying payment recounts them from that day.
+      delivery_estimate: row.delivery_eta_from
+        ? { from: row.delivery_eta_from, to: row.delivery_eta_to, if_paid_today: row.payment_status !== 'paid' }
+        : null,
       vehicle_type: row.vehicle_type || null,
       // Minutes only. The road line itself is not sent: it ends at the buyer's door and anyone with
       // the order number can open this page.

@@ -26,8 +26,8 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
     [links[0].canonical_product_sku]
   );
   if (products.length !== 1) throw ApiError.serviceUnavailable('Influencer product configuration is unavailable');
-  if (req.body.member_username != null && String(req.body.member_username).trim()) {
-    throw ApiError.badRequest('Member username is not supported on influencer checkout');
+  if (req.body.member_pass) {
+    throw ApiError.badRequest('The member discount is not available on influencer links');
   }
   // One product per link (Berry NAD+ for /kawoodee); the buyer chooses how many, within the public cap.
   const quantity = Array.isArray(req.body.items) && req.body.items.length === 1 ? Number(req.body.items[0].quantity) : NaN;
@@ -39,7 +39,7 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
   }
   req.body = {
     ...req.body,
-    member_username: undefined,
+    member_pass: undefined,
     items: [{ product_id: products[0].id, quantity }],
   };
   req.influencerContext = { slug, linkId: links[0].id };

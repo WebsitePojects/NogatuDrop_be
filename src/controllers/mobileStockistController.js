@@ -2,6 +2,12 @@ const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
+const { assertNewPasswordAllowed } = require('../utils/passwordPolicy');
+
+// users.level is ENUM('main','regional','city'); the 'mobile' this used to write was refused by strict MariaDB
+// (every Mobile Stockist create was a 500 on prod). A Mobile Stockist works at street level under a City or
+// Provincial Stockist, so it takes the lowest tier.
+const MOBILE_USER_LEVEL = 'city';
 const paginate = require('../utils/paginate');
 const { ROLES, canonicalRole } = require('../rbac/roles');
 const { resolveAddress, hasAddressParts, readCoordinates } = require('../services/addressInput');
@@ -137,7 +143,7 @@ const getMobileStockists = asyncHandler(async (req, res) => {
 const createMobileStockist = asyncHandler(async (req, res) => {
   const { name, email, phone, parent_partner_id, password } = req.body;
   if (!name || !email) throw ApiError.badRequest('name and email are required');
-  if (!password || password.length < 8) throw ApiError.badRequest('Password must be at least 8 characters');
+  assertNewPasswordAllowed(password);
 
   const parentId = isSuperAdmin(req.user) ? (parent_partner_id || req.user.partner_id) : req.user.partner_id;
   if (!parentId) throw ApiError.badRequest('Parent Stockist is required');
@@ -168,7 +174,7 @@ const createMobileStockist = asyncHandler(async (req, res) => {
     const [userResult] = await conn.execute(
       `INSERT INTO users (name, email, password, phone, role_id, partner_id, level, location)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, email, hashedPassword, phone || null, mobileRoleId, parentId, 'mobile', place.text]
+      [name, email, hashedPassword, phone || null, mobileRoleId, parentId, MOBILE_USER_LEVEL, place.text]
     );
 
     let result;

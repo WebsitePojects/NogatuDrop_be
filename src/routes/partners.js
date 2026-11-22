@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const { body, param } = require('express-validator');
 const validate = require('../middleware/validate');
+const { newPasswordValidator } = require('../utils/passwordPolicy');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
 const { getPartners, getPartner, createPartner, updatePartner, updateDiscount } = require('../controllers/partnerController');
@@ -23,7 +24,7 @@ router.post(
     body('discount_pct').optional().isFloat({ min: 0, max: 100 }),
     body('admin_name').optional().trim(),
     body('admin_email').optional().isEmail(),
-    body('admin_password').optional().isLength({ min: 8 }),
+    body('admin_password').custom(newPasswordValidator),
     ...addressPartsValidators({ required: true }),
   ],
   validate,

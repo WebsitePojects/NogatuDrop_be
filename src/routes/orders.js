@@ -66,7 +66,11 @@ const publicOrderValidation = [
     .withMessage(`Quantity must be a whole number from 1 to ${PUBLIC_ORDER_MAX_QUANTITY_PER_LINE}`),
   bodyValidator('payment_method').optional().isIn(['bank_transfer']),
   bodyValidator('payment_provider').optional().toUpperCase().isIn(['GCASH', 'BDO', 'PSBANK']),
-  bodyValidator('member_username').optional().isString().isLength({ max: 100 }),
+  // A bare username proves nothing: the discount needs the signed pass from POST /members/verify.
+  bodyValidator('member_username').not().exists()
+    .withMessage('Sign in with your Nogatu Alliance username and password to get the member discount.'),
+  bodyValidator('member_pass').optional({ values: 'falsy' }).isString().isLength({ max: 2000 })
+    .withMessage('Your member sign-in is not valid. Sign in again.'),
   validate,
 ];
 

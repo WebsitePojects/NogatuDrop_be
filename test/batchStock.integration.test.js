@@ -50,7 +50,7 @@ test.before(async () => {
   const [[product]] = await pool.execute("SELECT id FROM products WHERE sku = 'NOG-105' LIMIT 1");
   productId = product.id;
   const [wh] = await pool.execute(
-    "INSERT INTO warehouses (name, type, location, is_active) VALUES (?, 'city', 'Batch stock test', 1)",
+    "INSERT INTO warehouses (name, type, location, manager_name, is_active) VALUES (?, 'city', 'Batch stock test', 'QA', 1)",
     [`QA batch stock ${Date.now().toString(36)}`]
   );
   warehouseId = wh.insertId;
