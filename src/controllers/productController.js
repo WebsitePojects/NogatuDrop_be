@@ -211,7 +211,7 @@ const getProducts = asyncHandler(async (req, res) => {
     params.push(category);
   }
 
-  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, is_active, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
+  const baseQuery = `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, member_price_eligible, is_active, created_at, updated_at FROM products ${where} ORDER BY name ASC`;
   const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
 
   const result = await paginate(baseQuery, countQuery, params, page, limit);
@@ -298,7 +298,7 @@ const getPublicProducts = asyncHandler(async (req, res) => {
   }
 
   const baseQuery = `
-    SELECT id, name, category, retail_price, unit, description, image_url
+    SELECT id, name, category, retail_price, unit, description, image_url, member_price_eligible
     FROM products ${where}
     ORDER BY name ASC`;
   const countQuery = `SELECT COUNT(*) AS total FROM products ${where}`;
@@ -311,7 +311,7 @@ const getPublicProducts = asyncHandler(async (req, res) => {
 // GET /api/v1/products/:id
 const getProduct = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
-    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, is_active, created_at, updated_at
+    `SELECT id, name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, member_price_eligible, is_active, created_at, updated_at
      FROM products WHERE id = ? AND is_deleted = 0 LIMIT 1`,
     [req.params.id]
   );
@@ -384,9 +384,10 @@ const createProduct = asyncHandler(async (req, res) => {
   }
 
   const [result] = await pool.execute(
-    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url, weightGrams]
+    `INSERT INTO products (name, sku, category, retail_price, partner_price, unit, description, image_url, weight_grams, member_price_eligible)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, sku, category || 'Drink Mixes', retail_price, partner_price, unit || '420g Boxes', description || null, image_url, weightGrams,
+      req.body.member_price_eligible === false ? 0 : 1]
   );
 
   const [created] = await pool.execute('SELECT * FROM products WHERE id = ?', [result.insertId]);
@@ -433,6 +434,10 @@ const updateProduct = asyncHandler(async (req, res) => {
   if (req.body.weight_grams) { fields.push('weight_grams = ?'); values.push(req.body.weight_grams); }
   // Only update is_active when explicitly provided; never let undefined/null flip it.
   if (is_active !== undefined) { fields.push('is_active = ?'); values.push(is_active); }
+  if (req.body.member_price_eligible !== undefined) {
+    fields.push('member_price_eligible = ?');
+    values.push(req.body.member_price_eligible ? 1 : 0);
+  }
 
   if (req.file) {
     fields.push('image_url = ?');

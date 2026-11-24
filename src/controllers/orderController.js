@@ -863,7 +863,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     // Every product in one query (a cart has at most PUBLIC_ORDER_MAX_ITEMS lines).
     const productIds = [...new Set(items.map((item) => Number(item.product_id)))];
     const [productRows] = await conn.execute(
-      `SELECT id, name, retail_price, partner_price FROM products
+      `SELECT id, name, retail_price, partner_price, member_price_eligible FROM products
        WHERE id IN (${productIds.map(() => '?').join(', ')}) AND is_deleted = 0 AND is_active = 1`,
       productIds
     );
@@ -880,19 +880,23 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       const product = productsById.get(Number(item.product_id));
       if (!product) throw ApiError.badRequest(`Product ${item.product_id} not found`);
       const price = getPublicOrderUnitPrice(product);
-      resolvedItems.push({ ...item, quantity, name: product.name, unit_price: price });
+      resolvedItems.push({
+        ...item, quantity, name: product.name, unit_price: price,
+        member_price_eligible: Number(product.member_price_eligible) === 1,
+      });
       merchandiseSubtotal += quantity * price;
       preDiscountSubtotal += quantity * price;
     }
 
     // Member discount only for a signed member pass from POST /members/verify (username + password checked
-    // by nogatualliance.com). An expired or forged pass is refused, never silently priced in full.
+    // by nogatualliance.com). An expired or forged pass is refused, never silently priced in full. Products only,
+    // never packages (a product with member_price_eligible = 0) and never shipping (Sir Dino, 2026-11-24).
     const member = req.body.member_pass ? readMemberPass(req.body.member_pass) : null;
     const memberDiscountPct = member ? MEMBER_DISCOUNT_PCT : 0;
     if (member) {
       merchandiseSubtotal = 0;
       for (const it of resolvedItems) {
-        it.unit_price = Math.round(it.unit_price * (1 - memberDiscountPct / 100) * 100) / 100;
+        if (it.member_price_eligible) it.unit_price = Math.round(it.unit_price * (1 - memberDiscountPct / 100) * 100) / 100;
         merchandiseSubtotal += it.quantity * it.unit_price;
       }
     }

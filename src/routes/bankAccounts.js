@@ -32,9 +32,12 @@ const updateValidation = [
 ];
 
 r.use(auth);
-r.get('/', roleGuard('super_admin'), c.getBankAccounts);
-r.post('/', roleGuard('super_admin'), createValidation, c.createBankAccount);
-r.put('/:id', roleGuard('super_admin'), updateValidation, c.updateBankAccount);
-r.delete('/:id', roleGuard('super_admin'), [idParam, validate], c.deleteBankAccount);
+// Super Admin manages every account; a Provincial or City Stockist manages only its own warehouses' accounts
+// (the controller scopes each query). Staff do not manage money details.
+const ACCOUNT_MANAGERS = ['super_admin', 'provincial_stockist', 'city_stockist'];
+r.get('/', roleGuard(...ACCOUNT_MANAGERS), c.getBankAccounts);
+r.post('/', roleGuard(...ACCOUNT_MANAGERS), createValidation, c.createBankAccount);
+r.put('/:id', roleGuard(...ACCOUNT_MANAGERS), updateValidation, c.updateBankAccount);
+r.delete('/:id', roleGuard(...ACCOUNT_MANAGERS), [idParam, validate], c.deleteBankAccount);
 r.get('/for-order/:orderId', roleGuard.requirePermission(PERMISSIONS.ORDERS_VIEW), c.getBankAccountForOrder);
 module.exports = r;

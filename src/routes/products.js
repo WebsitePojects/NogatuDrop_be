@@ -31,6 +31,8 @@ router.post(
     // Grams of one unit as packed; checkout prices shipping from it (a product without it cannot be checked out).
     body('weight_grams').optional({ values: 'falsy' }).isInt({ min: 1, max: 50000 })
       .withMessage('Weight must be a whole number of grams from 1 to 50,000').toInt(),
+    // Unticked for packages: they never get the Nogatu Alliance member price.
+    body('member_price_eligible').optional().isBoolean().withMessage('Member price must be true or false').toBoolean(),
   ],
   validate,
   createProduct
@@ -50,6 +52,8 @@ router.put(
     // Grams of one unit as packed; checkout prices shipping from it (a product without it cannot be checked out).
     body('weight_grams').optional({ values: 'falsy' }).isInt({ min: 1, max: 50000 })
       .withMessage('Weight must be a whole number of grams from 1 to 50,000').toInt(),
+    // Unticked for packages: they never get the Nogatu Alliance member price.
+    body('member_price_eligible').optional().isBoolean().withMessage('Member price must be true or false').toBoolean(),
   ],
   validate,
   updateProduct
