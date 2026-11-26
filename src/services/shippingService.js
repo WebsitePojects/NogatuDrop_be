@@ -1,6 +1,7 @@
 const ApiError = require('../utils/ApiError');
 const { assertWithinPublicItemLimit } = require('./publicOrderLimits');
 const { resolvePublicFulfillmentRoute } = require('./publicFulfillmentRoute');
+const { getPublicPaymentProviders } = require('./bankAccountResolver');
 
 // Store shipping fee = rate for (delivery tier, total cart weight), from the tables Super Admin edits on the
 // Shipping Fees screen (Sir Dino, 2026-11-10; rates from PROPOSAL_0026_SHIPPING_FEES). The server always
@@ -206,7 +207,12 @@ async function quotePublicCart(db, { barangayCode, items, centersOnly = false })
   const products = await loadCartProducts(db, items);
   const named = items.map((item) => ({ ...item, name: products.get(Number(item.product_id)).name }));
   const route = await resolvePublicFulfillmentRoute(db, named, { barangayCode, centersOnly });
-  return quoteShipping(db, { barangayCode, items, originWarehouseId: route.warehouse_id });
+  const [quote, paymentProviders] = await Promise.all([
+    quoteShipping(db, { barangayCode, items, originWarehouseId: route.warehouse_id }),
+    // Checkout shows only how the Stockist (or hub) that ships here takes payment; the order applies the same rule.
+    getPublicPaymentProviders(db, route.payment_warehouse_id),
+  ]);
+  return { ...quote, payment_providers: paymentProviders };
 }
 
 module.exports = {

@@ -15,9 +15,9 @@
 const mysql = require('mysql2/promise');
 const { releaseStock } = require('../src/services/batchStock');
 const { insertStockMovement } = require('../src/utils/stockMovementLogger');
+const { softDeleteStockists, OPEN_ORDER_STATUSES } = require('../src/services/stockistRemoval');
 
 const STOCKIST_LEVELS = ['provincial_stockist', 'city_stockist'];
-const OPEN_STATUSES = ['pending', 'approved', 'delivering'];
 const REASON = 'Test data cleared';
 
 function readArgs(argv) {
@@ -101,7 +101,7 @@ async function main() {
     const [orders] = await conn.query(
       'SELECT id, order_number, status, source_warehouse_id FROM orders WHERE partner_id IN (?) AND is_deleted = 0', [ids]
     );
-    const openOrders = orders.filter((o) => OPEN_STATUSES.includes(o.status));
+    const openOrders = orders.filter((o) => OPEN_ORDER_STATUSES.includes(o.status));
     const [[counts]] = await conn.query(
       `SELECT
          (SELECT COUNT(*) FROM users WHERE partner_id IN (?) AND is_deleted = 0) AS users,
@@ -120,15 +120,7 @@ async function main() {
     await conn.beginTransaction();
     await releaseOpenOrders(conn, openOrders);
     await conn.query('UPDATE orders SET is_deleted = 1, archived_at = COALESCE(archived_at, NOW()) WHERE partner_id IN (?) AND is_deleted = 0', [ids]);
-    await conn.query("UPDATE users SET is_deleted = 1, status = 'inactive' WHERE partner_id IN (?) AND is_deleted = 0", [ids]);
-    await conn.query("UPDATE mobile_stockists SET is_deleted = 1, status = 'inactive' WHERE partner_id IN (?) AND is_deleted = 0", [ids]);
-    await conn.query(
-      `UPDATE bank_accounts ba JOIN warehouses w ON w.id = ba.warehouse_id
-       SET ba.is_deleted = 1 WHERE w.partner_id IN (?) AND ba.is_deleted = 0`, [ids]
-    );
-    await conn.query('UPDATE warehouses SET is_deleted = 1, is_active = 0 WHERE partner_id IN (?) AND is_deleted = 0', [ids]);
-    await conn.query('DELETE FROM stockist_territories WHERE partner_id IN (?)', [ids]);
-    await conn.query("UPDATE partners SET is_deleted = 1, status = 'inactive' WHERE id IN (?) AND is_deleted = 0", [ids]);
+    await softDeleteStockists(conn, ids);
     await conn.commit();
     console.log('Done.');
   } catch (err) {

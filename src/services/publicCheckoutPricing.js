@@ -58,4 +58,5 @@ module.exports = {
   LEGACY_FLAT_SHIPPING_FEE,
   getPublicOrderPricingTotals,
   reconcilePublicOrderPricing,
+  roundCurrency,
 };

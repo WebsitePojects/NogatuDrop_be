@@ -8,6 +8,7 @@ const { resolveAddress, hasAddressParts } = require('../services/addressInput');
 const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
 const { assignHomeTerritory } = require('./territoryController');
 const { assertNewPasswordAllowed } = require('../utils/passwordPolicy');
+const { findRemovalBlockers, assertNothingOpen, softDeleteStockists } = require('../services/stockistRemoval');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isDupEntryError = (err) => err && err.code === 'ER_DUP_ENTRY';
@@ -254,4 +255,40 @@ const updateDiscount = asyncHandler(async (req, res) => {
   res.json({ success: true, message: `Discount set to ${discount_pct}%` });
 });
 
-module.exports = { getPartners, getPartner, createPartner, updatePartner, updateDiscount };
+// DELETE /api/v1/partners/:id  (Super Admin)
+// Removes a Stockist with its logins, Mobile Stockists, warehouses, payment accounts and territory, only when
+// nothing live depends on it (services/stockistRemoval.js). Hubs are company sites and are never deleted here.
+const deletePartner = asyncHandler(async (req, res) => {
+  const conn = await pool.getConnection();
+  let name;
+  try {
+    await conn.beginTransaction();
+    // Row lock: a second delete of the same Stockist waits here, then finds it already deleted (409).
+    const [rows] = await conn.execute(
+      'SELECT id, business_name, stockist_level, is_deleted FROM partners WHERE id = ? LIMIT 1 FOR UPDATE',
+      [req.params.id]
+    );
+    const partner = rows[0];
+    if (!partner) throw ApiError.notFound('Stockist not found');
+    if (Number(partner.is_deleted) === 1) throw ApiError.conflict('This Stockist was already deleted');
+    if (partner.stockist_level === PARTNER_LEVELS.CENTER) throw ApiError.badRequest('Hubs cannot be deleted');
+    const [warehouses] = await conn.execute(
+      'SELECT id FROM warehouses WHERE partner_id = ? AND is_deleted = 0 FOR UPDATE', [partner.id]
+    );
+    assertNothingOpen(
+      await findRemovalBlockers(conn, { warehouseIds: warehouses.map((w) => w.id), partnerIds: [partner.id] }),
+      'This Stockist'
+    );
+    await softDeleteStockists(conn, [partner.id]);
+    await conn.commit();
+    name = partner.business_name;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  res.json({ success: true, message: `${name} was deleted. Its area is free for another Stockist.` });
+});
+
+module.exports = { getPartners, getPartner, createPartner, updatePartner, updateDiscount, deletePartner };

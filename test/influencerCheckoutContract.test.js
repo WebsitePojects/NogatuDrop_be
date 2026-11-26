@@ -40,13 +40,11 @@ test('influencer migration is schema-only and never seeds a hard-coded SKU', () 
   assert.doesNotMatch(migration, /NKT-BND-001/);
 });
 
-test('payment provider selection cannot cross warehouse scope', () => {
-  const accounts = [
-    { id: 1, provider: 'BDO', warehouse_id: 10, account_name: 'A', account_number: '1' },
-    { id: 2, provider: 'BDO', warehouse_id: null, account_name: 'Default', account_number: '2' },
-  ];
-  assert.equal(selectPublicPaymentAccount(accounts, 'BDO', 10).id, 1);
-  assert.equal(selectPublicPaymentAccount(accounts, 'BDO', 11).id, 2);
-  assert.throws(() => selectPublicPaymentAccount([], 'BDO', 10), /No active payment account/);
-  assert.throws(() => selectPublicPaymentAccount(accounts, 'MAYA', 10), /Unsupported/);
+test('payment provider selection picks only from the warehouse-scoped list it is given', () => {
+  // getPublicPaymentAccounts already scoped this list to one warehouse (or the company accounts).
+  const accounts = [{ id: 1, provider: 'BDO', warehouse_id: 10, account_name: 'A', account_number: '1' }];
+  assert.equal(selectPublicPaymentAccount(accounts, 'BDO').id, 1);
+  assert.throws(() => selectPublicPaymentAccount(accounts, 'GCASH'), /not available for this delivery address/);
+  assert.throws(() => selectPublicPaymentAccount([], 'BDO'), /No active payment account/);
+  assert.throws(() => selectPublicPaymentAccount(accounts, 'MAYA'), /Unsupported/);
 });

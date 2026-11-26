@@ -15,6 +15,7 @@ const BUYER_EVENTS = Object.freeze({
   COURIER: 'buyer_courier_tracking',
   DELIVERED: 'buyer_delivered',
   CANCELLED: 'buyer_order_cancelled',
+  MEMBER_PRICE_REMOVED: 'buyer_member_price_removed',
 });
 const BUYER_EVENT_SET = new Set(Object.values(BUYER_EVENTS));
 
@@ -151,6 +152,16 @@ function buildBuyerEmail(eventType, order) {
         heading: 'Your order was cancelled',
         blocks: [progress(0, true), { notice: { tone: 'bad', text: order.cancellation_reason ? `Reason: ${order.cancellation_reason}` : 'This order will not be shipped.' } },
           { p: 'If you already paid, please contact us with your order number.' }, { actions: [{ label: 'Shop again', href: siteUrl('/shop') }] }],
+      });
+    case BUYER_EVENTS.MEMBER_PRICE_REMOVED:
+      return renderEmail({
+        ...base, subject: `Order #${num}: new total at the regular price`,
+        preheader: `Your new total is ${peso(order.total_amount)}.`,
+        heading: 'Your order is now at the regular price',
+        blocks: [progress(0), { highlight: { label: 'New total', value: peso(order.total_amount) } },
+          { p: 'The Nogatu Alliance member price is for the member\'s own order, so we changed this order to the regular price. Shipping is unchanged.' },
+          { p: 'We will email you once the order is approved, with how to pay. If you no longer want it, you do not need to do anything: an unpaid order is cancelled on its own.' },
+          { actions: [trackButton(order)] }],
       });
     default:
       throw new Error(`Unknown buyer email event "${eventType}"`);

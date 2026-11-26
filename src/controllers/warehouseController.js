@@ -8,6 +8,7 @@ const { buildWarehouseListScope, canManageWarehouse } = require('../rbac/warehou
 const { resolveAddress, hasAddressParts, readCoordinates } = require('../services/addressInput');
 const { addressPartsJoins, addressPartsSelect } = require('../utils/addressPartsSql');
 const { withAdvisoryLock } = require('../utils/advisoryLock');
+const { findRemovalBlockers, assertNothingOpen, softDeleteWarehouse } = require('../services/stockistRemoval');
 
 // warehouses.location is varchar(200); the composed address text is shortened to fit.
 const LOCATION_MAX_LENGTH = 200;
@@ -211,14 +212,27 @@ const updateWarehouse = asyncHandler(async (req, res) => {
 
 const deleteWarehouse = asyncHandler(async (req, res) => {
   const context = await getContext(req);
-  const [existingRows] = await pool.execute(
-    'SELECT id, partner_id, type FROM warehouses WHERE id = ? AND is_deleted = 0 LIMIT 1',
-    [req.params.id]
-  );
-  if (existingRows.length === 0 || !canManageWarehouse(context, existingRows[0])) {
-    throw ApiError.notFound('Warehouse not found');
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Row lock: a second delete of the same warehouse waits here, then finds it already deleted (409).
+    const [existingRows] = await conn.execute(
+      'SELECT id, partner_id, type, is_deleted FROM warehouses WHERE id = ? LIMIT 1 FOR UPDATE',
+      [req.params.id]
+    );
+    const warehouse = existingRows[0];
+    if (!warehouse || !canManageWarehouse(context, warehouse)) throw ApiError.notFound('Warehouse not found');
+    if (Number(warehouse.is_deleted) === 1) throw ApiError.conflict('This warehouse was already deleted');
+    // Never strand an order, reserved stock or a transfer on a deleted warehouse.
+    assertNothingOpen(await findRemovalBlockers(conn, { warehouseIds: [warehouse.id] }), 'This warehouse');
+    await softDeleteWarehouse(conn, warehouse.id);
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
   }
-  await pool.execute('UPDATE warehouses SET is_deleted = 1, is_active = 0 WHERE id = ?', [req.params.id]);
   res.json({ success: true, message: 'Warehouse deleted' });
 });
 

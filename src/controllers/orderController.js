@@ -21,6 +21,7 @@ const {
   LEGACY_FLAT_SHIPPING_FEE,
   getPublicOrderPricingTotals,
   reconcilePublicOrderPricing,
+  roundCurrency,
 } = require('../services/publicCheckoutPricing');
 const { getPaymentVerificationDecision } = require('../services/paymentVerification');
 const { enqueueOrderNotifications } = require('../services/orderNotificationOutbox');
@@ -881,7 +882,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
       if (!product) throw ApiError.badRequest(`Product ${item.product_id} not found`);
       const price = getPublicOrderUnitPrice(product);
       resolvedItems.push({
-        ...item, quantity, name: product.name, unit_price: price,
+        ...item, quantity, name: product.name, unit_price: price, regular_unit_price: price,
         member_price_eligible: Number(product.member_price_eligible) === 1,
       });
       merchandiseSubtotal += quantity * price;
@@ -929,7 +930,7 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     let bankAccount = await getBankAccountForWarehouseOrDefault(conn, paymentWarehouseId);
     if (req.body.payment_provider) {
       const accounts = await getPublicPaymentAccounts(conn, paymentWarehouseId);
-      bankAccount = selectPublicPaymentAccount(accounts, req.body.payment_provider, paymentWarehouseId);
+      bankAccount = selectPublicPaymentAccount(accounts, req.body.payment_provider);
     }
     assertBankAccountAvailable(bankAccount);
 
@@ -1007,16 +1008,16 @@ const createPublicOrder = asyncHandler(async (req, res) => {
     for (const item of resolvedItems) {
       try {
         await conn.execute(
-          `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price)
-           VALUES (?, ?, ?, ?, ?)`,
-          [orderId, item.product_id, sourceWarehouseId, item.quantity, item.unit_price]
+          `INSERT INTO order_items (order_id, product_id, source_warehouse_id, quantity, unit_price, regular_unit_price)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [orderId, item.product_id, sourceWarehouseId, item.quantity, item.unit_price, item.regular_unit_price]
         );
       } catch (err) {
         if (isMissingColumn(err, 'source_warehouse_id')) {
           await conn.execute(
-            `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
-             VALUES (?, ?, ?, ?)`,
-            [orderId, item.product_id, item.quantity, item.unit_price]
+            `INSERT INTO order_items (order_id, product_id, quantity, unit_price, regular_unit_price)
+             VALUES (?, ?, ?, ?, ?)`,
+            [orderId, item.product_id, item.quantity, item.unit_price, item.regular_unit_price]
           );
         } else {
           throw err;
@@ -1108,6 +1109,75 @@ const createPublicOrder = asyncHandler(async (req, res) => {
 });
 
 // PATCH /api/v1/orders/:id/approve
+// PATCH /api/v1/orders/:id/remove-member-price
+// The member price is for the member's own order (Sir Dino, 2026-11-24). When the approver finds a store order
+// is for someone else, this puts the products back at their regular price (saved at checkout) instead of
+// rejecting the whole order, and emails the buyer the new total (2026-11-26). Only while the order is pending
+// and nothing has been paid: after that the amount the buyer was told is final, so reject instead.
+const removeMemberPrice = asyncHandler(async (req, res) => {
+  const orderId = req.params.id;
+  const [orders] = await pool.execute(
+    `SELECT o.id, o.order_number, o.partner_id, o.source_warehouse_id, o.status, o.placed_by_type,
+            o.member_discount_pct, o.payment_proof_url, o.shipping_fee, o.system_fee,
+            r.slug AS placed_by_role_slug
+     FROM orders o
+     LEFT JOIN users u ON u.id = o.placed_by
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE o.id = ? AND o.is_deleted = 0
+     LIMIT 1`,
+    [orderId]
+  );
+  if (orders.length === 0) throw ApiError.notFound('Order not found');
+  const order = orders[0];
+  const affiliationContext = await resolveAffiliationContext(pool, req.user);
+  if (!canApproveOrderFromContext(affiliationContext, order)) {
+    throw ApiError.forbidden('You do not have permission to change this order');
+  }
+  if (!(Number(order.member_discount_pct) > 0)) throw ApiError.conflict('This order has no member price');
+  if (order.status !== 'pending') throw ApiError.conflict('The member price can only be removed before the order is approved');
+  if (order.payment_proof_url) {
+    throw ApiError.conflict('The buyer already sent a payment for the member price. Reject the order, or settle the difference with the buyer.');
+  }
+
+  const conn = await pool.getConnection();
+  let totalDue;
+  try {
+    await conn.beginTransaction();
+    const [items] = await conn.execute(
+      'SELECT id, quantity, regular_unit_price FROM order_items WHERE order_id = ? FOR UPDATE',
+      [order.id]
+    );
+    if (items.length === 0 || items.some((item) => item.regular_unit_price == null)) {
+      throw ApiError.conflict('This order was placed before the member price could be removed. Reject it so the buyer can order again at the regular price.');
+    }
+    const regularSubtotal = roundCurrency(items.reduce((sum, item) => sum + Number(item.quantity) * Number(item.regular_unit_price), 0));
+    // Shipping and the system fee were never discounted, so they stay exactly as quoted.
+    totalDue = roundCurrency(regularSubtotal + Number(order.shipping_fee || 0) + Number(order.system_fee || 0));
+
+    // The state change that wins: a double click or a second approver gets 409 and changes nothing.
+    const [changed] = await conn.execute(
+      `UPDATE orders
+       SET merchandise_subtotal = ?, member_discount_amount = 0, member_discount_pct = 0, total_amount = ?
+       WHERE id = ? AND status = 'pending' AND member_discount_pct > 0 AND payment_proof_url IS NULL AND is_deleted = 0`,
+      [regularSubtotal, totalDue, order.id]
+    );
+    if (changed.affectedRows !== 1) throw ApiError.conflict('This order changed meanwhile. Open it again to see where it stands.');
+    await conn.execute('UPDATE order_items SET unit_price = regular_unit_price WHERE order_id = ?', [order.id]);
+    await enqueueBuyerEmail(conn, { orderId: order.id, eventType: BUYER_EVENTS.MEMBER_PRICE_REMOVED });
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  res.json({
+    success: true,
+    message: `Member price removed. The buyer was emailed the new total of PHP ${totalDue.toFixed(2)}.`,
+    data: { total_amount: totalDue },
+  });
+});
+
 const approveOrder = asyncHandler(async (req, res) => {
   const orderId = req.params.id;
 
@@ -1575,6 +1645,7 @@ module.exports = {
   createPublicOrder,
   uploadPublicPaymentProof,
   approveOrder,
+  removeMemberPrice,
   rejectOrder,
   cancelOrder,
   uploadPaymentProof,

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   getBankAccountForWarehouseOrDefault,
   getPublicPaymentAccounts,
+  getPublicPaymentProviders,
   selectPublicPaymentAccount,
   normalizeProvider,
 } = require('../src/services/bankAccountResolver');
@@ -69,25 +70,32 @@ test('fallback never hands out another warehouse account that is merely flagged 
   assert.equal(await getBankAccountForWarehouseOrDefault(fakeBankDb(noCompanyDefault), 12), null);
 });
 
-test('public accounts load only this warehouse plus company accounts, active and not deleted', async () => {
+test('a warehouse with its own accounts offers only those (active, not deleted), never the company ones', async () => {
   const accounts = await getPublicPaymentAccounts(fakeBankDb(), 10);
-  assert.deepEqual(accounts.map((a) => a.id), [1, 5]);
-  assert.deepEqual(accounts.map((a) => a.provider), ['GCASH', 'BDO']);
+  assert.deepEqual(accounts.map((a) => a.id), [1]);
+  assert.deepEqual(accounts.map((a) => a.provider), ['GCASH']);
+});
+
+test('a warehouse with no account of its own offers the company accounts', async () => {
+  assert.deepEqual((await getPublicPaymentAccounts(fakeBankDb(), 12)).map((a) => a.id), [5]);
+  assert.deepEqual((await getPublicPaymentAccounts(fakeBankDb(), null)).map((a) => a.id), [5]);
+  assert.deepEqual(await getPublicPaymentProviders(fakeBankDb(), 12), ['BDO']);
 });
 
 test('getPublicPaymentAccounts works when destructured and called as a bare function', async () => {
   // orderController imports it by destructuring; it must not rely on `this`.
   const { getPublicPaymentAccounts: bare } = require('../src/services/bankAccountResolver');
   const accounts = await bare(fakeBankDb(), 11);
-  assert.deepEqual(accounts.map((a) => a.id), [4, 5]);
+  assert.deepEqual(accounts.map((a) => a.id), [4]);
 });
 
-test('public selection prefers the warehouse account, then the company account, else fails closed', async () => {
+test('public selection takes only a provider the warehouse offers, else fails closed', async () => {
   const forTen = await getPublicPaymentAccounts(fakeBankDb(), 10);
-  assert.equal(selectPublicPaymentAccount(forTen, 'GCASH', 10).id, 1);
-  assert.equal(selectPublicPaymentAccount(forTen, 'bdo', 10).id, 5);
-  assert.throws(() => selectPublicPaymentAccount(forTen, 'PSBANK', 10), (err) => err.statusCode === 503);
-  assert.throws(() => selectPublicPaymentAccount(forTen, 'MAYA', 10), (err) => err.statusCode === 400);
+  assert.equal(selectPublicPaymentAccount(forTen, 'gcash').id, 1);
+  // The Davao case: the Stockist takes GCash only, so the company BDO is refused, not silently used.
+  assert.throws(() => selectPublicPaymentAccount(forTen, 'BDO'), (err) => err.statusCode === 400 && /not available/.test(err.message));
+  assert.throws(() => selectPublicPaymentAccount([], 'GCASH'), (err) => err.statusCode === 503);
+  assert.throws(() => selectPublicPaymentAccount(forTen, 'MAYA'), (err) => err.statusCode === 400);
 });
 
 test('normalizeProvider tolerates spacing and punctuation and rejects unknown banks', () => {

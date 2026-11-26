@@ -10,7 +10,7 @@ const { prepareInfluencerOrder, getPublicPaymentOptions, getInfluencerMetadata }
 const {
   getOrders, getOrder, createOrder, createPublicOrder,
   uploadPublicPaymentProof,
-  approveOrder, rejectOrder, cancelOrder,
+  approveOrder, rejectOrder, cancelOrder, removeMemberPrice,
   uploadPaymentProof, verifyPayment,
   archiveOrder, unarchiveOrder,
   changeShippingFee,
@@ -99,6 +99,7 @@ router.post(
 );
 
 router.patch('/:id/approve', requirePermission(PERMISSIONS.ORDERS_APPROVE), approveOrder);
+router.patch('/:id/remove-member-price', requirePermission(PERMISSIONS.ORDERS_APPROVE), param('id').isInt({ min: 1 }), validate, removeMemberPrice);
 router.patch('/:id/reject', requirePermission(PERMISSIONS.ORDERS_REJECT), [body('reason').optional().trim()], validate, rejectOrder);
 router.patch('/:id/cancel', requirePermission(PERMISSIONS.ORDERS_CANCEL), cancelOrder);
 

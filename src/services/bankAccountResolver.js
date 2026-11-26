@@ -94,9 +94,10 @@ function normalizeProvider(bankName) {
 }
 
 /**
- * Active accounts a public order for `warehouseId` may pay into: that
- * warehouse's own plus company-level (NULL warehouse) ones, tagged with provider.
- * Other warehouses' accounts are never loaded.
+ * Active accounts a public order for `warehouseId` may pay into, tagged with provider: that warehouse's own
+ * accounts when it has any, otherwise the company-level (NULL warehouse) ones. Never a mix: a buyer of a
+ * Stockist pays that Stockist, so the company's BDO must not appear beside the Stockist's GCash (Sir Dino,
+ * 2026-11-26). Other warehouses' accounts are never loaded.
  */
 async function getPublicPaymentAccounts(db, warehouseId) {
   const scopeWarehouseId = warehouseId == null ? null : warehouseId;
@@ -112,18 +113,31 @@ async function getPublicPaymentAccounts(db, warehouseId) {
      WHERE is_active = 1 AND (warehouse_id = ? OR warehouse_id IS NULL)
      ORDER BY (warehouse_id = ?) DESC, is_default DESC, id ASC`
   );
-  return rows
+  const payable = rows
     .map((row) => ({ ...row, provider: normalizeProvider(row.bank_name) }))
     .filter((row) => row.provider);
+  const own = scopeWarehouseId == null ? [] : payable.filter((row) => Number(row.warehouse_id) === Number(scopeWarehouseId));
+  return own.length > 0 ? own : payable.filter((row) => row.warehouse_id == null);
 }
 
-function selectPublicPaymentAccount(accounts, provider, warehouseId) {
+/** Providers a buyer may choose for this warehouse, in display order, each once. */
+async function getPublicPaymentProviders(db, warehouseId) {
+  const accounts = await getPublicPaymentAccounts(db, warehouseId);
+  return [...new Set(accounts.map((account) => account.provider))];
+}
+
+/**
+ * The account for the provider the buyer chose, from `accounts` (getPublicPaymentAccounts for the order's
+ * payment warehouse). A provider that warehouse does not take is refused, never sent to another account.
+ */
+function selectPublicPaymentAccount(accounts, provider) {
   const normalized = String(provider || '').toUpperCase();
   if (!PUBLIC_PAYMENT_PROVIDERS.includes(normalized)) throw ApiError.badRequest('Unsupported payment provider');
-  const candidates = accounts.filter((account) => account.provider === normalized);
-  const selected = candidates.find((account) => Number(account.warehouse_id) === Number(warehouseId))
-    || candidates.find((account) => account.warehouse_id == null);
-  if (!selected) throw ApiError.serviceUnavailable('No active payment account is configured for this provider and warehouse');
+  if (accounts.length === 0) throw ApiError.serviceUnavailable('No active payment account is configured for this delivery area');
+  const selected = accounts.find((account) => account.provider === normalized);
+  if (!selected) {
+    throw ApiError.badRequest(`${normalized} is not available for this delivery address. Please choose another payment option.`);
+  }
   return selected;
 }
 
@@ -181,5 +195,6 @@ module.exports = {
   PUBLIC_PAYMENT_PROVIDERS,
   normalizeProvider,
   getPublicPaymentAccounts,
+  getPublicPaymentProviders,
   selectPublicPaymentAccount,
 };

@@ -46,6 +46,9 @@ const prepareInfluencerOrder = asyncHandler(async (req, res, next) => {
   next();
 });
 
+// Every provider in the system, not per delivery area. Checkout now reads `payment_providers` from
+// POST /shipping/quote instead; this stays only for the store build still live before the 2026-11 release,
+// so a server deployed ahead of the website does not break checkout. Remove once that release is live.
 const getPublicPaymentOptions = asyncHandler(async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT DISTINCT bank_name

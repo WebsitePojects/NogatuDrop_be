@@ -4,7 +4,7 @@ const validate = require('../middleware/validate');
 const { newPasswordValidator } = require('../utils/passwordPolicy');
 const auth = require('../middleware/authMiddleware');
 const role = require('../middleware/roleGuard');
-const { getPartners, getPartner, createPartner, updatePartner, updateDiscount } = require('../controllers/partnerController');
+const { getPartners, getPartner, createPartner, updatePartner, updateDiscount, deletePartner } = require('../controllers/partnerController');
 const { addressPartsValidators } = require('../services/addressInput');
 const { getTerritories, setTerritories } = require('../controllers/territoryController');
 
@@ -32,6 +32,7 @@ router.post(
 );
 
 router.put('/:id', param('id').isInt(), addressPartsValidators({ required: false }), validate, updatePartner);
+router.delete('/:id', param('id').isInt({ min: 1 }), validate, deletePartner);
 router.patch('/:id/discount', [body('discount_pct').isFloat({ min: 0, max: 100 })], validate, updateDiscount);
 // Store-order territory: the provinces and cities this Stockist fulfils (Super Admin only, as above).
 router.get('/:id/territories', param('id').isInt({ min: 1 }), validate, getTerritories);

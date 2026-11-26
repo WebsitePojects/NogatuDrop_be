@@ -185,9 +185,17 @@ async function withOrdersRouter(run) {
   try {
     await run(`http://127.0.0.1:${server.address().port}/api/v1/orders/public`);
   } finally {
+    // fetch keeps its sockets alive; left open, Windows aborts at exit (libuv async.c assertion) after every
+    // test has passed. Close them with the server.
+    server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
 }
+
+test.after(async () => {
+  // The orders router opened the database pool on load; release it so the process ends on its own.
+  await require('../src/config/db').end().catch(() => {});
+});
 
 const publicOrder = {
   customer_first_name: 'Maria',
