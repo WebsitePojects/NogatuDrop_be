@@ -1,7 +1,8 @@
 # Handoff: Nogatu NCDMS (nogatu.store store + distribution system)
 
-Last updated: 2026-11-26, on the desktop. The client's Nov 24 and Nov 26 answers are built and pushed to `staging`.
-The Nov 26 server deploy block was handed over but its output has not come back yet.
+Last updated: 2026-11-28, on the desktop. Nov 24 + Nov 26 client answers are on branch `staging` (both repos); the
+staging SERVER still runs the Nov 24 build (checked 2026-11-28), so its Nov 26 deploy block is the first thing to do.
+Deploy/setup details: `docs/DEPLOY.md`.
 Read this file first in any new session, on any device. Refresh it with `/handoff update`.
 
 This file is committed. It never holds secrets, tokens, passwords, personal data of customers or residents,
@@ -94,25 +95,32 @@ Full log: workspace `.claude/rules/lessons.md` (newest on top).
 - Branch `feat/meeting-2026-11-10` in both repos; `staging` is fast-forwarded to it. `main` = live, merged only at go-live.
 - Messages to the client: casual paragraphs, "sir", no bullets/numbered lists, no em/en dashes, brief.
 
-## 5. Status (2026-11-26)
+## 5. Status (2026-11-28)
 **Branches:** `feat/meeting-2026-11-10` (both repos, pushed) == `origin/staging`. Not merged to `main`.
-`release/live-2026-10-28`, `finalization`: old, merged into live.
+`release/live-2026-10-28`, `finalization`: old, merged into live. Not merged and dormant (do not merge blindly):
+backend `feature/signin-security` (2026-10-02, also `origin/parked/signin-security`), `feature/signin-security-v2`
+(2026-10-10, WIP sign-in security + reset hardening), `hotfix/store-no-vat` (2026-10-14); frontend
+`feature/signin-security`, `feature/signin-security-v2`. Old Codex worktrees under workspace
+`outputs/management-2026-09-10/` (one, `quarantine-store-copy`, has 190 uncommitted files): not ours, leave them.
 **Recent commits:**
+- be `bb9f1bd` docs/DEPLOY.md; `0ca43dd` this handoff
 - be `9667980` Nov 26: checkout pays shipping Stockist only, Remove member price, safe Delete Stockist/warehouse
 - be `02cb72e` Nov 24: member price skips packages, Stockist payment accounts, staging clean-up
 - be `33fb328` store shipping/payments/member sign-in/rate limits; live `main` = `1fa9688`
-- fe `8fa88ac` Nov 26 (same features); fe `8cc0bc0` Nov 24; live `main` = `bf7ddb4`
+- fe (NogatuDrop_fe repo) `8fa88ac` Nov 26 (same features); `8cc0bc0` Nov 24; live `main` = `bf7ddb4`
 **Verified (real output):** staging API ran `02cb72e` (restarted 2026-11-24, member column = 1, 401 checks, prod health 200); staging Stockists cleared (4) and a re-run found nothing; staging website bundle contains the Nov 24 pages. Sim: backend 389/391 (the 1 = lesson 6), frontend 71/71, build OK; browser checks: payment options 5/5 (Davao buyer sees GCASH only), new buttons 4/4, store e2e 21/21, Nov 24 screens 7/7.
-**NOT verified:** staging API on `9667980` (block in workspace `outputs/sim-2026-11-15/STAGING_DEPLOY_2026-11-26.md` not run yet). Until it runs, the staging checkout shows "Payment accounts are not available" because the new website is already live there. Rejection of the staging test order is step 5 of that block.
+**Staging server is behind (checked 2026-11-28):** `/api/health` uptime 334,190 s (restarted 2026-11-24, the `02cb72e` deploy) and the shipping quote has no `payment_providers`, so the `9667980` block (workspace `outputs/sim-2026-11-15/STAGING_DEPLOY_2026-11-26.md`) has NOT run. Meanwhile the staging website (already `8fa88ac`) shows "Payment accounts are not available" at checkout. Rejecting the staging test order PUB-20261123080452192000 is step 5 of that block.
+**Migrate archive:** plan built 2026-11-26 (workspace `.claude/migrate.json`, 380 files, 43.9 MB, real data left out); the owner has not packed it yet (no archive found 2026-11-28).
 **Waiting on others:** the client adds a test Stockist on staging and tries the flow; client approval to go live; the MLM session's progress on the client's 8-item list + auto-upgrade proposal (unknown).
 
 ## 6. What's next
-1. Run the Nov 26 staging block (owner, on the VPS) and read its output: HEAD `9667980`, quote shows `payment_providers`, both 401s, reject result.
+1. Run the Nov 26 staging block (owner, on the VPS) NOW and read its output: HEAD `9667980`, quote shows `payment_providers`, both 401s, reject result. Check first: `curl -s https://staging-api.nogatu.store/api/health` uptime must drop.
 2. Re-check staging in the browser: a Stockist-area address shows only that Stockist's options; Delete Stockist and Remove member price work.
 3. Send the client the short update (payment options fixed, Remove member price, Delete Stockist, staging test order removed).
 4. When the client adds packages, untick "Nogatu Alliance member price applies" on each (none exist yet).
 5. Go-live (only after the client's OK): MLM BLUE gets the member verify endpoint; prod DB backup; pull + `scripts/addShippingRates.js`, `scripts/addProductMemberPriceFlag.js` (and any earlier ones live lacks) with `--apply`; set MLM_API_URL/KEY; restart; merge to `main` for Vercel; live test-data clean-up only with `--live --ids=<approved list>`.
-6. Later: remove the old `GET /orders/public/payment-options` once the new website is live; dependency advisories (React Router 7 upgrade, xlsx, flowbite deepmerge).
+6. If moving devices: owner runs the `/migrate` pack + verify commands (password typed in their own terminal), then the plan file in the session scratchpad is deleted.
+7. Later: remove the old `GET /orders/public/payment-options` once the new website is live; dependency advisories (React Router 7 upgrade, xlsx, flowbite deepmerge).
 
 ## 7. Handoff rules for this project
 - Verify on resume: `cd NogatuDrop_fe && node --test 'test/*.test.js'` (fast); DB suite as in 0.3 when Docker is up.
