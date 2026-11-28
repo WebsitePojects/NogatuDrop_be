@@ -110,7 +110,7 @@ backend `feature/signin-security` (2026-10-02, also `origin/parked/signin-securi
 - fe (NogatuDrop_fe repo) `8fa88ac` Nov 26 (same features); `8cc0bc0` Nov 24; live `main` = `bf7ddb4`
 **Verified (real output):** staging API ran `02cb72e` (restarted 2026-11-24, member column = 1, 401 checks, prod health 200); staging Stockists cleared (4) and a re-run found nothing; staging website bundle contains the Nov 24 pages. Sim: backend 389/391 (the 1 = lesson 6), frontend 71/71, build OK; browser checks: payment options 5/5 (Davao buyer sees GCASH only), new buttons 4/4, store e2e 21/21, Nov 24 screens 7/7.
 **Staging server is behind (checked 2026-11-28):** `/api/health` uptime 334,190 s (restarted 2026-11-24, the `02cb72e` deploy) and the shipping quote has no `payment_providers`, so the `9667980` block (workspace `outputs/sim-2026-11-15/STAGING_DEPLOY_2026-11-26.md`) has NOT run. Meanwhile the staging website (already `8fa88ac`) shows "Payment accounts are not available" at checkout. Rejecting the staging test order PUB-20261123080452192000 is step 5 of that block.
-**Migrate archive:** plan built 2026-11-26 (workspace `.claude/migrate.json`, 380 files, 43.9 MB, real data left out); the owner has not packed it yet (no archive found 2026-11-28).
+**Migrate archive (2026-11-28):** workspace `public/NogatuDS-migrate-20261128-161652.zip` (36.7 MB, AES-256, 397 files, verified 0 mismatches, real data left out, no git bundles needed). Password file: `~/.migrate-keys/` on the desktop, same name with `-PASSWORD.txt`; it travels separately. Next tool: VS Code + Claude extension on a laptop, later T3; the agent-neutral start is workspace `AGENTS.md` "Start here".
 **Waiting on others:** the client adds a test Stockist on staging and tries the flow; client approval to go live; the MLM session's progress on the client's 8-item list + auto-upgrade proposal (unknown).
 
 ## 6. What's next
@@ -119,7 +119,7 @@ backend `feature/signin-security` (2026-10-02, also `origin/parked/signin-securi
 3. Send the client the short update (payment options fixed, Remove member price, Delete Stockist, staging test order removed).
 4. When the client adds packages, untick "Nogatu Alliance member price applies" on each (none exist yet).
 5. Go-live (only after the client's OK): MLM BLUE gets the member verify endpoint; prod DB backup; pull + `scripts/addShippingRates.js`, `scripts/addProductMemberPriceFlag.js` (and any earlier ones live lacks) with `--apply`; set MLM_API_URL/KEY; restart; merge to `main` for Vercel; live test-data clean-up only with `--live --ids=<approved list>`.
-6. If moving devices: owner runs the `/migrate` pack + verify commands (password typed in their own terminal), then the plan file in the session scratchpad is deleted.
+6. New laptop: restore the archive (`migrate.py restore --archive <zip> --root <NogatuDS> --password-file <key file>`), clone both repos on `feat/meeting-2026-11-10`, `npm ci`, reinstall the caveman and playwright-skill plugins, open the `NogatuDS` folder (not a repo) in VS Code, then follow AGENTS.md "Start here".
 7. Later: remove the old `GET /orders/public/payment-options` once the new website is live; dependency advisories (React Router 7 upgrade, xlsx, flowbite deepmerge).
 
 ## 7. Handoff rules for this project
